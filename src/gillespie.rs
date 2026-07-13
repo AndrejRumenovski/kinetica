@@ -135,6 +135,22 @@ struct BinMeta {
     total_propensity: FixedPoint,
 }
 
+impl BinMeta {
+    /// Whether this bin has a member the rejection loop can actually
+    /// accept. `count > 0` alone isn't sufficient: a bin can be non-empty
+    /// yet all-zero-rate -- e.g. the zero-padded trailing lanes
+    /// `pack_records_into_blocks` leaves in a partially-filled last block,
+    /// which default to `bin_id = 0, rate_q16 = 0` and so land in bin 0
+    /// alongside any genuine low-rate reactions there. The rejection test
+    /// `coin.0 < rate.0` can never succeed for `rate == 0`, so selecting
+    /// such a bin without this check would spin its `loop` forever once
+    /// every real member had already been tried and missed by chance.
+    #[inline(always)]
+    fn is_usable(&self) -> bool {
+        self.count > 0 && self.total_propensity != FixedPoint::ZERO
+    }
+}
+
 /// The O(1) reaction sampler. Holds exactly `NUM_BINS` `BinMeta` records
 /// (`[BinMeta; NUM_BINS]`, stack-resident, no `Vec`) plus the grand total
 /// propensity; sampling never allocates and never inspects more than
@@ -219,9 +235,10 @@ impl CompositionTable {
         }
 
         let bin = &self.bins[chosen];
-        if bin.count == 0 {
-            // Landed in an empty bin due to fixed-point rounding at a bin
-            // boundary; fall back to the highest non-empty bin below it.
+        if !bin.is_usable() {
+            // Landed in an empty (or all-zero-rate-padding) bin due to
+            // fixed-point rounding at a bin boundary; fall back to the
+            // nearest usable bin below it.
             return self.sample_from_nearest_nonempty(chosen, rng, lut);
         }
 
@@ -250,7 +267,7 @@ impl CompositionTable {
     ) -> Option<u32> {
         for j in (0..=from).rev() {
             let bin = &self.bins[j];
-            if bin.count == 0 {
+            if !bin.is_usable() {
                 continue;
             }
             let ceiling = Self::bin_ceiling(j);
@@ -435,6 +452,45 @@ mod tests {
             }
         }
         assert!(count_high as f64 / trials as f64 > 0.99);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bin_meta_is_usable_requires_count_and_nonzero_propensity() {
+        assert!(!BinMeta::default().is_usable());
+
+        let zero_rate_padding = BinMeta {
+            start: 0,
+            count: 3,
+            total_propensity: FixedPoint::ZERO,
+        };
+        assert!(!zero_rate_padding.is_usable());
+
+        let real = BinMeta {
+            start: 0,
+            count: 1,
+            total_propensity: FixedPoint::from_q16(5),
+        };
+        assert!(real.is_usable());
+    }
+
+    #[test]
+    fn sample_from_nearest_nonempty_skips_all_zero_rate_padding_bin() {
+        // 7 zero-rate records (mimicking pack_records_into_blocks' trailing
+        // padding lanes, which default to bin_id = 0) plus one real
+        // reaction elsewhere -- sorted by bin_id, bin 0 ends up with
+        // count = 7 but total_propensity = 0. Before the `is_usable` fix,
+        // scanning straight off `bin.count == 0` would have entered bin
+        // 0's rejection loop and spun forever, since `coin.0 < rate.0` can
+        // never hold for an all-zero-rate bin.
+        let mut records = vec![(10u32, 5u8, 0u8)];
+        records.extend(std::iter::repeat((0u32, 0u8, 0u8)).take(7));
+        let (lut, path) = lut_from(records, "padding_bin_regression");
+        let table = CompositionTable::build(&lut);
+
+        let mut rng = Rng::seeded(1);
+        assert_eq!(table.sample_from_nearest_nonempty(0, &mut rng, &lut), None);
 
         let _ = std::fs::remove_file(&path);
     }
