@@ -308,3 +308,148 @@ impl GillespieDomain {
         Some((reaction_id, tau))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout;
+    use crate::test_support::temp_path;
+
+    fn lut_from(records: Vec<(u32, u8, u8)>, tag: &str) -> (ReactionLut, std::path::PathBuf) {
+        let blocks = layout::pack_records_into_blocks(records);
+        let path = temp_path(tag);
+        layout::write_lut(&path, &blocks).unwrap();
+        let lut = ReactionLut::open(&path).unwrap();
+        (lut, path)
+    }
+
+    #[test]
+    fn from_q16_widens_into_q32_32_domain() {
+        assert_eq!(FixedPoint::from_q16(1).0, 1u64 << 16);
+        assert_eq!(FixedPoint::from_q16(0).0, 0);
+    }
+
+    #[test]
+    fn saturating_add_caps_at_u64_max() {
+        let a = FixedPoint(u64::MAX - 5);
+        let b = FixedPoint(10);
+        assert_eq!(a.saturating_add(b).0, u64::MAX);
+    }
+
+    #[test]
+    fn to_f64_matches_fraction_of_one() {
+        assert_eq!(FixedPoint::ONE.to_f64(), 1.0);
+        assert_eq!(FixedPoint::ZERO.to_f64(), 0.0);
+        let half = FixedPoint(FixedPoint::ONE.0 / 2);
+        assert!((half.to_f64() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn next_u32_below_stays_in_bounds() {
+        let mut rng = Rng::seeded(42);
+        for _ in 0..10_000 {
+            assert!(rng.next_u32_below(17) < 17);
+        }
+    }
+
+    #[test]
+    fn next_fixed_stays_below_max() {
+        let mut rng = Rng::seeded(7);
+        let max = FixedPoint(1_000_000);
+        for _ in 0..10_000 {
+            assert!(rng.next_fixed(max).0 < max.0);
+        }
+    }
+
+    #[test]
+    fn seeded_rng_is_deterministic() {
+        let mut a = Rng::seeded(123);
+        let mut b = Rng::seeded(123);
+        for _ in 0..100 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+    }
+
+    #[test]
+    fn seed_zero_does_not_degenerate() {
+        let mut rng = Rng::seeded(0);
+        assert_ne!(rng.next_u64(), 0);
+    }
+
+    #[test]
+    fn bin_ceiling_matches_upper_bound_of_its_magnitude_class() {
+        assert_eq!(CompositionTable::bin_ceiling(0).0, 1u64 << 33);
+        assert_eq!(CompositionTable::bin_ceiling(1).0, 1u64 << 34);
+    }
+
+    #[test]
+    fn bin_ceiling_clamps_shift_to_63_bits() {
+        // FRAC_BITS_PLUS_ONE (33) + (NUM_BINS - 1) (31) = 64, which would
+        // overflow a u64 shift -- must clamp to 63.
+        assert_eq!(CompositionTable::bin_ceiling(NUM_BINS - 1).0, 1u64 << 63);
+    }
+
+    #[test]
+    fn sample_reaction_returns_none_when_lut_is_empty() {
+        let (lut, path) = lut_from(Vec::new(), "empty_lut");
+        assert_eq!(lut.len(), 0);
+
+        let table = CompositionTable::build(&lut);
+        let mut rng = Rng::seeded(1);
+        assert_eq!(table.sample_reaction(&mut rng, &lut), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sample_reaction_always_returns_the_only_active_reaction() {
+        let (lut, path) = lut_from(vec![(1000u32, 5u8, 0u8)], "single_reaction");
+
+        let table = CompositionTable::build(&lut);
+        let mut rng = Rng::seeded(99);
+        for _ in 0..1000 {
+            assert_eq!(table.sample_reaction(&mut rng, &lut), Some(0));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sample_reaction_favors_the_higher_propensity_reaction() {
+        // Reaction 1's rate is ~1000x reaction 0's, so it should dominate
+        // stage-1 composition selection.
+        let (lut, path) = lut_from(
+            vec![(1u32, 0u8, 0u8), (1_000_000u32, 19u8, 0u8)],
+            "two_reactions",
+        );
+
+        let table = CompositionTable::build(&lut);
+        let mut rng = Rng::seeded(2024);
+        let trials = 5000;
+        let mut count_high = 0;
+        for _ in 0..trials {
+            match table.sample_reaction(&mut rng, &lut) {
+                Some(0) => {}
+                Some(1) => count_high += 1,
+                other => panic!("unexpected reaction id {other:?}"),
+            }
+        }
+        assert!(count_high as f64 / trials as f64 > 0.99);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn gillespie_domain_step_advances_simulation_time() {
+        let (lut, path) = lut_from(vec![(500u32, 4u8, 0u8)], "domain_step");
+
+        let mut domain = GillespieDomain::new(&lut, 55);
+        let before = domain.sim_time;
+        let (reaction_id, tau) = domain.step(&lut).expect("domain has an active reaction");
+        assert_eq!(reaction_id, 0);
+        assert!(tau > 0.0);
+        assert!(domain.sim_time > before);
+
+        let _ = std::fs::remove_file(&path);
+    }
+}

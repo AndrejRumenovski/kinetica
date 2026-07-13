@@ -41,6 +41,7 @@ const SPECIES_BITS: [u8; 3] = [layout::ADS_O, layout::ADS_H, layout::ADS_CO];
 const MAGIC: &[u8; 8] = b"OC20E001";
 const KB_EV_PER_K: f64 = 8.617_333_262e-5;
 
+#[derive(Debug)]
 struct Config {
     input: PathBuf,
     out: PathBuf,
@@ -262,4 +263,114 @@ fn run(config: &Config) -> io::Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "kinetica_test_oc20_ingest_{tag}_{}",
+            std::process::id()
+        ))
+    }
+
+    fn cfg(alpha: f64, beta_ev: f64, nu: f64, temperature_k: f64) -> Config {
+        Config {
+            input: PathBuf::new(),
+            out: PathBuf::new(),
+            alpha,
+            beta_ev,
+            nu,
+            temperature_k,
+        }
+    }
+
+    #[test]
+    fn rate_constant_applies_bep_and_arrhenius() {
+        // alpha=1, beta=0, and T chosen so kB*T = 1 eV -- k should reduce
+        // to exp(-dE_rxn) exactly.
+        let c = cfg(1.0, 0.0, 1.0, 1.0 / KB_EV_PER_K);
+        let k = rate_constant(0.5, &c);
+        assert!((k - (-0.5f64).exp()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rate_constant_clamps_negative_activation_to_zero() {
+        let c = cfg(1.0, 0.0, 2.0, 1.0 / KB_EV_PER_K);
+        // A strongly negative reaction energy would otherwise drive the
+        // activation energy negative; it must clamp to 0, leaving k == nu.
+        let k = rate_constant(-10.0, &c);
+        assert!((k - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn config_parse_requires_input() {
+        let args = vec!["oc20_ingest".to_string()];
+        let err = Config::parse(args.into_iter()).unwrap_err();
+        assert!(err.contains("--input"));
+    }
+
+    #[test]
+    fn config_parse_applies_defaults_and_overrides() {
+        let args = ["oc20_ingest", "--input", "energies.bin", "--alpha", "0.5", "--out", "custom.lut"]
+            .iter()
+            .map(|s| s.to_string());
+        let c = Config::parse(args).unwrap();
+        assert_eq!(c.input, PathBuf::from("energies.bin"));
+        assert_eq!(c.out, PathBuf::from("custom.lut"));
+        assert_eq!(c.alpha, 0.5);
+        assert_eq!(c.beta_ev, 0.0);
+        assert_eq!(c.nu, 1.0e13);
+        assert_eq!(c.temperature_k, 298.15);
+    }
+
+    #[test]
+    fn config_parse_rejects_unknown_flag() {
+        let args = ["oc20_ingest", "--input", "e.bin", "--bogus"]
+            .iter()
+            .map(|s| s.to_string());
+        let err = Config::parse(args).unwrap_err();
+        assert!(err.contains("--bogus"));
+    }
+
+    #[test]
+    fn read_energy_records_round_trips_and_skips_unknown_species() {
+        let path = temp_path("roundtrip");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // record_count
+
+        bytes.push(0); // species 0 = O
+        bytes.extend_from_slice(&(-123i32).to_le_bytes());
+        bytes.extend_from_slice(&7u32.to_le_bytes());
+
+        bytes.push(9); // unknown species index -- must be skipped
+        bytes.extend_from_slice(&0i32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+
+        bytes.push(2); // species 2 = CO
+        bytes.extend_from_slice(&456i32.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes());
+
+        std::fs::write(&path, &bytes).unwrap();
+        let records = read_energy_records(&path).unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].species, 0);
+        assert!((records[0].energy_ev - (-0.123)).abs() < 1e-9);
+        assert_eq!(records[1].species, 2);
+        assert!((records[1].energy_ev - 0.456).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_energy_records_rejects_bad_magic() {
+        let path = temp_path("bad_magic");
+        std::fs::write(&path, b"NOTMAGIC\x00\x00\x00\x00").unwrap();
+        assert!(read_energy_records(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
 }

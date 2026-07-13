@@ -362,3 +362,98 @@ pub fn write_lut(path: impl AsRef<Path>, blocks: &[ReactionLutBlock]) -> io::Res
 
     std::fs::File::create(path)?.write_all(bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::temp_path;
+
+    #[test]
+    fn block_and_lane_computes_correct_coordinates() {
+        assert_eq!(block_and_lane(0), (0, 0));
+        assert_eq!(block_and_lane(7), (0, 7));
+        assert_eq!(block_and_lane(8), (1, 0));
+        assert_eq!(block_and_lane(23), (2, 7));
+    }
+
+    #[test]
+    fn pack_records_into_blocks_sorts_by_bin_id_and_pads_last_block() {
+        let records = vec![(100u32, 3u8, 0x12u8), (50, 1, 0x21), (10, 0, 0x00)];
+        let blocks = pack_records_into_blocks(records);
+        assert_eq!(blocks.len(), 1);
+
+        let b = &blocks[0];
+        assert_eq!((b.rate_q16[0], b.bin_id[0]), (10, 0));
+        assert_eq!((b.rate_q16[1], b.bin_id[1]), (50, 1));
+        assert_eq!((b.rate_q16[2], b.bin_id[2]), (100, 3));
+        assert_eq!(b.transition[2], 0x12);
+
+        for lane in 3..ReactionLutBlock::LANES {
+            assert_eq!(b.rate_q16[lane], 0);
+            assert_eq!(b.bin_id[lane], 0);
+            assert_eq!(b.transition[lane], 0);
+        }
+    }
+
+    #[test]
+    fn pack_records_into_blocks_empty_input_yields_no_blocks() {
+        assert!(pack_records_into_blocks(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn write_and_reopen_lut_round_trips_reaction_rates() {
+        let records = vec![(10u32, 0u8, 0x01u8), (20, 1, 0x02), (30, 2, 0x04), (40, 31, 0x00)];
+        let blocks = pack_records_into_blocks(records.clone());
+        let path = temp_path("lut_roundtrip");
+        write_lut(&path, &blocks).unwrap();
+
+        let lut = ReactionLut::open(&path).unwrap();
+        assert_eq!(lut.len(), blocks.len());
+        for (i, &(rate, bin, trans)) in records.iter().enumerate() {
+            assert_eq!(lut.rate_of(i), (rate, bin, trans));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_file_with_length_not_multiple_of_block_size() {
+        let path = temp_path("lut_bad_len");
+        std::fs::write(&path, [0u8; 100]).unwrap(); // not a multiple of 64
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn site_lattice_get_set_round_trips() {
+        let path = temp_path("lattice_get_set");
+        let mut lattice = SiteLattice::open(&path, 4, 3).unwrap();
+        assert_eq!(lattice.as_slice().len(), 12);
+
+        lattice.set(5, ADS_O);
+        assert_eq!(lattice.get(5), ADS_O);
+        assert_eq!(lattice.get(0), VACANT);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn split_row_bands_mut_partitions_full_height_without_overlap() {
+        let path = temp_path("lattice_bands");
+        let mut lattice = SiteLattice::open(&path, 4, 10).unwrap();
+        let bands = lattice.split_row_bands_mut(3);
+
+        let mut covered = 0usize;
+        let mut prev_y1 = 0usize;
+        for (y0, y1, data) in &bands {
+            assert_eq!(*y0, prev_y1);
+            assert!(y1 > y0);
+            assert_eq!(data.len(), (y1 - y0) * 4);
+            covered += y1 - y0;
+            prev_y1 = *y1;
+        }
+        assert_eq!(covered, 10);
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
