@@ -1,4 +1,4 @@
-//! CLI entrypoint for `cattrace`, an asynchronous, out-of-core lattice kMC
+//! CLI entrypoint for `kinetica`, an asynchronous, out-of-core lattice kMC
 //! engine. This binary wires together the three architectural pieces the
 //! rest of the crate provides:
 //!
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use cattrace::{engine, gillespie, layout};
+use kinetica::{engine, gillespie, layout};
 use layout::{ReactionLut, ReactionLutBlock, SiteLattice};
 
 struct Config {
@@ -99,9 +99,9 @@ fn parse_value<T: std::str::FromStr>(
 }
 
 fn usage() -> String {
-    "cattrace: async out-of-core lattice kMC engine\n\n\
+    "kinetica: async out-of-core lattice kMC engine\n\n\
      USAGE:\n    \
-       cattrace [OPTIONS]\n\n\
+       kinetica [OPTIONS]\n\n\
      OPTIONS:\n    \
        --lattice-path <PATH>      Backing mmap file for the surface [default: surface.lattice]\n    \
        --lattice-width <N>        Lattice width in sites [default: 4096]\n    \
@@ -127,7 +127,7 @@ fn main() -> ExitCode {
     match run(&config) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("cattrace: {err}");
+            eprintln!("kinetica: {err}");
             ExitCode::FAILURE
         }
     }
@@ -137,30 +137,30 @@ fn run(config: &Config) -> std::io::Result<()> {
     if let Some(count) = config.generate_lut {
         generate_demo_lut(&config.lut_path, count)?;
         println!(
-            "cattrace: wrote {count} synthetic reactions to {}",
+            "kinetica: wrote {count} synthetic reactions to {}",
             config.lut_path.display()
         );
     }
 
     println!(
-        "cattrace: opening lattice {}x{} at {}",
+        "kinetica: opening lattice {}x{} at {}",
         config.lattice_width,
         config.lattice_height,
         config.lattice_path.display()
     );
     let mut lattice = SiteLattice::open(&config.lattice_path, config.lattice_width, config.lattice_height)?;
 
-    println!("cattrace: mapping reaction LUT {}", config.lut_path.display());
+    println!("kinetica: mapping reaction LUT {}", config.lut_path.display());
     let lut = ReactionLut::open(&config.lut_path)?;
     println!(
-        "cattrace: {} blocks ({} reactions) mapped from {}",
+        "kinetica: {} blocks ({} reactions) mapped from {}",
         lut.len(),
         lut.len() * ReactionLutBlock::LANES,
         config.lut_path.display()
     );
 
     println!(
-        "cattrace: fanning out across {} patch(es), {} steps/patch -> {}",
+        "kinetica: fanning out across {} patch(es), {} steps/patch -> {}",
         config.patches,
         config.steps_per_patch,
         config.trajectory_path.display()
@@ -181,7 +181,7 @@ fn run(config: &Config) -> std::io::Result<()> {
     let total_steps = config.patches as u64 * config.steps_per_patch;
     let rate = total_steps as f64 / elapsed.as_secs_f64().max(1e-9);
     println!(
-        "cattrace: done in {:.3}s ({:.0} reactions/sec)",
+        "kinetica: done in {:.3}s ({:.0} reactions/sec)",
         elapsed.as_secs_f64(),
         rate
     );

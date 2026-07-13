@@ -1,5 +1,5 @@
 [package]
-name = "cattrace"
+name = "kinetica"
 version = "0.1.0"
 edition = "2021"
 description = "Asynchronous, out-of-core lattice kinetic Monte Carlo engine for single-workstation OC20-scale surface reaction simulation."

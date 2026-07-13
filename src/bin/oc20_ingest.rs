@@ -1,5 +1,5 @@
 //! Builds a real `reactions.lut` from Open Catalyst Project (OC20) IS2RE
-//! adsorption-energy data, instead of `cattrace --generate-lut`'s synthetic
+//! adsorption-energy data, instead of `kinetica --generate-lut`'s synthetic
 //! demo records.
 //!
 //! OC20 does not publish transition-state barriers or rate constants --
@@ -30,9 +30,9 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use cattrace::layout::{self, ReactionLutBlock};
+use kinetica::layout::{self, ReactionLutBlock};
 
-/// The three adsorbates cattrace's lattice bitflags (layout.rs) model,
+/// The three adsorbates kinetica's lattice bitflags (layout.rs) model,
 /// matching OC20's global adsorbate-index table
 /// (`mapping_adsorbates_2020may12.txt`: 0 = *O, 1 = *H, 5 = *CO) as
 /// remapped to a dense 0..3 range by `extract_energies.py`.
