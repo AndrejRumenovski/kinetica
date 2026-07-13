@@ -2,3 +2,5 @@
 *.lattice
 *.lut
 trajectory.bin
+/data/
+/PROMPT.md

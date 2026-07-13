@@ -12,7 +12,7 @@
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use std::fs::OpenOptions;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::slice;
 
@@ -306,4 +306,59 @@ impl ReactionLut {
         let block = &self.as_slice()[block_idx];
         (block.rate_q16[lane], block.bin_id[lane], block.transition[lane])
     }
+}
+
+/// Pack `(rate_q16, bin_id, transition)` triples into `ReactionLutBlock`s,
+/// sorting by `bin_id` first (the invariant `CompositionTable::build`
+/// relies on to collapse bin membership to a `[start, count)` range). Used
+/// by both the synthetic demo generator (`main.rs`) and the real OC20
+/// ingestion tool (`bin/oc20_ingest.rs`) so the on-disk packing logic
+/// exists in exactly one place.
+pub fn pack_records_into_blocks(mut records: Vec<(u32, u8, u8)>) -> Vec<ReactionLutBlock> {
+    records.sort_by_key(|&(_, bin_id, _)| bin_id);
+
+    let block_count = records.len().div_ceil(ReactionLutBlock::LANES).max(1);
+    let mut blocks = Vec::with_capacity(block_count);
+
+    for chunk in records.chunks(ReactionLutBlock::LANES) {
+        let mut rate_q16 = [0u32; ReactionLutBlock::LANES];
+        let mut bin_id = [0u8; ReactionLutBlock::LANES];
+        let mut transition = [0u8; ReactionLutBlock::LANES];
+        let e_act_mev = [0u16; ReactionLutBlock::LANES];
+
+        for (lane, &(rate, bin, trans)) in chunk.iter().enumerate() {
+            rate_q16[lane] = rate;
+            bin_id[lane] = bin;
+            transition[lane] = trans;
+        }
+
+        blocks.push(ReactionLutBlock {
+            rate_q16,
+            bin_id,
+            transition,
+            e_act_mev,
+        });
+    }
+
+    blocks
+}
+
+/// Write `blocks` verbatim to `path` as the raw bytes `ReactionLut::open`
+/// expects to map back in.
+pub fn write_lut(path: impl AsRef<Path>, blocks: &[ReactionLutBlock]) -> io::Result<()> {
+    // SAFETY: `ReactionLutBlock` is `repr(C, align(64))`, `Copy`, and every
+    // field is a plain fixed-width integer array with no padding bytes
+    // (enforced by the `size_of::<ReactionLutBlock>() == 64` assertion
+    // above), so reinterpreting `&[ReactionLutBlock]` as `&[u8]` for the
+    // duration of this write is a sound, lossless byte-for-byte view --
+    // there is no uninitialized padding to expose, and no lifetime hazard
+    // since the byte slice does not outlive `blocks`.
+    let bytes = unsafe {
+        slice::from_raw_parts(
+            blocks.as_ptr() as *const u8,
+            std::mem::size_of_val(blocks),
+        )
+    };
+
+    std::fs::File::create(path)?.write_all(bytes)
 }

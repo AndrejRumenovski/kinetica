@@ -14,15 +14,11 @@
 //! `memmap2`, `rio`, `rayon`, and `crossbeam-channel`, so a CLI-parsing
 //! dependency would be scope creep.
 
-mod engine;
-mod gillespie;
-mod layout;
-
-use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
+use cattrace::{engine, gillespie, layout};
 use layout::{ReactionLut, ReactionLutBlock, SiteLattice};
 
 struct Config {
@@ -201,12 +197,10 @@ fn generate_demo_lut(path: &std::path::Path, count: usize) -> std::io::Result<()
     let block_count = count.div_ceil(ReactionLutBlock::LANES).max(1);
     let mut rng = gillespie::Rng::seeded(0xC0FF_EE00_C0FF_EE00);
 
-    // (rate_q16, bin_id, transition) triples, sorted by bin_id ascending
-    // afterward -- `CompositionTable::build` (gillespie.rs) requires
-    // `reactions.lut` to already be grouped by magnitude class so bin
-    // membership collapses to a contiguous `[start, count)` range instead
-    // of needing a separately allocated index.
-    let mut records: Vec<(u32, u8, u8)> = (0..block_count * ReactionLutBlock::LANES)
+    // (rate_q16, bin_id, transition) triples -- `layout::pack_records_into_blocks`
+    // sorts these by bin_id and packs them into cache-line blocks; see its
+    // doc comment for why that ordering matters to `CompositionTable::build`.
+    let records: Vec<(u32, u8, u8)> = (0..block_count * ReactionLutBlock::LANES)
         .map(|_| {
             let raw = rng.next_u64();
             let rate_q16 = ((raw & 0x00FF_FFFF) as u32).max(1);
@@ -219,44 +213,7 @@ fn generate_demo_lut(path: &std::path::Path, count: usize) -> std::io::Result<()
             (rate_q16, bin_id, transition)
         })
         .collect();
-    records.sort_by_key(|&(_, bin_id, _)| bin_id);
 
-    let mut blocks = Vec::with_capacity(block_count);
-    for chunk in records.chunks(ReactionLutBlock::LANES) {
-        let mut rate_q16 = [0u32; ReactionLutBlock::LANES];
-        let mut bin_id = [0u8; ReactionLutBlock::LANES];
-        let mut transition = [0u8; ReactionLutBlock::LANES];
-        let e_act_mev = [0u16; ReactionLutBlock::LANES];
-
-        for (lane, &(rate, bin, trans)) in chunk.iter().enumerate() {
-            rate_q16[lane] = rate;
-            bin_id[lane] = bin;
-            transition[lane] = trans;
-        }
-
-        blocks.push(ReactionLutBlock {
-            rate_q16,
-            bin_id,
-            transition,
-            e_act_mev,
-        });
-    }
-
-    // SAFETY: `ReactionLutBlock` is `repr(C, align(64))`, `Copy`, and every
-    // field is a plain fixed-width integer array with no padding bytes
-    // (enforced by the `size_of::<ReactionLutBlock>() == 64` assertion in
-    // layout.rs), so reinterpreting a `&[ReactionLutBlock]` as `&[u8]` for
-    // the duration of this write is a sound, lossless byte-for-byte view --
-    // there is no uninitialized padding to expose and no lifetime hazard
-    // since the byte slice does not outlive `blocks`.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            blocks.as_ptr() as *const u8,
-            blocks.len() * std::mem::size_of::<ReactionLutBlock>(),
-        )
-    };
-
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(bytes)?;
-    Ok(())
+    let blocks = layout::pack_records_into_blocks(records);
+    layout::write_lut(path, &blocks)
 }
