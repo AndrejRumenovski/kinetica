@@ -1,0 +1,34 @@
+[package]
+name = "cattrace"
+version = "0.1.0"
+edition = "2021"
+description = "Asynchronous, out-of-core lattice kinetic Monte Carlo engine for single-workstation OC20-scale surface reaction simulation."
+authors = ["AndrejRumenovski"]
+
+# ------------------------------------------------------------------------------
+# BUILD NOTES
+# ------------------------------------------------------------------------------
+# This crate is written to run entirely inside L1/L2 cache during the hot
+# Gillespie loop and to vectorize the neighborhood-scan kernels in layout.rs.
+# The default `rustc` target does not enable AVX2 or FMA, so LLVM cannot emit
+# the packed-SIMD instructions the cache-line-aligned reaction LUT is shaped
+# for. To get the intended codegen, always build with:
+#
+#   RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" cargo build --release
+#
+# `target-cpu=native` lets LLVM pick the widest vector width the host CPU
+# actually supports (AVX2/AVX-512/FMA), and the explicit `+avx2` is a floor
+# for machines where `native` detection under-reports. Because this bakes in
+# host-specific instructions, binaries built this way are not portable across
+# heterogeneous CPU fleets -- rebuild per target machine.
+[profile.release]
+opt-level = 3
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[dependencies]
+memmap2 = "=0.9.11"
+rio = "=0.9.4"
+rayon = "=1.12.0"
+crossbeam-channel = "=0.5.16"
