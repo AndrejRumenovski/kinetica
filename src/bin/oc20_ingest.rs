@@ -21,7 +21,7 @@
 //! `--help` for the exact defaults.
 //!
 //! Upstream of this tool, a small Python script
-//! (`data/oc20/extract_energies.py`) reads the OC20 LMDB shards directly
+//! (`scripts/extract_energies.py`) reads the OC20 LMDB shards directly
 //! (bypassing `torch`/`torch_geometric` entirely via a stub `Unpickler`,
 //! since we only need two plain-Python scalar fields per record: `sid` and
 //! `y_relaxed`) and emits the flat binary this tool consumes as `--input`.
@@ -37,6 +37,7 @@ use kinetica::layout::{self, ReactionLutBlock};
 /// (`mapping_adsorbates_2020may12.txt`: 0 = *O, 1 = *H, 5 = *CO) as
 /// remapped to a dense 0..3 range by `extract_energies.py`.
 const SPECIES_BITS: [u8; 3] = [layout::ADS_O, layout::ADS_H, layout::ADS_CO];
+const SPECIES_NAMES: [&str; 3] = ["O", "H", "CO"];
 
 const MAGIC: &[u8; 8] = b"OC20E001";
 const KB_EV_PER_K: f64 = 8.617_333_262e-5;
@@ -105,7 +106,7 @@ fn usage() -> String {
      USAGE:\n    \
        oc20_ingest --input <PATH> [OPTIONS]\n\n\
      OPTIONS:\n    \
-       --input <PATH>        Flat binary from data/oc20/extract_energies.py (required)\n    \
+       --input <PATH>        Flat binary from scripts/extract_energies.py (required)\n    \
        --out <PATH>          Output reactions.lut [default: reactions.lut]\n    \
        --alpha <F>           BEP relation slope [default: 0.87]\n    \
        --beta <F>            BEP relation intercept, eV [default: 0.0]\n    \
@@ -194,6 +195,28 @@ fn run(config: &Config) -> io::Result<()> {
             io::ErrorKind::InvalidData,
             "no energy records to build reactions.lut from",
         ));
+    }
+
+    // Log per-species coverage explicitly rather than let a gap pass
+    // silently: OC20's `train`/`val` splits do not cover every adsorbate
+    // uniformly. `*CO` in particular is held out of `train`/`val` entirely
+    // by the benchmark's own design (it's one of the "unseen adsorbate"
+    // out-of-domain test classes), and OC20's `test_*` splits ship with
+    // `y_relaxed`/`y_init` withheld (both `None`) to prevent leaderboard
+    // cheating -- so there is currently no real-energy source for CO
+    // anywhere in this dataset bundle. A `--input` built from `train` will
+    // therefore always show 0 CO records; that is expected, not a bug.
+    let mut species_counts = [0usize; SPECIES_BITS.len()];
+    for rec in &energy_records {
+        species_counts[rec.species as usize] += 1;
+    }
+    for (name, count) in SPECIES_NAMES.iter().zip(species_counts.iter()) {
+        let note = if *count == 0 {
+            "  (absent from --input; reactions.lut will have no reactions for this species)"
+        } else {
+            ""
+        };
+        println!("oc20_ingest: species {name}: {count} adsorption-energy records{note}");
     }
 
     // Each OC20 sample yields TWO reactions on the lattice: adsorption

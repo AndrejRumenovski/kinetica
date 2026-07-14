@@ -485,7 +485,7 @@ mod tests {
         // 0's rejection loop and spun forever, since `coin.0 < rate.0` can
         // never hold for an all-zero-rate bin.
         let mut records = vec![(10u32, 5u8, 0u8)];
-        records.extend(std::iter::repeat((0u32, 0u8, 0u8)).take(7));
+        records.extend(std::iter::repeat_n((0u32, 0u8, 0u8), 7));
         let (lut, path) = lut_from(records, "padding_bin_regression");
         let table = CompositionTable::build(&lut);
 

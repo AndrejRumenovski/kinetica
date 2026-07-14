@@ -76,7 +76,7 @@ Pipeline:
    `torch`/`torch_geometric` entirely:
 
    ```sh
-   python3 data/oc20/extract_energies.py \
+   python3 scripts/extract_energies.py \
        --lmdb data/oc20/is2res_train_val_test_lmdbs/data/is2re/all/train/data.lmdb \
        --mapping data/oc20/oc20_data_mapping.pkl \
        --out data/oc20/energies_all.bin
@@ -93,5 +93,17 @@ Pipeline:
    `--alpha`, `--beta`, `--nu`, and `--temperature` override the BEP/TST
    defaults — see `oc20_ingest --help`.
 
+`oc20_ingest` logs a per-species record count so any coverage gap is
+visible rather than silent. In particular, OC20's `train`/`val` splits
+contain **no `*CO` samples at all** — `*CO` is one of the benchmark's
+deliberately held-out "unseen adsorbate" out-of-domain test classes, and
+the `test_*` splits ship with `y_relaxed`/`y_init` withheld (`None`) to
+prevent leaderboard cheating. So a `reactions.lut` built this way will
+always have real O and H adsorption/desorption chemistry but zero CO
+reactions — there is currently no real-energy source for CO anywhere in
+this dataset bundle.
+
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
-untracked — see `.gitignore`.
+untracked — see `.gitignore`. `scripts/extract_energies.py` is tracked;
+only the OC20 downloads/extractions and generated `.bin` files under
+`data/` are not.
