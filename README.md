@@ -34,7 +34,9 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing patches, crossbeam boundary migration, double-buffered `io_uring` trajectory writer |
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
-| `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real OC20 IS2RE adsorption-energy data     |
+| `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
+| `scripts/extract_energies.py` | Pulls `(species, energy, sid)` records from OC20 IS2RE LMDB shards |
+| `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API |
 
 ## Running the simulator
 
@@ -56,7 +58,12 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `--steps`             | `1000000`           | Gillespie steps per patch                |
 | `--generate-lut <N>`  | —                   | Synthesize `N` demo reactions into `--lut-path` instead of using a real one |
 
-## Building `reactions.lut` from real OC20 data
+## Building `reactions.lut` from real data
+
+Two independent real-data sources feed the same `oc20_ingest` pipeline;
+see the CO-gap note below for why you likely want both.
+
+### OC20
 
 OC20's IS2RE task publishes only relaxed adsorption energies (initial
 structure guess → DFT-relaxed structure and energy), not transition-state
@@ -137,12 +144,42 @@ visible rather than silent. In particular, OC20's `train`/`val` splits
 contain **no `*CO` samples at all** — `*CO` is one of the benchmark's
 deliberately held-out "unseen adsorbate" out-of-domain test classes, and
 the `test_*` splits ship with `y_relaxed`/`y_init` withheld (`None`) to
-prevent leaderboard cheating. So a `reactions.lut` built this way will
-always have real O and H adsorption/desorption chemistry but zero CO
-reactions — there is currently no real-energy source for CO anywhere in
-this dataset bundle.
+prevent leaderboard cheating. So a `reactions.lut` built from OC20 alone
+will always have real O and H adsorption/desorption chemistry but zero CO
+reactions. (Checked directly: OC20's `100k` train split already contains
+~97.5% of every O/H sample that exists anywhere in the full 460k-sample
+`all` split — re-extracting a bigger split won't find more O/H data
+either.)
+
+### Alternative/supplemental source: Catalysis-Hub.org (fills the CO gap)
+
+[Catalysis-Hub.org](https://catalysis-hub.org) is a separate, curated
+database of DFT chemisorption/reaction energies across many publications,
+queryable live over a public GraphQL API — no multi-GB download needed.
+Unlike OC20 it has real `*CO` adsorption data. It does *not* generally
+have real transition-state activation energies either (the schema has an
+`activationEnergy` field, but it comes back `null` for effectively every
+reaction queried), so it still feeds the same BEP/Arrhenius rate model,
+just with a real CO data source OC20 alone can't provide:
+
+```sh
+python3 scripts/extract_catalysis_hub.py --out data/oc20/energies_catalysis_hub.bin
+cargo run --release --bin oc20_ingest -- \
+    --input data/oc20/energies_catalysis_hub.bin \
+    --out reactions.lut
+```
+
+`scripts/extract_catalysis_hub.py` paginates the API for the elementary
+adsorption step `star + <gas> -> <adsorbate>star` per species (`O2gas`
+at 0.5 stoichiometry, `H2gas` at 0.5, `COgas` at 1.0), keeping only exact
+matches (no co-adsorbates or lumped multi-step reactions), and writes the
+same `OC20E001` flat binary format `extract_energies.py` does — `oc20_ingest`
+consumes either source unchanged. Uses only the Python standard library
+(`urllib`, `json`, `base64`) — no pip install needed, unlike the OC20 path.
+A full run (no `--limit-per-species`) takes a few minutes and yields on
+the order of 1.3k O + 12.5k H + 5.7k CO real reactions.
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
-untracked — see `.gitignore`. `scripts/extract_energies.py` is tracked;
-only the OC20 downloads/extractions and generated `.bin` files under
-`data/` are not.
+untracked — see `.gitignore`. `scripts/extract_energies.py` and
+`scripts/extract_catalysis_hub.py` are both tracked; only the downloads,
+extractions, and generated `.bin` files under `data/` are not.
