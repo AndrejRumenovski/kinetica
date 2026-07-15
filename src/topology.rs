@@ -11,20 +11,71 @@
 //! slice `idx` lives in* -- a whole lattice's `height`, or one patch's
 //! `rows_in_band` -- since a patch's own local coordinate space is what
 //! actually bounds a neighbor search within it.
+//!
+//! **Hexagonal (fcc(111)) topology.** The reaction data this engine now
+//! targets (see `oc20_ingest --metal Pd --facet 111`) is a real fcc(111)
+//! close-packed surface -- six equidistant nearest neighbors per site, not
+//! four. Rather than introduce a second storage layout, this stays on the
+//! same flat row-major mmap and reinterprets it as an "offset-coordinate"
+//! (odd-r) hex grid: even rows and odd rows are horizontally offset by
+//! half a hex-width from each other, so each row zig-zags into true
+//! close-packed alignment with its neighbors while every site is still
+//! addressable as `row * width + col`. Six neighbor directions per site
+//! (W, E, and two each of "up"/"down") whose exact column offset depends
+//! on the current row's parity -- see `EVEN_ROW_DELTAS`/`ODD_ROW_DELTAS`.
 
 /// Upper bound on neighbors any supported topology can produce for one
-/// site. Every function here returns a fixed-size
-/// `[Option<usize>; MAX_NEIGHBORS]` (no heap allocation on this hot path)
-/// with unused trailing slots `None`.
-pub const MAX_NEIGHBORS: usize = 4;
+/// site -- six, for the hexagonal topology below. Every function here
+/// returns a fixed-size `[Option<usize>; MAX_NEIGHBORS]` (no heap
+/// allocation on this hot path) with unused trailing slots `None`.
+pub const MAX_NEIGHBORS: usize = 6;
 
 #[inline]
 fn row_col(idx: usize, width: usize) -> (usize, usize) {
     (idx / width, idx % width)
 }
 
+/// Bounds-check a `(row, col)` computed via signed deltas and convert it
+/// back to a flat index, or `None` if it fell outside `width` x `rows`.
+#[inline]
+fn try_idx(row: isize, col: isize, width: usize, rows: usize) -> Option<usize> {
+    if row < 0 || col < 0 {
+        return None;
+    }
+    let (row, col) = (row as usize, col as usize);
+    if row >= rows || col >= width {
+        return None;
+    }
+    Some(row * width + col)
+}
+
+/// Offset-coordinate ("odd-r") hex deltas as `(dRow, dCol)`, in a fixed
+/// `[W, E, NW, NE, SW, SE]` order, for a site on an *even*-indexed row.
+/// Even rows are the "reference" columns; odd rows are shifted a half
+/// step to the right, which is why the diagonal (NW/NE/SW/SE) column
+/// offsets differ between `EVEN_ROW_DELTAS` and `ODD_ROW_DELTAS` even
+/// though both represent the same real, symmetric hex adjacency.
+const EVEN_ROW_DELTAS: [(isize, isize); MAX_NEIGHBORS] = [
+    (0, -1),
+    (0, 1), // W, E
+    (-1, -1),
+    (-1, 0), // NW, NE
+    (1, -1),
+    (1, 0), // SW, SE
+];
+
+/// Same as `EVEN_ROW_DELTAS`, for a site on an *odd*-indexed row.
+const ODD_ROW_DELTAS: [(isize, isize); MAX_NEIGHBORS] = [
+    (0, -1),
+    (0, 1), // W, E
+    (-1, 0),
+    (-1, 1), // NW, NE
+    (1, 0),
+    (1, 1), // SW, SE
+];
+
 /// Every grid-adjacent neighbor of `idx` that exists within `width` x
-/// `rows` -- left, right, up, down, in that fixed order (existing
+/// `rows`, in the fixed `[W, E, NW, NE, SW, SE]` order (existing
 /// neighbors packed at the front of the array; the rest `None`). Used
 /// wherever *all* adjacent sites of one site need visiting (bimolecular
 /// partner search, incremental counter updates after a single site
@@ -32,41 +83,42 @@ fn row_col(idx: usize, width: usize) -> (usize, usize) {
 #[inline]
 pub fn all_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; MAX_NEIGHBORS] {
     let (row, col) = row_col(idx, width);
+    let deltas = if row % 2 == 0 { &EVEN_ROW_DELTAS } else { &ODD_ROW_DELTAS };
+
     let mut out = [None; MAX_NEIGHBORS];
     let mut n = 0;
-    if col > 0 {
-        out[n] = Some(idx - 1);
-        n += 1;
-    }
-    if col + 1 < width {
-        out[n] = Some(idx + 1);
-        n += 1;
-    }
-    if row > 0 {
-        out[n] = Some(idx - width);
-        n += 1;
-    }
-    if row + 1 < rows {
-        out[n] = Some(idx + width);
+    for &(dr, dc) in deltas {
+        if let Some(neighbor) = try_idx(row as isize + dr, col as isize + dc, width, rows) {
+            out[n] = Some(neighbor);
+            n += 1;
+        }
     }
     out
 }
 
-/// The canonical *half* of `all_neighbors` -- right and down only -- for a
+/// The canonical *half* of `all_neighbors` -- E, SW, SE -- for a
 /// full-grid scan that must visit every unordered adjacent pair exactly
-/// once (not twice, once from each side). Checking all four from every
-/// site during a full scan would double-count each edge.
+/// once (not twice, once from each side). Checking all six from every
+/// site during a full scan would double-count each edge; this subset is
+/// exactly the complement (W, NW, NE) that every other site's own E/SW/SE
+/// already reaches from the other direction -- see the module tests for
+/// the reciprocity/edge-count invariant this relies on.
 #[inline]
 pub fn forward_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; MAX_NEIGHBORS] {
     let (row, col) = row_col(idx, width);
+    let deltas: [(isize, isize); 3] = if row % 2 == 0 {
+        [(0, 1), (1, -1), (1, 0)] // E, SW, SE
+    } else {
+        [(0, 1), (1, 0), (1, 1)] // E, SW, SE
+    };
+
     let mut out = [None; MAX_NEIGHBORS];
     let mut n = 0;
-    if col + 1 < width {
-        out[n] = Some(idx + 1);
-        n += 1;
-    }
-    if row + 1 < rows {
-        out[n] = Some(idx + width);
+    for &(dr, dc) in &deltas {
+        if let Some(neighbor) = try_idx(row as isize + dr, col as isize + dc, width, rows) {
+            out[n] = Some(neighbor);
+            n += 1;
+        }
     }
     out
 }
@@ -76,16 +128,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_neighbors_interior_site_has_all_four() {
-        let width = 5;
-        let rows = 5;
-        let idx = 2 * width + 2; // (row=2, col=2), fully interior
-        let neighbors: Vec<usize> = all_neighbors(idx, width, rows).into_iter().flatten().collect();
-        assert_eq!(neighbors.len(), 4);
-        assert!(neighbors.contains(&(idx - 1)));
-        assert!(neighbors.contains(&(idx + 1)));
-        assert!(neighbors.contains(&(idx - width)));
-        assert!(neighbors.contains(&(idx + width)));
+    fn all_neighbors_interior_even_row_site_matches_expected_hex_set() {
+        // width=6, rows=6, site (row=2, col=2) -- interior, even row.
+        let width = 6;
+        let rows = 6;
+        let idx = 2 * width + 2;
+        let neighbors: std::collections::BTreeSet<usize> =
+            all_neighbors(idx, width, rows).into_iter().flatten().collect();
+        // W=13, E=15, NW=7, NE=8, SW=19, SE=20
+        assert_eq!(neighbors, [13, 15, 7, 8, 19, 20].into_iter().collect());
+    }
+
+    #[test]
+    fn all_neighbors_interior_odd_row_site_matches_expected_hex_set() {
+        // width=6, rows=6, site (row=3, col=2) -- interior, odd row.
+        let width = 6;
+        let rows = 6;
+        let idx = 3 * width + 2;
+        let neighbors: std::collections::BTreeSet<usize> =
+            all_neighbors(idx, width, rows).into_iter().flatten().collect();
+        // W=19, E=21, NW=14, NE=15, SW=26, SE=27
+        assert_eq!(neighbors, [19, 21, 14, 15, 26, 27].into_iter().collect());
     }
 
     #[test]
@@ -138,5 +201,13 @@ mod tests {
         let rows = 1;
         let neighbors: Vec<usize> = all_neighbors(1, width, rows).into_iter().flatten().collect();
         assert_eq!(neighbors, vec![0, 2]);
+    }
+
+    #[test]
+    fn interior_site_has_exactly_six_neighbors() {
+        let width = 8;
+        let rows = 8;
+        let idx = 4 * width + 4;
+        assert_eq!(all_neighbors(idx, width, rows).into_iter().flatten().count(), 6);
     }
 }

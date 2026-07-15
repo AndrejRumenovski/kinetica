@@ -112,10 +112,10 @@ pub struct OccupancyCounters {
 impl OccupancyCounters {
     /// One O(N) pass over `patch_data`'s initial state, seeding every
     /// counter from scratch. Pair counting only looks at each site's
-    /// *right* and *down* neighbor (not all four) specifically so a full
-    /// scan counts every unordered adjacent pair exactly once -- checking
-    /// all four from every site would double-count each pair, once from
-    /// each side.
+    /// `topology::forward_neighbors` (not all up to six) specifically so a
+    /// full scan counts every unordered adjacent pair exactly once --
+    /// checking every neighbor from every site would double-count each
+    /// pair, once from each side.
     pub fn new(patch_data: &[u8], width: usize, seed: u64) -> Self {
         let mut counters = OccupancyCounters {
             vacant_count: [[0; BUCKETS_PER_SPECIES]; 3],
@@ -396,7 +396,7 @@ impl OccupancyCounters {
     }
 }
 
-/// First (if any) of `site_idx`'s up to four grid neighbors currently in
+/// First (if any) of `site_idx`'s up to six grid neighbors currently in
 /// `state`. Deterministic rather than randomized among multiple matches --
 /// the caller already randomized *which* first site it tried, so picking
 /// the first matching neighbor deterministically doesn't introduce
@@ -634,11 +634,14 @@ mod tests {
                     pair == (ADS_O, ADS_CO) || pair == (ADS_CO, ADS_O),
                     "fired on non-matching pair {pair:?}"
                 );
-                let (ra, ca) = (site_a / width, site_a % width);
-                let (rb, cb) = (site_b / width, site_b % width);
-                let manhattan = (ra as isize - rb as isize).unsigned_abs()
-                    + (ca as isize - cb as isize).unsigned_abs();
-                assert_eq!(manhattan, 1, "bimolecular sites must be grid-adjacent");
+                let neighbors: Vec<usize> = crate::topology::all_neighbors(site_a, width, height)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert!(
+                    neighbors.contains(&site_b),
+                    "bimolecular sites must be topology-adjacent"
+                );
             }
         }
     }

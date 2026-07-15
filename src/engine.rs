@@ -82,9 +82,10 @@ fn apply_migration_occupancy_gated(
 // Per-patch local Gillespie loop
 // ------------------------------------------------------------------------
 
-/// Pick a uniformly random *same-patch* neighbor (up/down/left/right on the
-/// shared (x, y) grid) of `site_idx`, for a bimolecular reaction's second
-/// site. Deliberately constrained to stay within this patch rather than
+/// Pick a uniformly random *same-patch* neighbor (one of `site_idx`'s up
+/// to six hex-topology neighbors, see `topology::all_neighbors`) for a
+/// bimolecular reaction's second site. Deliberately constrained to stay
+/// within this patch rather than
 /// possibly landing in a neighboring patch: a monomolecular reaction's
 /// single-site update can be mirrored across a patch boundary
 /// fire-and-forget via `MigrationEvent` (see `apply_and_record`), but a
@@ -606,10 +607,21 @@ mod tests {
                     .expect("every site in a >1x1 patch has at least one neighbor");
                 assert!(neighbor < width * rows_in_band, "neighbor out of patch bounds");
 
-                let (row, col) = (site_idx / width, site_idx % width);
-                let (n_row, n_col) = (neighbor / width, neighbor % width);
-                let manhattan_distance = row.abs_diff(n_row) + col.abs_diff(n_col);
-                assert_eq!(manhattan_distance, 1, "neighbor must be exactly one grid step away");
+                // "Adjacent" on the hexagonal (fcc(111)) topology isn't a
+                // Manhattan-distance-1 relationship (diagonal neighbors
+                // shift both row and column) -- the actual invariant is
+                // that `neighbor` is one of `site_idx`'s topology-defined
+                // neighbors, and adjacency is reciprocal both ways.
+                let forward: Vec<usize> = crate::topology::all_neighbors(site_idx, width, rows_in_band)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert!(forward.contains(&neighbor), "not a topology neighbor of site_idx");
+                let back: Vec<usize> = crate::topology::all_neighbors(neighbor, width, rows_in_band)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert!(back.contains(&site_idx), "adjacency must be reciprocal");
             }
         }
     }
