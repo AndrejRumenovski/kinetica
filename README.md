@@ -195,11 +195,9 @@ is visible, e.g.:
 oc20_ingest: species O: 1368 adsorption-energy records  (15 with a real DFT-computed activation energy, not BEP)
 ```
 
-(There's also real barrier data for actual bimolecular surface reactions
-like CO oxidation itself, `O* + CO* -> CO2 + 2*`. The engine now supports
-two-site reactions structurally — see "Bimolecular reactions" below — but
-`oc20_ingest` doesn't yet ingest this specific real data into one; it's a
-natural next step, not an architectural limitation anymore.)
+**There's also real barrier data for actual bimolecular surface reactions
+like CO oxidation itself, `O* + CO* -> CO2 + 2*`** — see "Bimolecular
+reactions" below for how this is now wired all the way through.
 
 ### Bimolecular reactions
 
@@ -217,9 +215,43 @@ site has no same-patch neighbor at all (a degenerate 1×1 patch), the
 event is skipped rather than forced onto an invalid site.
 
 `kinetica --generate-lut` synthesizes roughly 1 in 8 demo reactions as
-bimolecular so the path is exercised even without real data on hand;
-`oc20_ingest` currently only builds monomolecular reactions from either
-real data source.
+bimolecular so the path is exercised even without real data on hand.
+
+**`oc20_ingest` now also builds real bimolecular reactions from
+Catalysis-Hub data.** `scripts/extract_catalysis_hub.py`'s real-barrier
+sweep also picks out genuine `O* + CO* -> CO2 + 2*` CO-oxidation
+barriers (e.g. from `StreibelMicrokinetic2021`, "Microkinetic Modeling of
+Propene Combustion" — real NEB barriers around 0.98-1.21 eV on Pd) and
+writes them to a second, parallel binary file (`OC20BI01` format — see
+`scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that file to
+`oc20_ingest --bimolecular-input`:
+
+```sh
+python3 scripts/extract_catalysis_hub.py \
+    --out data/oc20/energies_catalysis_hub.bin \
+    --bimolecular-out data/oc20/energies_catalysis_hub_bimolecular.bin
+cargo run --release --bin oc20_ingest -- \
+    --input data/oc20/energies_catalysis_hub.bin \
+    --bimolecular-input data/oc20/energies_catalysis_hub_bimolecular.bin \
+    --out reactions.lut
+```
+
+Unlike the monomolecular adsorption/desorption pair, a bimolecular record
+only ever builds a *single* forward `ReactionRecord` — there's no BEP
+fallback for a two-species step (a bimolecular record is only emitted
+when Catalysis-Hub reports a real activation energy), and no reverse
+reaction is derived: CO2 leaving the surface as gas isn't the reverse of
+a single elementary step back onto two sites, so there's no
+thermodynamically meaningful `Ea_rev` the way there is for
+adsorption/desorption. These real barriers are rare — typically 1-3
+records per run, since it depends on which handful of publications in
+this live, growing database happen to report a genuine two-site NEB
+barrier for this exact reaction — but real all the same, and the two
+known ones so far land right in the ~1 eV range you'd expect for CO
+oxidation's rate-limiting step. `oc20_ingest` logs how many it loaded and
+folds their rates into the same Q16.16 rescaling pass as every other
+reaction, so the fastest reaction overall (mono- or bimolecular) still
+anchors the scale factor.
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
 untracked — see `.gitignore`. `scripts/extract_energies.py`,

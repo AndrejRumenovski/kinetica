@@ -52,11 +52,20 @@ const SPECIES_NAMES: [&str; 3] = ["O", "H", "CO"];
 const MAGIC: &[u8; 8] = b"OC20E002";
 /// species(1) + energy_mev(4) + sid(4) + has_real_ea(1) + real_ea_mev(4).
 const RECORD_SIZE: usize = 14;
+
+/// `OC20BI01`: the parallel bimolecular format `extract_catalysis_hub.py`'s
+/// `write_bimolecular_records` writes -- see `scripts/oc20e_format.py` for
+/// the authoritative byte layout this must match.
+const MAGIC_BI: &[u8; 8] = b"OC20BI01";
+/// species_a(1) + species_b(1) + energy_mev(4) + sid(4) + ea_mev(4).
+const RECORD_SIZE_BI: usize = 14;
+
 const KB_EV_PER_K: f64 = 8.617_333_262e-5;
 
 #[derive(Debug)]
 struct Config {
     input: PathBuf,
+    bimolecular_input: Option<PathBuf>,
     out: PathBuf,
     alpha: f64,
     beta_ev: f64,
@@ -70,6 +79,7 @@ impl Config {
         let _bin = args.next();
 
         let mut input = None;
+        let mut bimolecular_input = None;
         let mut out = PathBuf::from("reactions.lut");
         let mut alpha = 0.87; // typical BEP slope for atomic adsorption/dissociation steps
         let mut beta_ev = 0.0; // typical BEP intercept, eV
@@ -79,6 +89,10 @@ impl Config {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--input" => input = Some(PathBuf::from(next_value(&mut args, "--input")?)),
+                "--bimolecular-input" => {
+                    bimolecular_input =
+                        Some(PathBuf::from(next_value(&mut args, "--bimolecular-input")?))
+                }
                 "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
                 "--alpha" => alpha = parse_value(&mut args, "--alpha")?,
                 "--beta" => beta_ev = parse_value(&mut args, "--beta")?,
@@ -91,6 +105,7 @@ impl Config {
 
         Ok(Self {
             input: input.ok_or_else(|| format!("`--input` is required\n\n{}", usage()))?,
+            bimolecular_input,
             out,
             alpha,
             beta_ev,
@@ -118,13 +133,17 @@ fn usage() -> String {
      USAGE:\n    \
        oc20_ingest --input <PATH> [OPTIONS]\n\n\
      OPTIONS:\n    \
-       --input <PATH>        Flat binary from an extract_*.py script (required)\n    \
-       --out <PATH>          Output reactions.lut [default: reactions.lut]\n    \
-       --alpha <F>           BEP relation slope [default: 0.87]\n    \
-       --beta <F>            BEP relation intercept, eV [default: 0.0]\n    \
-       --nu <F>              Arrhenius prefactor, s^-1 [default: 1e13]\n    \
-       --temperature <F>     Temperature, K [default: 298.15]\n    \
-       -h, --help            Print this message"
+       --input <PATH>              Flat binary from an extract_*.py script (required)\n    \
+       --bimolecular-input <PATH>  Optional OC20BI01 binary (from\n                                    \
+                                    extract_catalysis_hub.py's --bimolecular-out)\n                                    \
+                                    carrying real two-site reaction barriers,\n                                    \
+                                    e.g. CO oxidation\n    \
+       --out <PATH>                Output reactions.lut [default: reactions.lut]\n    \
+       --alpha <F>                 BEP relation slope [default: 0.87]\n    \
+       --beta <F>                  BEP relation intercept, eV [default: 0.0]\n    \
+       --nu <F>                    Arrhenius prefactor, s^-1 [default: 1e13]\n    \
+       --temperature <F>           Temperature, K [default: 298.15]\n    \
+       -h, --help                  Print this message"
         .to_string()
 }
 
@@ -171,6 +190,58 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
             energy_ev: energy_mev as f64 / 1000.0,
             sid,
             real_ea_ev: has_real_ea.then_some(real_ea_mev as f64 / 1000.0),
+        });
+    }
+
+    Ok(records)
+}
+
+/// One parsed bimolecular record: two adsorbed species consumed by the
+/// same event (indices into `SPECIES_BITS`, same convention as
+/// `EnergyRecord::species`), plus a real DFT-computed forward activation
+/// energy -- this format never carries a BEP-derived one, since there is
+/// no bimolecular BEP relation here (see `oc20e_format.py`).
+struct BiEnergyRecord {
+    species_a: u8,
+    species_b: u8,
+    #[allow(dead_code)]
+    sid: u32,
+    ea_ev: f64,
+}
+
+fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRecord>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+
+    if bytes.len() < 12 || &bytes[0..8] != MAGIC_BI {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not an OC20BI01 bimolecular-energy file (bad magic/too short)",
+        ));
+    }
+    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+
+    let mut records = Vec::with_capacity(count);
+    let mut offset = 12usize;
+    for _ in 0..count {
+        let species_a = bytes[offset];
+        let species_b = bytes[offset + 1];
+        // energy_mev (reaction energy) at offset+2..offset+6 is read from
+        // the file but not currently used -- kept for future thermodynamic
+        // bookkeeping (see oc20e_format.py's field docs).
+        let sid = u32::from_le_bytes(bytes[offset + 6..offset + 10].try_into().unwrap());
+        let ea_mev = i32::from_le_bytes(bytes[offset + 10..offset + 14].try_into().unwrap());
+        offset += RECORD_SIZE_BI;
+
+        if (species_a as usize) >= SPECIES_BITS.len() || (species_b as usize) >= SPECIES_BITS.len()
+        {
+            continue; // defensive: ignore any species index this build doesn't know
+        }
+        records.push(BiEnergyRecord {
+            species_a,
+            species_b,
+            sid,
+            ea_ev: ea_mev as f64 / 1000.0,
         });
     }
 
@@ -256,23 +327,54 @@ fn run(config: &Config) -> io::Result<()> {
         println!("oc20_ingest: species {name}: {count} adsorption-energy records{note}");
     }
 
+    let bimolecular_records = match &config.bimolecular_input {
+        Some(path) => read_bimolecular_records(path)?,
+        None => Vec::new(),
+    };
+    if let Some(path) = &config.bimolecular_input {
+        println!(
+            "oc20_ingest: loaded {} real bimolecular reaction records from {}",
+            bimolecular_records.len(),
+            path.display()
+        );
+    }
+
     // Each input sample yields TWO reactions on the lattice: adsorption
     // (VACANT -> ADS_X, forward reaction energy = the relaxed adsorption
     // energy itself) and desorption (ADS_X -> VACANT, the reverse). Using
     // Ea_rev = Ea_fwd - dE_rxn keeps the pair thermodynamically consistent
     // (same forward/reverse ratio a real free-energy landscape would give)
     // regardless of whether Ea_fwd came from a real barrier or BEP.
-    let mut raw_rates: Vec<(f64, u8)> = Vec::with_capacity(energy_records.len() * 2);
+    //
+    // `(rate, transition_a, transition_b, is_bimolecular)` -- transition_b
+    // is only meaningful (and non-zero) for the bimolecular records
+    // appended below.
+    let mut raw_rates: Vec<(f64, u8, u8, bool)> =
+        Vec::with_capacity(energy_records.len() * 2 + bimolecular_records.len());
     for rec in &energy_records {
         let species_bit = SPECIES_BITS[rec.species as usize];
 
         let ea_fwd = activation_energy_ev(rec.energy_ev, rec.real_ea_ev, config);
         let k_ads = rate_from_activation(ea_fwd, config);
-        raw_rates.push((k_ads, species_bit)); // transition = 0x0_species (adsorption)
+        raw_rates.push((k_ads, species_bit, 0, false)); // transition = 0x0_species (adsorption)
 
         let ea_rev = (ea_fwd - rec.energy_ev).max(0.0);
         let k_des = rate_from_activation(ea_rev, config);
-        raw_rates.push((k_des, species_bit << 4)); // transition = species_0x0 (desorption)
+        raw_rates.push((k_des, species_bit << 4, 0, false)); // transition = species_0x0 (desorption)
+    }
+
+    // Bimolecular records (e.g. CO oxidation, O* + CO* -> CO2 + 2*) carry a
+    // real DFT-computed forward barrier only -- no BEP fallback exists for
+    // a two-species step, and no reverse reaction is built: CO2 leaving the
+    // surface as gas isn't a single elementary step back onto two sites, so
+    // there's no thermodynamically meaningful Ea_rev to derive here (unlike
+    // the monomolecular adsorption/desorption pair above).
+    for rec in &bimolecular_records {
+        let bit_a = SPECIES_BITS[rec.species_a as usize];
+        let bit_b = SPECIES_BITS[rec.species_b as usize];
+        let k = rate_from_activation(rec.ea_ev, config);
+        // transition_a/b = species_0x0 (each site: occupied -> vacant).
+        raw_rates.push((k, bit_a << 4, bit_b << 4, true));
     }
 
     // Rescale into the Q16.16 fixed-point domain `ReactionLutBlock` uses:
@@ -283,12 +385,13 @@ fn run(config: &Config) -> io::Result<()> {
     // changes nothing about which reaction is likeliest to fire -- it only
     // changes the absolute wall-clock/tau units, which this synthetic
     // engine doesn't otherwise calibrate against real time anyway. The
-    // scale is chosen so the single fastest reaction lands just under
-    // 2^31, leaving headroom in the u32 field and keeping bin_id (log2 of
-    // this value) comfortably inside CompositionTable's 32 bins.
+    // scale is chosen so the single fastest reaction (mono- or bimolecular
+    // alike -- both compete for the same propensity budget) lands just
+    // under 2^31, leaving headroom in the u32 field and keeping bin_id
+    // (log2 of this value) comfortably inside CompositionTable's 32 bins.
     let max_k = raw_rates
         .iter()
-        .map(|&(k, _)| k)
+        .map(|&(k, _, _, _)| k)
         .fold(0.0_f64, f64::max);
     let scale = if max_k > 0.0 {
         (1u64 << 31) as f64 / max_k
@@ -298,24 +401,26 @@ fn run(config: &Config) -> io::Result<()> {
 
     let records: Vec<layout::ReactionRecord> = raw_rates
         .into_iter()
-        .map(|(k, transition_a)| {
+        .map(|(k, transition_a, transition_b, is_bimolecular)| {
             let rate_q16 = ((k * scale).round() as u64).clamp(1, u32::MAX as u64) as u32;
             let bin_id = (31 - rate_q16.leading_zeros()) as u8;
             layout::ReactionRecord {
                 rate_q16,
                 bin_id,
                 transition_a,
-                transition_b: 0,
-                is_bimolecular: false,
+                transition_b,
+                is_bimolecular,
             }
         })
         .collect();
 
     println!(
-        "oc20_ingest: built {} reactions ({} adsorption + {} desorption), rate scale factor {:.3e}",
+        "oc20_ingest: built {} reactions ({} adsorption + {} desorption + {} bimolecular), \
+         rate scale factor {:.3e}",
         records.len(),
-        records.len() / 2,
-        records.len() / 2,
+        energy_records.len(),
+        energy_records.len(),
+        bimolecular_records.len(),
         scale
     );
 
@@ -346,6 +451,7 @@ mod tests {
     fn cfg(alpha: f64, beta_ev: f64, nu: f64, temperature_k: f64) -> Config {
         Config {
             input: PathBuf::new(),
+            bimolecular_input: None,
             out: PathBuf::new(),
             alpha,
             beta_ev,
@@ -414,6 +520,21 @@ mod tests {
         assert!(err.contains("--bogus"));
     }
 
+    #[test]
+    fn config_parse_accepts_bimolecular_input() {
+        let args = [
+            "oc20_ingest",
+            "--input",
+            "e.bin",
+            "--bimolecular-input",
+            "bi.bin",
+        ]
+        .iter()
+        .map(|s| s.to_string());
+        let c = Config::parse(args).unwrap();
+        assert_eq!(c.bimolecular_input, Some(PathBuf::from("bi.bin")));
+    }
+
     fn push_record(bytes: &mut Vec<u8>, species: u8, energy_mev: i32, sid: u32, real_ea_mev: Option<i32>) {
         bytes.push(species);
         bytes.extend_from_slice(&energy_mev.to_le_bytes());
@@ -469,5 +590,105 @@ mod tests {
         std::fs::write(&path, b"NOTMAGIC\x00\x00\x00\x00").unwrap();
         assert!(read_energy_records(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn push_bimolecular_record(
+        bytes: &mut Vec<u8>,
+        species_a: u8,
+        species_b: u8,
+        energy_mev: i32,
+        sid: u32,
+        ea_mev: i32,
+    ) {
+        bytes.push(species_a);
+        bytes.push(species_b);
+        bytes.extend_from_slice(&energy_mev.to_le_bytes());
+        bytes.extend_from_slice(&sid.to_le_bytes());
+        bytes.extend_from_slice(&ea_mev.to_le_bytes());
+    }
+
+    #[test]
+    fn read_bimolecular_records_round_trips_and_skips_unknown_species() {
+        let path = temp_path("bi_roundtrip");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC_BI);
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // record_count
+
+        push_bimolecular_record(&mut bytes, 0, 2, -980, 7, 980); // O + CO -> real
+        push_bimolecular_record(&mut bytes, 9, 2, 0, 0, 0); // unknown species_a -- must be skipped
+        push_bimolecular_record(&mut bytes, 0, 9, 0, 0, 0); // unknown species_b -- must be skipped
+
+        std::fs::write(&path, &bytes).unwrap();
+        let records = read_bimolecular_records(&path).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].species_a, 0);
+        assert_eq!(records[0].species_b, 2);
+        assert_eq!(records[0].sid, 7);
+        assert!((records[0].ea_ev - 0.980).abs() < 1e-9);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_bimolecular_records_rejects_bad_magic() {
+        let path = temp_path("bi_bad_magic");
+        std::fs::write(&path, b"NOTMAGIC\x00\x00\x00\x00").unwrap();
+        assert!(read_bimolecular_records(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn run_builds_a_single_bimolecular_reaction_with_no_reverse() {
+        let input_path = temp_path("run_bi_mono_input");
+        let bi_path = temp_path("run_bi_bimolecular_input");
+        let out_path = temp_path("run_bi_out.lut");
+
+        // One ordinary O adsorption/desorption pair, so `energy_records`
+        // isn't empty (run() rejects that up front).
+        let mut mono_bytes = Vec::new();
+        mono_bytes.extend_from_slice(MAGIC);
+        mono_bytes.extend_from_slice(&1u32.to_le_bytes());
+        push_record(&mut mono_bytes, 0, -500, 1, None);
+        std::fs::write(&input_path, &mono_bytes).unwrap();
+
+        // One real CO-oxidation barrier: O* + CO* -> CO2 + 2*, Ea = 1.0 eV.
+        let mut bi_bytes = Vec::new();
+        bi_bytes.extend_from_slice(MAGIC_BI);
+        bi_bytes.extend_from_slice(&1u32.to_le_bytes());
+        push_bimolecular_record(&mut bi_bytes, 0, 2, -980, 42, 1000);
+        std::fs::write(&bi_path, &bi_bytes).unwrap();
+
+        let config = Config {
+            input: input_path.clone(),
+            bimolecular_input: Some(bi_path.clone()),
+            out: out_path.clone(),
+            alpha: 0.87,
+            beta_ev: 0.0,
+            nu: 1.0e13,
+            temperature_k: 298.15,
+        };
+        run(&config).unwrap();
+
+        let lut = layout::ReactionLut::open(&out_path).unwrap();
+        let reaction_count = lut.len() * ReactionLutBlock::LANES;
+        let all_records: Vec<_> = (0..reaction_count).map(|id| lut.rate_of(id)).collect();
+        // 2 monomolecular (adsorption + desorption) + 1 bimolecular; the
+        // rest of the last (8-lane) block is zero-padding.
+        let real_records = all_records.iter().filter(|r| r.rate_q16 > 0).count();
+        assert_eq!(real_records, 3);
+
+        let bimolecular: Vec<_> = all_records
+            .into_iter()
+            .filter(|r| r.is_bimolecular)
+            .collect();
+        assert_eq!(bimolecular.len(), 1, "exactly one bimolecular reaction, no reverse built");
+        let r = bimolecular[0];
+        assert_eq!(r.transition_a, layout::ADS_O << 4); // O* -> vacant
+        assert_eq!(r.transition_b, layout::ADS_CO << 4); // CO* -> vacant
+
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&bi_path);
+        let _ = std::fs::remove_file(&out_path);
     }
 }
