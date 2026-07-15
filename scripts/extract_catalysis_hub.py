@@ -48,7 +48,13 @@ import json
 import sys
 import urllib.request
 
-from oc20e_format import write_bimolecular_records, write_records
+from oc20e_format import (
+    facet_code,
+    metal_index,
+    parse_pure_metal,
+    write_bimolecular_records,
+    write_records,
+)
 
 API_URL = "https://api.catalysis-hub.org/graphql"
 
@@ -150,18 +156,28 @@ def is_clean_adsorption(reactants, products, gas_key, gas_stoich, product_key):
     return True
 
 
-def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None):
-    """Bulk sweep: returns {sid: (species, energy_mev, sid, False, 0)}."""
+def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None, metal=None, facet=None):
+    """Bulk sweep: returns {sid: (species, energy_mev, sid, False, 0, metal_idx, facet_code)}.
+
+    `metal`/`facet`, when given, are pushed down as server-side GraphQL
+    filter args (`surfaceComposition`/`facet`) so this doesn't have to
+    page through every reaction of every metal just to throw most of them
+    away client-side.
+    """
     records = {}
     after = None
+    metal_clause = f', surfaceComposition: "{metal}"' if metal else ""
+    facet_clause = f', facet: "{facet}"' if facet else ""
+    metal_idx = metal_index(metal) if metal else 0
+    facet_val = facet_code(facet) if facet else 0
     while True:
         after_clause = f', after: "{after}"' if after else ""
         limit_clause = f", first: {min(PAGE_SIZE, limit - len(records)) if limit else PAGE_SIZE}"
         query = f"""{{
-          reactions(reactants: "{gas_key}"{limit_clause}{after_clause}) {{
+          reactions(reactants: "{gas_key}"{metal_clause}{facet_clause}{limit_clause}{after_clause}) {{
             totalCount
             pageInfo {{ hasNextPage endCursor }}
-            edges {{ node {{ id reactants products reactionEnergy }} }}
+            edges {{ node {{ id reactants products reactionEnergy surfaceComposition facet }} }}
           }}
         }}"""
         data = graphql_query(query)["reactions"]
@@ -176,7 +192,13 @@ def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None)
             if energy_ev is None:
                 continue
             sid = sid_from_id(node["id"])
-            records[sid] = (species, int(round(energy_ev * 1000.0)), sid, False, 0)
+            # The server-side filter already constrains these when set, but
+            # re-derive from the node's own fields rather than trusting the
+            # filter args blindly -- keeps the record's stored metal/facet
+            # accurate even if this function is ever called without one.
+            rec_metal = metal_idx if metal else metal_index(parse_pure_metal(node["surfaceComposition"]))
+            rec_facet = facet_val if facet else facet_code(node["facet"])
+            records[sid] = (species, int(round(energy_ev * 1000.0)), sid, False, 0, rec_metal, rec_facet)
 
         print(
             f"  ...{gas_key}: scanned to {len(records)} matches "
@@ -193,28 +215,37 @@ def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None)
     return records
 
 
-def fetch_real_barrier_records():
+def fetch_real_barrier_records(metal=None, facet=None):
     """Real-barrier sweep: returns `(mono_records, bimolecular_records)`.
 
-    `mono_records`: {sid: (species, energy_mev, sid, True, ea_mev)} for
-    every reaction with a non-null `activationEnergy` matching one of
-    `REAL_BARRIER_PATTERNS`.
+    `mono_records`: {sid: (species, energy_mev, sid, True, ea_mev, metal,
+    facet)} for every reaction with a non-null `activationEnergy` matching
+    one of `REAL_BARRIER_PATTERNS`.
 
     `bimolecular_records`: {sid: (species_a, species_b, energy_mev, sid,
-    ea_mev)} for every reaction matching one of `BIMOLECULAR_PATTERNS`.
-    Disjoint from `mono_records` -- a node only ever matches one of the
-    two categories, since the reactant-key sets involved don't overlap.
+    ea_mev, metal, facet)} for every reaction matching one of
+    `BIMOLECULAR_PATTERNS`. Disjoint from `mono_records` -- a node only
+    ever matches one of the two categories, since the reactant-key sets
+    involved don't overlap.
+
+    `metal`/`facet`, when given, are pushed down as server-side filter
+    args, same as `fetch_species_records` -- this sweep already scans a
+    much smaller candidate set (only records with a real
+    `activationEnergy`), but there's no reason to pull barriers for metals
+    this run doesn't care about either.
     """
     mono_records = {}
     bimolecular_records = {}
     seen_ids = set()
     after = None
+    metal_clause = f', surfaceComposition: "{metal}"' if metal else ""
+    facet_clause = f', facet: "{facet}"' if facet else ""
     while True:
         after_clause = f', after: "{after}"' if after else ""
         query = f"""{{
-          reactions(first: {PAGE_SIZE}, activationEnergy: -100, op: ">"{after_clause}) {{
+          reactions(first: {PAGE_SIZE}, activationEnergy: -100, op: ">"{metal_clause}{facet_clause}{after_clause}) {{
             pageInfo {{ hasNextPage endCursor }}
-            edges {{ node {{ id reactants products activationEnergy reactionEnergy }} }}
+            edges {{ node {{ id reactants products activationEnergy reactionEnergy surfaceComposition facet }} }}
           }}
         }}"""
         data = graphql_query(query)["reactions"]
@@ -231,6 +262,9 @@ def fetch_real_barrier_records():
             if energy_ev is None:
                 continue
 
+            rec_metal = metal_index(parse_pure_metal(node["surfaceComposition"]))
+            rec_facet = facet_code(node["facet"])
+
             matched = False
             for species, gas_keys, product_key in REAL_BARRIER_PATTERNS:
                 if set(products.keys()) != {product_key}:
@@ -246,6 +280,8 @@ def fetch_real_barrier_records():
                     sid,
                     True,
                     int(round(node["activationEnergy"] * 1000.0)),
+                    rec_metal,
+                    rec_facet,
                 )
                 matched = True
                 break
@@ -263,6 +299,8 @@ def fetch_real_barrier_records():
                     int(round(energy_ev * 1000.0)),
                     sid,
                     int(round(node["activationEnergy"] * 1000.0)),
+                    rec_metal,
+                    rec_facet,
                 )
 
         if not data["pageInfo"]["hasNextPage"]:
@@ -299,13 +337,32 @@ def main():
         help="skip the (fast) real-activation-energy sweep (also skips the "
         "bimolecular recombination sweep, since it rides along the same pass)",
     )
+    parser.add_argument(
+        "--metal",
+        default=None,
+        help="restrict to this pure metal's surfaceComposition (e.g. Pd) -- "
+        "pushed down as a server-side filter; see oc20e_format.METALS for "
+        "the tracked list",
+    )
+    parser.add_argument(
+        "--facet",
+        default=None,
+        help="restrict to this Miller-index facet (e.g. 111) -- pushed down "
+        "as a server-side filter",
+    )
     args = parser.parse_args()
 
     by_sid = {}
     for species, gas_key, gas_stoich, product_key in SPECIES_PATTERNS:
         print(f"fetching clean {product_key} adsorption reactions...", file=sys.stderr)
         records = fetch_species_records(
-            species, gas_key, gas_stoich, product_key, args.limit_per_species
+            species,
+            gas_key,
+            gas_stoich,
+            product_key,
+            args.limit_per_species,
+            metal=args.metal,
+            facet=args.facet,
         )
         print(f"  -> {len(records)} clean {product_key} records", file=sys.stderr)
         by_sid.update(records)
@@ -313,7 +370,9 @@ def main():
     bimolecular_records = {}
     if not args.skip_real_barriers:
         print("fetching real (non-BEP) activation-energy reactions...", file=sys.stderr)
-        real_barrier_records, bimolecular_records = fetch_real_barrier_records()
+        real_barrier_records, bimolecular_records = fetch_real_barrier_records(
+            metal=args.metal, facet=args.facet
+        )
         new_count = sum(1 for sid in real_barrier_records if sid not in by_sid)
         upgraded_count = len(real_barrier_records) - new_count
         by_sid.update(real_barrier_records)

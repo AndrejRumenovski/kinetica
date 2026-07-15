@@ -5,10 +5,12 @@ single-workstation, OC20-scale surface reaction simulation, written in
 pure Rust.
 
 The lattice lives as a memory-mapped file rather than in heap-resident
-`Vec`s, and the simulation is spatially decomposed into independently-
-scheduled `rayon` work-stealing patches whose fired-reaction trajectory is
-streamed out through a double-buffered `io_uring` writer so no compute
-thread ever blocks on disk I/O.
+`Vec`s, is a real hexagonal fcc(111) close-packed surface geometry (see
+"Lattice geometry and target surface: Pd(111)" below) rather than a
+generic square grid, and the simulation is spatially decomposed into
+independently-scheduled `rayon` work-stealing patches whose fired-reaction
+trajectory is streamed out through a double-buffered `io_uring` writer so
+no compute thread ever blocks on disk I/O.
 
 Two reaction-selection engines coexist, auto-selected from a magic header
 in `reactions.lut` itself (no CLI flag to keep in sync): a **static**
@@ -38,6 +40,7 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | Path                    | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
 | `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind` |
+| `src/topology.rs`        | Neighbor topology (hexagonal, fcc(111) -- six neighbors per site) shared by the occupancy-gated engine and the bimolecular partner search |
 | `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
 | `src/occupancy.rs`       | Live per-patch occupancy counters + bounded-rejection site selection -- the `OccupancyGated`/real-data engine |
 | `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing patches, crossbeam boundary migration, double-buffered `io_uring` trajectory writer, dispatch between the two engines |
@@ -110,12 +113,55 @@ sync with how the file was actually built. For an occupancy-gated LUT,
 rejection magnitude class"; see `oc20_ingest`'s docs for where that bucket
 index comes from.
 
-**This intentionally didn't try to fix everything at once.** Pooling real
-DFT samples from many different metals/facets onto one idealized lattice,
-and the lattice's generic square/4-neighbor geometry not matching any real
-crystallographic surface, are both still open — occupancy-gating changes
-*how* a reaction is selected and applied, not *what* chemistry the
-underlying rate constants represent.
+**This intentionally didn't try to fix everything at once.** Occupancy-gating
+changes *how* a reaction is selected and applied, not *what* chemistry the
+underlying rate constants represent. The next section closes the other
+half: the lattice's real geometry and which real surface its rate
+constants are actually measured on.
+
+## Lattice geometry and target surface: Pd(111)
+
+The lattice is a real fcc(111) close-packed surface — six equidistant
+nearest neighbors per site, not the generic square/4-neighbor grid earlier
+versions used. `src/topology.rs` centralizes what "adjacent site" means
+(previously duplicated, inconsistently, across `occupancy.rs` and
+`engine.rs`) and models the hex grid as an offset-coordinate ("odd-r")
+reinterpretation of the same flat row-major mmap — no storage change, just
+row-parity-dependent column offsets for the diagonal neighbors, so every
+row zig-zags into true close-packed alignment. `topology::all_neighbors`
+returns up to six neighbors; `topology::forward_neighbors` returns the
+canonical half (three) a full-grid scan uses to count every unordered
+adjacent pair exactly once.
+
+`reactions.lut`'s real data is now filtered to a single real
+crystallographic surface — **Pd(111)** — instead of pooling DFT samples
+from every metal/facet a species happens to appear on. `oc20_ingest
+--metal Pd --facet 111` (see below) restricts monomolecular O/H/CO
+adsorption data to that one surface, with a per-species fallback to
+"Pd, any facet" logged explicitly if a species' facet-filtered pool is too
+sparse to bucket meaningfully (see `oc20_ingest --help`).
+
+**Real bimolecular (CO-oxidation, H2-recombination) barriers are absent
+from a strict Pd(111) build — a genuine, checked finding, not an
+oversight.** Tracing the exact `surfaceComposition`/`facet` metadata behind
+the two previously-cited real barriers turned up:
+
+- The CO-oxidation barrier (`StreibelMicrokinetic2021`, ~0.98–1.21 eV) is
+  real and on pure Pd, but at facet **(211)**, not (111) — plus a second
+  record on an oxide-modified `Pd+1:3O` surface (excluded outright by the
+  pure-single-element metal filter, since it isn't elemental Pd).
+- The H2-recombination barrier (~0.35 eV) is on `PdH`-hydride surfaces
+  (`PdH-hcp-4layer`/`PdH-hcp-6layer`) at non-clean facet labels
+  (`101-0.75MLfccH`, etc.) — a hydride, not clean metallic Pd.
+
+Neither survives a filter that means what it says ("real Pd(111) metal").
+So this build's `reactions.lut` has real, Pd(111)-specific monomolecular
+O/H/CO adsorption/desorption chemistry and **zero bimolecular reactions**
+— rather than quietly keeping the old cross-facet/cross-composition
+bimolecular records under a "Pd" label that would itself be exactly the
+kind of pooling this change exists to eliminate. Restoring bimolecular
+chemistry on a real, single, chemically-clean surface is future work (see
+"Next step" in the project handoff), not something this pass papers over.
 
 ## Building `reactions.lut` from real data
 
@@ -224,6 +270,37 @@ cargo run --release --bin oc20_ingest -- \
     --out reactions.lut
 ```
 
+**Restricting to one real surface (`--metal`/`--facet`).** Both the
+extraction script and `oc20_ingest` accept `--metal`/`--facet` filters —
+pushed down to the GraphQL API as server-side `surfaceComposition`/`facet`
+filter args on the extraction side, applied post-hoc (with a per-species
+fallback to metal-only if `--facet` leaves too few samples to bucket) on
+the ingest side. This is what this repo's own `reactions.lut` is built
+from — see "Lattice geometry and target surface: Pd(111)" above:
+
+```sh
+python3 scripts/extract_catalysis_hub.py \
+    --out data/oc20/energies_pd111.bin \
+    --metal Pd --facet 111
+cargo run --release --bin oc20_ingest -- \
+    --input data/oc20/energies_pd111.bin \
+    --metal Pd --facet 111 \
+    --out reactions.lut
+```
+
+`--metal` matches against a *pure single element* formula (via
+`oc20e_format.parse_pure_metal`) — an alloy, intermetallic, oxide, or
+hydride surface (e.g. `PdPt`, `Pd+1:3O`, `PdH`) is excluded, not folded in
+under the pure metal's name, even though the database's own
+`surfaceComposition` string sometimes does exactly that. `--facet` matches
+a plain decimal Miller-index string (`"111"`); facet labels with suffixes
+(`"110-lc-Ovac"`) or non-numeric content don't match anything and are
+tagged "unknown" (`facet_code` returns 0) rather than silently
+mis-parsed. Sample counts at this level of filtering are small (tens, not
+thousands, per species) — `oc20_ingest`'s per-species fallback log line
+makes it visible whenever a species had to broaden from "this facet" to
+"this metal, any facet" to reach `BUCKETS_PER_SPECIES` (4) samples.
+
 `scripts/extract_catalysis_hub.py` runs two passes. The bulk sweep
 paginates the API for the elementary adsorption step
 `star + <gas> -> <adsorbate>star` per species (`O2gas` at 0.5
@@ -282,14 +359,14 @@ exactly as before. How the two sites get *chosen* differs by engine (see
 "Occupancy-gated kMC" above):
 
 - **Static** (`--generate-lut` demo data): site A is a uniformly random
-  patch site; site B is one of its same-patch grid neighbors
-  (up/down/left/right), picked without checking either site's actual
+  patch site; site B is one of its same-patch hex-topology neighbors (see
+  `topology::all_neighbors`), picked without checking either site's actual
   occupancy -- fine for exercising the architecture, not meant to be
   chemically exact.
 - **Occupancy-gated** (real, `oc20_ingest`-built data): site A is
   rejection-sampled until it genuinely holds the reaction's first
   reactant species; site B is deterministically checked among site A's
-  (up to four) neighbors for the second reactant species, retrying the
+  (up to six) neighbors for the second reactant species, retrying the
   whole pair on a miss. A bimolecular reaction can only ever fire on a
   site pair that actually has both reactants present.
 
@@ -304,12 +381,21 @@ invalid site.
 bimolecular so the static path is exercised even without real data on
 hand.
 
-**`oc20_ingest` now also builds real bimolecular reactions from
-Catalysis-Hub data.** `scripts/extract_catalysis_hub.py`'s real-barrier
-sweep also picks out genuine two-site recombination barriers
-(`BIMOLECULAR_PATTERNS`) and writes them to a second, parallel binary
-file (`OC20BI01` format — see `scripts/oc20e_format.py`) via
-`--bimolecular-out`. Pass that file to `oc20_ingest --bimolecular-input`:
+**`oc20_ingest` can also build real bimolecular reactions from
+Catalysis-Hub data — though not, currently, for the Pd(111)-filtered build
+this repo ships (see "Lattice geometry and target surface: Pd(111)" above
+for why: the real barriers below turned out to live on Pd(211)/oxide/
+hydride surfaces once their exact facet/composition was checked, not on
+clean Pd(111)).** The mechanism itself is real and tested — it's the
+*intersection* with a strict single-surface filter that's currently empty,
+not a gap in the engine or the ingest pipeline.
+`scripts/extract_catalysis_hub.py`'s real-barrier sweep picks out genuine
+two-site recombination barriers (`BIMOLECULAR_PATTERNS`) and writes them
+to a second, parallel binary file (`OC20BI02` format — see
+`scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that file to
+`oc20_ingest --bimolecular-input` (using an unfiltered or differently-
+filtered extraction — e.g. no `--metal`/`--facet`, or `--metal Pd --facet
+211` for the real CO-oxidation barrier specifically):
 
 ```sh
 python3 scripts/extract_catalysis_hub.py \
@@ -368,7 +454,9 @@ genuine two-site O2 recombination record with a real barrier exists in
 the data either (only the same single-site 0.5-stoichiometry pattern
 already covered by the monomolecular path). So within the current
 three-species (O/H/CO) model, CO oxidation and H2 recombination are the
-only two real bimolecular reactions the live data actually supports.
+only two real bimolecular reactions the live data actually supports (on
+*some* metal/facet — see the Pd(111)-specific finding above for why
+neither currently makes it into this repo's own single-surface build).
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
 untracked — see `.gitignore`. `scripts/extract_energies.py`,

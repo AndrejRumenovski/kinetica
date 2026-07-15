@@ -80,16 +80,32 @@ use kinetica::occupancy::BUCKETS_PER_SPECIES;
 /// scripts.
 const SPECIES_NAMES: [&str; 3] = ["O", "H", "CO"];
 
-const MAGIC: &[u8; 8] = b"OC20E002";
-/// species(1) + energy_mev(4) + sid(4) + has_real_ea(1) + real_ea_mev(4).
-const RECORD_SIZE: usize = 14;
+const MAGIC: &[u8; 8] = b"OC20E003";
+/// species(1) + energy_mev(4) + sid(4) + has_real_ea(1) + real_ea_mev(4)
+/// + metal(1) + facet(2).
+const RECORD_SIZE: usize = 17;
 
-/// `OC20BI01`: the parallel bimolecular format `extract_catalysis_hub.py`'s
+/// `OC20BI02`: the parallel bimolecular format `extract_catalysis_hub.py`'s
 /// `write_bimolecular_records` writes -- see `scripts/oc20e_format.py` for
 /// the authoritative byte layout this must match.
-const MAGIC_BI: &[u8; 8] = b"OC20BI01";
-/// species_a(1) + species_b(1) + energy_mev(4) + sid(4) + ea_mev(4).
-const RECORD_SIZE_BI: usize = 14;
+const MAGIC_BI: &[u8; 8] = b"OC20BI02";
+/// species_a(1) + species_b(1) + energy_mev(4) + sid(4) + ea_mev(4)
+/// + metal(1) + facet(2).
+const RECORD_SIZE_BI: usize = 17;
+
+/// Metal index table, in lockstep with `scripts/oc20e_format.py`'s own
+/// `METALS` list -- the numeric index is what's on disk in both
+/// `OC20E003`/`OC20BI02` records, not the string, so the two lists must
+/// stay identical. Index 0 ("unknown") means "not one of the metals this
+/// pipeline tracks," not "absent" -- every real record still carries some
+/// index, even if it's 0.
+const METALS: [&str; 13] = [
+    "unknown", "Pd", "Pt", "Cu", "Ni", "Rh", "Ru", "Ag", "Au", "Fe", "Co", "Ir", "Os",
+];
+
+fn metal_index(symbol: &str) -> Option<u8> {
+    METALS.iter().position(|&m| m == symbol).map(|i| i as u8)
+}
 
 const KB_EV_PER_K: f64 = 8.617_333_262e-5;
 
@@ -102,6 +118,12 @@ struct Config {
     beta_ev: f64,
     nu: f64,
     temperature_k: f64,
+    /// Restrict ingestion to this metal (index into `METALS`), with a
+    /// per-species fallback to "this metal, any facet" when the
+    /// `--facet`-filtered pool is too sparse to bucket meaningfully --
+    /// see `run`'s `filter_with_fallback`.
+    metal: Option<u8>,
+    facet: Option<u16>,
 }
 
 impl Config {
@@ -116,6 +138,8 @@ impl Config {
         let mut beta_ev = 0.0; // typical BEP intercept, eV
         let mut nu = 1.0e13; // typical harmonic TST attempt frequency, s^-1
         let mut temperature_k = 298.15;
+        let mut metal = None;
+        let mut facet = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -129,6 +153,16 @@ impl Config {
                 "--beta" => beta_ev = parse_value(&mut args, "--beta")?,
                 "--nu" => nu = parse_value(&mut args, "--nu")?,
                 "--temperature" => temperature_k = parse_value(&mut args, "--temperature")?,
+                "--metal" => {
+                    let symbol = next_value(&mut args, "--metal")?;
+                    metal = Some(metal_index(&symbol).ok_or_else(|| {
+                        format!(
+                            "`--metal` value `{symbol}` isn't tracked; known metals: {}",
+                            METALS[1..].join(", ")
+                        )
+                    })?);
+                }
+                "--facet" => facet = Some(parse_value(&mut args, "--facet")?),
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unrecognized argument `{other}`\n\n{}", usage())),
             }
@@ -142,6 +176,8 @@ impl Config {
             beta_ev,
             nu,
             temperature_k,
+            metal,
+            facet,
         })
     }
 }
@@ -174,6 +210,11 @@ fn usage() -> String {
        --beta <F>                  BEP relation intercept, eV [default: 0.0]\n    \
        --nu <F>                    Arrhenius prefactor, s^-1 [default: 1e13]\n    \
        --temperature <F>           Temperature, K [default: 298.15]\n    \
+       --metal <SYMBOL>            Restrict to this metal (e.g. Pd); per-species\n                                    \
+                                    fallback to metal/any-facet if --facet leaves\n                                    \
+                                    too few samples to bucket [default: no filter]\n    \
+       --facet <N>                 Restrict to this Miller-index facet (e.g. 111)\n                                    \
+                                    [default: no filter]\n    \
        -h, --help                  Print this message"
         .to_string()
 }
@@ -190,6 +231,10 @@ struct EnergyRecord {
     #[allow(dead_code)]
     sid: u32,
     real_ea_ev: Option<f64>,
+    /// Index into `METALS`; 0 = unknown/not tracked.
+    metal: u8,
+    /// Decimal-digit Miller-index encoding (e.g. 111); 0 = unknown.
+    facet: u16,
 }
 
 fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> {
@@ -199,7 +244,7 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
     if bytes.len() < 12 || &bytes[0..8] != MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not an OC20E002 energy file (bad magic/too short)",
+            "not an OC20E003 energy file (bad magic/too short)",
         ));
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -212,6 +257,8 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
         let sid = u32::from_le_bytes(bytes[offset + 5..offset + 9].try_into().unwrap());
         let has_real_ea = bytes[offset + 9] != 0;
         let real_ea_mev = i32::from_le_bytes(bytes[offset + 10..offset + 14].try_into().unwrap());
+        let metal = bytes[offset + 14];
+        let facet = u16::from_le_bytes(bytes[offset + 15..offset + 17].try_into().unwrap());
         offset += RECORD_SIZE;
 
         if (species as usize) >= SPECIES_BITS.len() {
@@ -222,6 +269,8 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
             energy_ev: energy_mev as f64 / 1000.0,
             sid,
             real_ea_ev: has_real_ea.then_some(real_ea_mev as f64 / 1000.0),
+            metal,
+            facet,
         });
     }
 
@@ -233,12 +282,15 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
 /// `EnergyRecord::species`), plus a real DFT-computed forward activation
 /// energy -- this format never carries a BEP-derived one, since there is
 /// no bimolecular BEP relation here (see `oc20e_format.py`).
+#[derive(Clone, Copy)]
 struct BiEnergyRecord {
     species_a: u8,
     species_b: u8,
     #[allow(dead_code)]
     sid: u32,
     ea_ev: f64,
+    metal: u8,
+    facet: u16,
 }
 
 fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRecord>> {
@@ -248,7 +300,7 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
     if bytes.len() < 12 || &bytes[0..8] != MAGIC_BI {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not an OC20BI01 bimolecular-energy file (bad magic/too short)",
+            "not an OC20BI02 bimolecular-energy file (bad magic/too short)",
         ));
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -263,6 +315,8 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
         // bookkeeping (see oc20e_format.py's field docs).
         let sid = u32::from_le_bytes(bytes[offset + 6..offset + 10].try_into().unwrap());
         let ea_mev = i32::from_le_bytes(bytes[offset + 10..offset + 14].try_into().unwrap());
+        let metal = bytes[offset + 14];
+        let facet = u16::from_le_bytes(bytes[offset + 15..offset + 17].try_into().unwrap());
         offset += RECORD_SIZE_BI;
 
         if (species_a as usize) >= SPECIES_BITS.len() || (species_b as usize) >= SPECIES_BITS.len()
@@ -274,6 +328,8 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
             species_b,
             sid,
             ea_ev: ea_mev as f64 / 1000.0,
+            metal,
+            facet,
         });
     }
 
@@ -348,6 +404,92 @@ fn rate_from_activation(activation_ev: f64, config: &Config) -> f64 {
     config.nu * (-activation_ev / (KB_EV_PER_K * config.temperature_k)).exp()
 }
 
+/// Apply `config`'s `--metal`/`--facet` filters to `records`, grouped per
+/// species (`SPECIES_BITS`'s index order). When both are set and a given
+/// species' `(metal, facet)`-filtered pool has fewer than
+/// `BUCKETS_PER_SPECIES` samples, that species alone falls back to
+/// `metal`-only (any facet) -- logged explicitly so a reader can tell a
+/// deliberate, honest broadening from a silent pooling regression. A
+/// species left with zero samples even after falling back stays empty,
+/// same as today's "absent from --input" case.
+fn filter_with_fallback(records: &[EnergyRecord], config: &Config) -> [Vec<EnergyRecord>; 3] {
+    let mut by_species: [Vec<EnergyRecord>; 3] = Default::default();
+
+    let Some(metal) = config.metal else {
+        for &rec in records {
+            by_species[rec.species as usize].push(rec);
+        }
+        return by_species;
+    };
+
+    let metal_only: Vec<EnergyRecord> = records.iter().copied().filter(|r| r.metal == metal).collect();
+    let metal_name = METALS[metal as usize];
+
+    for (species, slot) in by_species.iter_mut().enumerate() {
+        let metal_only_species: Vec<EnergyRecord> = metal_only
+            .iter()
+            .copied()
+            .filter(|r| r.species as usize == species)
+            .collect();
+
+        let Some(facet) = config.facet else {
+            *slot = metal_only_species;
+            continue;
+        };
+
+        let filtered: Vec<EnergyRecord> = metal_only_species
+            .iter()
+            .copied()
+            .filter(|r| r.facet == facet)
+            .collect();
+
+        if filtered.len() < BUCKETS_PER_SPECIES && metal_only_species.len() > filtered.len() {
+            println!(
+                "oc20_ingest: species {}: only {} record(s) match --metal {metal_name} \
+                 --facet {facet}; broadening to --metal {metal_name} (any facet) -> \
+                 {} record(s)",
+                SPECIES_NAMES[species],
+                filtered.len(),
+                metal_only_species.len()
+            );
+            *slot = metal_only_species;
+        } else {
+            *slot = filtered;
+        }
+    }
+
+    by_species
+}
+
+/// Same `--metal`/`--facet` filtering for the (much smaller) bimolecular
+/// record set. Bimolecular real barriers are rare enough that there's no
+/// meaningful quantile-bucket threshold to fall back against -- the
+/// fallback here triggers whenever the facet-filtered pool is empty but
+/// the metal-only one isn't.
+fn filter_bimolecular_with_fallback(records: &[BiEnergyRecord], config: &Config) -> Vec<BiEnergyRecord> {
+    let Some(metal) = config.metal else {
+        return records.to_vec();
+    };
+    let metal_only: Vec<BiEnergyRecord> = records.iter().copied().filter(|r| r.metal == metal).collect();
+    let metal_name = METALS[metal as usize];
+
+    let Some(facet) = config.facet else {
+        return metal_only;
+    };
+
+    let filtered: Vec<BiEnergyRecord> = metal_only.iter().copied().filter(|r| r.facet == facet).collect();
+    if filtered.is_empty() && !metal_only.is_empty() {
+        println!(
+            "oc20_ingest: bimolecular: no record matches --metal {metal_name} --facet {facet}; \
+             broadening to --metal {metal_name} (any facet) -> {} record(s)",
+            metal_only.len()
+        );
+        metal_only
+    } else {
+        filtered
+    }
+}
+
 fn main() -> std::process::ExitCode {
     let config = match Config::parse(std::env::args()) {
         Ok(c) => c,
@@ -380,6 +522,18 @@ fn run(config: &Config) -> io::Result<()> {
         ));
     }
 
+    if let Some(metal) = config.metal {
+        let facet_desc = config
+            .facet
+            .map(|f| f.to_string())
+            .unwrap_or_else(|| "any".to_string());
+        println!(
+            "oc20_ingest: filtering to metal={} facet={facet_desc} (per-species fallback to \
+             metal-only if --facet leaves too few samples to bucket)",
+            METALS[metal as usize]
+        );
+    }
+
     // Log per-species coverage explicitly rather than let a gap pass
     // silently: OC20's `train`/`val` splits do not cover every adsorbate
     // uniformly. `*CO` in particular is held out of `train`/`val` entirely
@@ -389,10 +543,7 @@ fn run(config: &Config) -> io::Result<()> {
     // cheating -- so there is currently no real-energy source for CO
     // anywhere in this dataset bundle. A `--input` built from `train` will
     // therefore always show 0 CO records; that is expected, not a bug.
-    let mut by_species: [Vec<EnergyRecord>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-    for &rec in &energy_records {
-        by_species[rec.species as usize].push(rec);
-    }
+    let by_species = filter_with_fallback(&energy_records, config);
 
     let mut bucketed_by_species: [Vec<BucketSummary>; 3] = Default::default();
     for species in 0..SPECIES_BITS.len() {
@@ -428,12 +579,12 @@ fn run(config: &Config) -> io::Result<()> {
     }
 
     let bimolecular_records = match &config.bimolecular_input {
-        Some(path) => read_bimolecular_records(path)?,
+        Some(path) => filter_bimolecular_with_fallback(&read_bimolecular_records(path)?, config),
         None => Vec::new(),
     };
     if let Some(path) = &config.bimolecular_input {
         println!(
-            "oc20_ingest: loaded {} real bimolecular reaction records from {}",
+            "oc20_ingest: loaded {} real bimolecular reaction records from {} (after --metal/--facet filtering)",
             bimolecular_records.len(),
             path.display()
         );
@@ -601,6 +752,8 @@ mod tests {
             beta_ev,
             nu,
             temperature_k,
+            metal: None,
+            facet: None,
         }
     }
 
@@ -679,12 +832,114 @@ mod tests {
         assert_eq!(c.bimolecular_input, Some(PathBuf::from("bi.bin")));
     }
 
+    #[test]
+    fn config_parse_accepts_metal_and_facet() {
+        let args = ["oc20_ingest", "--input", "e.bin", "--metal", "Pd", "--facet", "111"]
+            .iter()
+            .map(|s| s.to_string());
+        let c = Config::parse(args).unwrap();
+        assert_eq!(c.metal, metal_index("Pd"));
+        assert_eq!(c.facet, Some(111));
+    }
+
+    #[test]
+    fn config_parse_rejects_unknown_metal() {
+        let args = ["oc20_ingest", "--input", "e.bin", "--metal", "Unobtainium"]
+            .iter()
+            .map(|s| s.to_string());
+        let err = Config::parse(args).unwrap_err();
+        assert!(err.contains("Unobtainium"));
+    }
+
+    fn energy_record_with_metal(species: u8, metal: u8, facet: u16) -> EnergyRecord {
+        EnergyRecord {
+            species,
+            energy_ev: -0.5,
+            sid: 0,
+            real_ea_ev: None,
+            metal,
+            facet,
+        }
+    }
+
+    #[test]
+    fn filter_with_fallback_passes_through_everything_when_no_metal_set() {
+        let records = vec![
+            energy_record_with_metal(0, 0, 0),
+            energy_record_with_metal(0, 1, 111),
+        ];
+        let c = cfg(0.87, 0.0, 1e13, 298.15);
+        let by_species = filter_with_fallback(&records, &c);
+        assert_eq!(by_species[0].len(), 2);
+    }
+
+    #[test]
+    fn filter_with_fallback_restricts_to_metal_and_facet() {
+        let pd = metal_index("Pd").unwrap();
+        let pt = metal_index("Pt").unwrap();
+        let records = vec![
+            energy_record_with_metal(0, pd, 111), // matches
+            energy_record_with_metal(0, pd, 100), // wrong facet
+            energy_record_with_metal(0, pt, 111), // wrong metal
+        ];
+        let mut c = cfg(0.87, 0.0, 1e13, 298.15);
+        c.metal = Some(pd);
+        c.facet = Some(111);
+        // Only 1 record matches metal+facet, below BUCKETS_PER_SPECIES --
+        // this exercises the fallback path (see the next test for a case
+        // where the fallback shouldn't trigger).
+        let by_species = filter_with_fallback(&records, &c);
+        // Falls back to metal-only (any facet): both Pd records.
+        assert_eq!(by_species[0].len(), 2);
+        assert!(by_species[0].iter().all(|r| r.metal == pd));
+    }
+
+    #[test]
+    fn filter_with_fallback_does_not_broaden_when_facet_pool_is_large_enough() {
+        let pd = metal_index("Pd").unwrap();
+        let pt = metal_index("Pt").unwrap();
+        let mut records: Vec<EnergyRecord> = (0..BUCKETS_PER_SPECIES)
+            .map(|_| energy_record_with_metal(0, pd, 111))
+            .collect();
+        records.push(energy_record_with_metal(0, pt, 111)); // wrong metal, must be excluded
+        let mut c = cfg(0.87, 0.0, 1e13, 298.15);
+        c.metal = Some(pd);
+        c.facet = Some(111);
+        let by_species = filter_with_fallback(&records, &c);
+        assert_eq!(by_species[0].len(), BUCKETS_PER_SPECIES);
+        assert!(by_species[0].iter().all(|r| r.metal == pd && r.facet == 111));
+    }
+
+    fn bimolecular_record_with_metal(species_a: u8, species_b: u8, metal: u8, facet: u16) -> BiEnergyRecord {
+        BiEnergyRecord {
+            species_a,
+            species_b,
+            sid: 0,
+            ea_ev: 1.0,
+            metal,
+            facet,
+        }
+    }
+
+    #[test]
+    fn filter_bimolecular_with_fallback_broadens_when_facet_pool_is_empty() {
+        let pd = metal_index("Pd").unwrap();
+        let records = vec![bimolecular_record_with_metal(0, 2, pd, 211)]; // facet 211, not 111
+        let mut c = cfg(0.87, 0.0, 1e13, 298.15);
+        c.metal = Some(pd);
+        c.facet = Some(111);
+        let filtered = filter_bimolecular_with_fallback(&records, &c);
+        assert_eq!(filtered.len(), 1, "should broaden to metal-only rather than drop the only record");
+    }
+
     fn energy_record(energy_ev: f64, real_ea_ev: Option<f64>) -> EnergyRecord {
         EnergyRecord {
             species: 0,
             energy_ev,
             sid: 0,
             real_ea_ev,
+            metal: 0,
+            facet: 0,
         }
     }
 
@@ -749,11 +1004,26 @@ mod tests {
     }
 
     fn push_record(bytes: &mut Vec<u8>, species: u8, energy_mev: i32, sid: u32, real_ea_mev: Option<i32>) {
+        push_record_with_metal(bytes, species, energy_mev, sid, real_ea_mev, 0, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_record_with_metal(
+        bytes: &mut Vec<u8>,
+        species: u8,
+        energy_mev: i32,
+        sid: u32,
+        real_ea_mev: Option<i32>,
+        metal: u8,
+        facet: u16,
+    ) {
         bytes.push(species);
         bytes.extend_from_slice(&energy_mev.to_le_bytes());
         bytes.extend_from_slice(&sid.to_le_bytes());
         bytes.push(real_ea_mev.is_some() as u8);
         bytes.extend_from_slice(&real_ea_mev.unwrap_or(0).to_le_bytes());
+        bytes.push(metal);
+        bytes.extend_from_slice(&facet.to_le_bytes());
     }
 
     #[test]
@@ -813,11 +1083,27 @@ mod tests {
         sid: u32,
         ea_mev: i32,
     ) {
+        push_bimolecular_record_with_metal(bytes, species_a, species_b, energy_mev, sid, ea_mev, 0, 0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_bimolecular_record_with_metal(
+        bytes: &mut Vec<u8>,
+        species_a: u8,
+        species_b: u8,
+        energy_mev: i32,
+        sid: u32,
+        ea_mev: i32,
+        metal: u8,
+        facet: u16,
+    ) {
         bytes.push(species_a);
         bytes.push(species_b);
         bytes.extend_from_slice(&energy_mev.to_le_bytes());
         bytes.extend_from_slice(&sid.to_le_bytes());
         bytes.extend_from_slice(&ea_mev.to_le_bytes());
+        bytes.push(metal);
+        bytes.extend_from_slice(&facet.to_le_bytes());
     }
 
     #[test]
@@ -880,6 +1166,8 @@ mod tests {
             beta_ev: 0.0,
             nu: 1.0e13,
             temperature_k: 298.15,
+            metal: None,
+            facet: None,
         };
         run(&config).unwrap();
 
@@ -936,6 +1224,8 @@ mod tests {
             beta_ev: 0.0,
             nu: 1.0e13,
             temperature_k: 298.15,
+            metal: None,
+            facet: None,
         };
         run(&config).unwrap();
 
@@ -1004,6 +1294,8 @@ mod tests {
             beta_ev: 0.0,
             nu: 1.0e13,
             temperature_k: 298.15,
+            metal: None,
+            facet: None,
         };
         run(&config).unwrap();
 
