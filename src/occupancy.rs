@@ -59,6 +59,49 @@ fn species_index(species_bit: u8) -> Option<usize> {
     SPECIES_BITS.iter().position(|&b| b == species_bit)
 }
 
+/// Relative gas-phase partial-pressure multipliers for the three tracked
+/// species' *adsorption* channels only, in `SPECIES_BITS` index order (O,
+/// H, CO) -- a runtime simulator parameter (`kinetica --pressure-o2
+/// --pressure-h2 --pressure-co`), not baked into `reactions.lut`, so
+/// changing the feed-gas composition never requires rebuilding it. Without
+/// this, two runs meant to represent different partial pressures produced
+/// identical adsorption kinetics -- the same rate-constant table applied
+/// regardless of how much of each gas was actually being fed in.
+///
+/// Desorption and bimolecular templates are untouched: pressure only
+/// gates a reaction that consumes a gas-phase molecule (an adsorption
+/// step, `VACANT -> species`), not one that's already conditioned on
+/// something already sitting on the surface. `ones()` reproduces exactly
+/// the pre-pressure-coupling propensities (every multiplier 1.0).
+#[derive(Clone, Copy, Debug)]
+pub struct Pressures {
+    pub values: [f64; 3],
+}
+
+impl Pressures {
+    pub const fn ones() -> Self {
+        Pressures { values: [1.0; 3] }
+    }
+}
+
+/// `1.0` for every template except a monomolecular adsorption one, where
+/// it's that species' relative partial pressure -- the single point
+/// pressure enters the propensity calculation, kept separate from
+/// `live_count` since a pressure multiplier isn't a physical site count.
+fn pressure_factor(template: &ReactionRecord, pressures: &Pressures) -> f64 {
+    if template.is_bimolecular {
+        return 1.0;
+    }
+    let reactant_mask = template.transition_a >> 4;
+    if reactant_mask != 0 {
+        return 1.0; // desorption: no gas-phase reactant to gate on
+    }
+    let product_mask = template.transition_a & 0x0F;
+    species_index(product_mask)
+        .map(|s| pressures.values[s])
+        .unwrap_or(1.0)
+}
+
 /// Deterministic, storage-free hash mapping one lattice site's global
 /// index to a quantile bucket for one species. A single-shot mix (not a
 /// stateful stream) reusing `gillespie::Rng`'s SplitMix64 constants for
@@ -263,24 +306,27 @@ impl OccupancyCounters {
         }
     }
 
-    /// Sum of every template's live weight (`rate_q16 * live_count`) --
-    /// the total propensity the exponential waiting-time draw needs.
-    /// Zero means the domain has gone fully quiescent: no template has a
-    /// site currently matching its reactant pattern.
-    pub fn total_propensity(&self, templates: &[ReactionRecord]) -> f64 {
+    /// Sum of every template's live weight (`rate_q16 * live_count *
+    /// pressure_factor`) -- the total propensity the exponential
+    /// waiting-time draw needs. Zero means the domain has gone fully
+    /// quiescent: no template has a site currently matching its reactant
+    /// pattern (or every matching template's gas-phase pressure is zero).
+    pub fn total_propensity(&self, templates: &[ReactionRecord], pressures: &Pressures) -> f64 {
         templates
             .iter()
-            .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64)
+            .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64 * pressure_factor(t, pressures))
             .sum()
     }
 
     /// Select which reaction fires next (weighted by `rate_q16 *
-    /// live_count`) and which site(s) it fires on, without applying
-    /// anything -- callers are expected to apply the transition(s) via
-    /// the existing `layout::apply_transition`/trajectory-logging path,
-    /// then call `on_occupancy_change` per touched site. Returns `None`
-    /// when every template's live weight is zero (domain quiescent, same
-    /// semantics as `gillespie::GillespieDomain::step`).
+    /// live_count * pressure_factor`) and which site(s) it fires on,
+    /// without applying anything -- callers are expected to apply the
+    /// transition(s) via the existing
+    /// `layout::apply_transition`/trajectory-logging path, then call
+    /// `on_occupancy_change` per touched site. Returns `None` when every
+    /// template's live weight is zero (domain quiescent, same semantics
+    /// as `gillespie::GillespieDomain::step`).
+    #[allow(clippy::too_many_arguments)]
     pub fn select_event(
         &self,
         templates: &[ReactionRecord],
@@ -289,10 +335,11 @@ impl OccupancyCounters {
         rows_in_band: usize,
         rng: &mut Rng,
         seed: u64,
+        pressures: &Pressures,
     ) -> Option<(u32, usize, Option<usize>)> {
         let weights: Vec<f64> = templates
             .iter()
-            .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64)
+            .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64 * pressure_factor(t, pressures))
             .collect();
         let total: f64 = weights.iter().sum();
         if total <= 0.0 {
@@ -547,6 +594,68 @@ mod tests {
         }
     }
 
+    fn bimolecular_template(species_a_bit: u8, species_b_bit: u8, rate: u32) -> ReactionRecord {
+        ReactionRecord {
+            rate_q16: rate,
+            bin_id: 0,
+            transition_a: species_a_bit << 4,
+            transition_b: species_b_bit << 4,
+            is_bimolecular: true,
+        }
+    }
+
+    #[test]
+    fn pressure_factor_only_scales_adsorption_templates() {
+        let pressures = Pressures { values: [2.0, 3.0, 5.0] };
+        // Adsorption: pressure_factor equals that species' own pressure.
+        assert_eq!(pressure_factor(&ads_template(ADS_O, 0, 1), &pressures), 2.0);
+        assert_eq!(pressure_factor(&ads_template(ADS_H, 0, 1), &pressures), 3.0);
+        assert_eq!(pressure_factor(&ads_template(ADS_CO, 0, 1), &pressures), 5.0);
+        // Desorption and bimolecular: untouched by pressure, always 1.0.
+        assert_eq!(pressure_factor(&des_template(ADS_O, 0, 1), &pressures), 1.0);
+        assert_eq!(pressure_factor(&des_template(ADS_CO, 0, 1), &pressures), 1.0);
+        assert_eq!(pressure_factor(&bimolecular_template(ADS_O, ADS_CO, 1), &pressures), 1.0);
+    }
+
+    #[test]
+    fn total_propensity_with_ones_pressure_matches_unpressured_formula() {
+        let width = 4;
+        let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
+        let counters = OccupancyCounters::new(&data, width, 3);
+        let bucket = site_bucket(0, ADS_O, 3) as u8;
+        let templates = vec![ads_template(ADS_O, bucket, 1000), des_template(ADS_O, bucket, 500)];
+
+        let with_ones = counters.total_propensity(&templates, &Pressures::ones());
+        let manual: f64 = templates
+            .iter()
+            .map(|t| t.rate_q16 as f64 * counters.live_count(t) as f64)
+            .sum();
+        assert_eq!(with_ones, manual);
+    }
+
+    #[test]
+    fn total_propensity_scales_linearly_with_adsorption_pressure() {
+        let width = 4;
+        let data = vec![VACANT; 16];
+        let counters = OccupancyCounters::new(&data, width, 9);
+        let bucket = site_bucket(0, ADS_CO, 9) as u8;
+        // Only a CO adsorption template -- every VACANT site matches, so
+        // this isolates the pressure multiplier's effect cleanly.
+        let templates = vec![ads_template(ADS_CO, bucket, 1000)];
+
+        let baseline = counters.total_propensity(&templates, &Pressures::ones());
+        let doubled = counters.total_propensity(&templates, &Pressures { values: [1.0, 1.0, 2.0] });
+        assert!(baseline > 0.0, "adsorption template should have nonzero live count");
+        assert!((doubled - 2.0 * baseline).abs() < 1e-9);
+
+        // Desorption is untouched by the same pressure change.
+        let des_templates = vec![des_template(ADS_CO, bucket, 1000)];
+        let des_baseline = counters.total_propensity(&des_templates, &Pressures::ones());
+        let des_under_pressure =
+            counters.total_propensity(&des_templates, &Pressures { values: [1.0, 1.0, 2.0] });
+        assert_eq!(des_baseline, des_under_pressure);
+    }
+
     #[test]
     fn select_event_never_fires_desorption_on_a_site_lacking_the_reactant() {
         let width = 8;
@@ -566,7 +675,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed)
+                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
             {
                 assert_eq!(site, o_site);
                 assert_eq!(site_b, None);
@@ -591,7 +700,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed)
+                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
             {
                 assert_eq!(site, vacant_site);
                 assert_eq!(site_b, None);
@@ -626,7 +735,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed)
+                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
             {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);
@@ -659,7 +768,7 @@ mod tests {
         ];
         let mut rng = rng();
         assert_eq!(
-            counters.select_event(&templates, &data, width, 4, &mut rng, 1),
+            counters.select_event(&templates, &data, width, 4, &mut rng, 1, &Pressures::ones()),
             None
         );
     }

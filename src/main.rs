@@ -33,6 +33,13 @@ struct Config {
     /// before running, for exercising the pipeline without a real OC20
     /// rate-constant export on hand.
     generate_lut: Option<usize>,
+    /// Relative partial pressures for the O2/H2/CO feed gas, applied only
+    /// to the occupancy-gated engine's adsorption channels (see
+    /// `occupancy::Pressures`). Named after the gas-phase molecule fed in
+    /// (O2, H2, CO), not the surface species index it couples to.
+    pressure_o2: f64,
+    pressure_h2: f64,
+    pressure_co: f64,
 }
 
 impl Config {
@@ -48,6 +55,9 @@ impl Config {
         let mut patches = rayon::current_num_threads();
         let mut steps_per_patch = 1_000_000u64;
         let mut generate_lut = None;
+        let mut pressure_o2 = 1.0f64;
+        let mut pressure_h2 = 1.0f64;
+        let mut pressure_co = 1.0f64;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -67,6 +77,9 @@ impl Config {
                 "--patches" => patches = parse_value(&mut args, "--patches")?,
                 "--steps" => steps_per_patch = parse_value(&mut args, "--steps")?,
                 "--generate-lut" => generate_lut = Some(parse_value(&mut args, "--generate-lut")?),
+                "--pressure-o2" => pressure_o2 = parse_value(&mut args, "--pressure-o2")?,
+                "--pressure-h2" => pressure_h2 = parse_value(&mut args, "--pressure-h2")?,
+                "--pressure-co" => pressure_co = parse_value(&mut args, "--pressure-co")?,
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unrecognized argument `{other}`\n\n{}", usage())),
             }
@@ -81,6 +94,9 @@ impl Config {
             patches,
             steps_per_patch,
             generate_lut,
+            pressure_o2,
+            pressure_h2,
+            pressure_co,
         })
     }
 }
@@ -111,6 +127,12 @@ fn usage() -> String {
        --patches <N>              Spatial domains / rayon tasks [default: available CPUs]\n    \
        --steps <N>                Gillespie steps per patch [default: 1000000]\n    \
        --generate-lut <N>         Synthesize N demo reactions into --lut-path first\n    \
+       --pressure-o2 <F>          Relative O2 partial pressure, gates O* adsorption\n                                    \
+                                    (occupancy-gated engine only) [default: 1.0]\n    \
+       --pressure-h2 <F>          Relative H2 partial pressure, gates H* adsorption\n                                    \
+                                    [default: 1.0]\n    \
+       --pressure-co <F>          Relative CO partial pressure, gates CO* adsorption\n                                    \
+                                    [default: 1.0]\n    \
        -h, --help                 Print this message"
         .to_string()
 }
@@ -169,6 +191,15 @@ fn run(config: &Config) -> std::io::Result<()> {
         config.steps_per_patch,
         config.trajectory_path.display()
     );
+    if lut.kind() == layout::LutKind::OccupancyGated {
+        println!(
+            "kinetica: relative partial pressures: O2={} H2={} CO={}",
+            config.pressure_o2, config.pressure_h2, config.pressure_co
+        );
+    }
+    let pressures = kinetica::occupancy::Pressures {
+        values: [config.pressure_o2, config.pressure_h2, config.pressure_co],
+    };
 
     let start = Instant::now();
     engine::run_simulation(
@@ -177,6 +208,7 @@ fn run(config: &Config) -> std::io::Result<()> {
         config.patches,
         config.steps_per_patch,
         &config.trajectory_path,
+        &pressures,
     )?;
     let elapsed = start.elapsed();
 

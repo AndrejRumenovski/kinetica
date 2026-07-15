@@ -70,6 +70,16 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `--patches`           | available CPUs      | Spatial domains / rayon tasks            |
 | `--steps`             | `1000000`           | Gillespie steps per patch                |
 | `--generate-lut <N>`  | —                   | Synthesize `N` demo reactions into `--lut-path` instead of using a real one |
+| `--pressure-o2 <F>`   | `1.0`                | Relative O2 partial pressure — gates O* adsorption |
+| `--pressure-h2 <F>`   | `1.0`                | Relative H2 partial pressure — gates H* adsorption |
+| `--pressure-co <F>`   | `1.0`                | Relative CO partial pressure — gates CO* adsorption |
+
+The three `--pressure-*` flags are runtime simulator parameters, not baked
+into `reactions.lut` — changing the feed-gas composition never requires
+rebuilding the LUT. They only affect the occupancy-gated engine (real
+data), and only an adsorption channel's propensity (`VACANT -> species`);
+desorption and bimolecular reactions are untouched, since neither consumes
+a gas-phase molecule. See "Gas-phase pressure coupling" below.
 
 ## Occupancy-gated kMC
 
@@ -115,9 +125,38 @@ index comes from.
 
 **This intentionally didn't try to fix everything at once.** Occupancy-gating
 changes *how* a reaction is selected and applied, not *what* chemistry the
-underlying rate constants represent. The next section closes the other
-half: the lattice's real geometry and which real surface its rate
-constants are actually measured on.
+underlying rate constants represent. The next two sections close two more
+of the gaps this left open: gas-phase partial pressure, and the lattice's
+real geometry / which real surface its rate constants are actually
+measured on.
+
+## Gas-phase pressure coupling
+
+Before this, every run's adsorption kinetics were identical regardless of
+feed-gas composition: `reactions.lut`'s rate constants encode a fixed
+propensity per adsorption channel, with no notion of how much of each gas
+is actually present above the surface. Two runs meant to represent, say, a
+CO-rich feed versus an O2-rich one produced exactly the same coverage
+trajectory.
+
+`--pressure-o2`/`--pressure-h2`/`--pressure-co` (default `1.0` each) are
+runtime multipliers, not LUT-baked constants — `occupancy::Pressures`
+scales an adsorption template's propensity by the matching species'
+relative pressure at the point `total_propensity`/`select_event` compute
+live weights, alongside the existing `rate_q16 * live_count` factors. Nothing
+about the LUT itself changes, so switching feed-gas composition between
+runs is just a CLI flag, not a rebuild. Only adsorption is affected —
+identifiable as a template whose reactant is `VACANT` (`reactant_mask ==
+0`) — since desorption and bimolecular reactions don't consume a
+gas-phase molecule in the first place; scaling their propensity by a
+partial pressure wouldn't correspond to anything physical.
+
+Verified against the real Pd(111) `reactions.lut` and release binary:
+identical starting lattices, identical seeds, differing only in
+`--pressure-co` — baseline (`1.0`) settles at 45.0% CO coverage; `20.0`
+settles at 72.1%, with O and H coverage correspondingly displaced (all
+three compete for the same finite pool of vacant sites). Zero invalid
+occupancy states in either run.
 
 ## Lattice geometry and target surface: Pd(111)
 

@@ -19,7 +19,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::gillespie::{GillespieDomain, Rng};
 use crate::layout::{LutKind, ReactionLut, ReactionLutBlock, SiteLattice};
-use crate::occupancy::OccupancyCounters;
+use crate::occupancy::{OccupancyCounters, Pressures};
 
 // ------------------------------------------------------------------------
 // Cross-patch boundary migration
@@ -250,6 +250,7 @@ fn run_patch_occupancy_gated(
     steps: u64,
     seed: u64,
     trajectory_tx: &Sender<TrajectoryRecord>,
+    pressures: &Pressures,
 ) {
     let (y0, y1) = band;
     let rows_in_band = y1 - y0;
@@ -275,7 +276,7 @@ fn run_patch_occupancy_gated(
             }
         }
 
-        let total = counters.total_propensity(&templates);
+        let total = counters.total_propensity(&templates, pressures);
         if total <= 0.0 {
             break; // domain gone fully quiescent: no template's reactant exists anywhere
         }
@@ -285,7 +286,7 @@ fn run_patch_occupancy_gated(
         sim_time += tau;
 
         let Some((reaction_id, site_a, site_b)) =
-            counters.select_event(&templates, data, width, rows_in_band, &mut rng, seed)
+            counters.select_event(&templates, data, width, rows_in_band, &mut rng, seed, pressures)
         else {
             break; // structurally unreachable given total > 0 above, but handled defensively
         };
@@ -327,6 +328,7 @@ pub fn run_simulation(
     num_patches: usize,
     steps_per_patch: u64,
     trajectory_path: &Path,
+    pressures: &Pressures,
 ) -> io::Result<()> {
     let (trajectory_tx, trajectory_rx) = crossbeam_channel::unbounded::<TrajectoryRecord>();
 
@@ -382,7 +384,7 @@ pub fn run_simulation(
                     run_patch((y0, y1), width, data, lut, links, steps_per_patch, seed, &tx)
                 }
                 LutKind::OccupancyGated => run_patch_occupancy_gated(
-                    (y0, y1), width, data, lut, links, steps_per_patch, seed, &tx,
+                    (y0, y1), width, data, lut, links, steps_per_patch, seed, &tx, pressures,
                 ),
             });
         }
@@ -717,7 +719,7 @@ mod tests {
         let lut = ReactionLut::open(&lut_path).unwrap();
         assert_eq!(lut.kind(), LutKind::OccupancyGated);
 
-        run_simulation(&mut lattice, &lut, 2, 2000, &trajectory_path).unwrap();
+        run_simulation(&mut lattice, &lut, 2, 2000, &trajectory_path, &Pressures::ones()).unwrap();
 
         for i in 0..width * height {
             let byte = lattice.get(i);
@@ -783,7 +785,7 @@ mod tests {
         // go quiescent (total_propensity == 0 breaking the loop), this
         // would still terminate, but the point is confirming the *state*
         // afterward is fully vacant, not that it doesn't hang.
-        run_simulation(&mut lattice, &lut, 1, 1000, &trajectory_path).unwrap();
+        run_simulation(&mut lattice, &lut, 1, 1000, &trajectory_path, &Pressures::ones()).unwrap();
 
         for i in 0..width * height {
             assert_eq!(lattice.get(i), VACANT, "site {i} should be vacant after the only O* desorbed");
@@ -792,5 +794,87 @@ mod tests {
         let _ = std::fs::remove_file(&lattice_path);
         let _ = std::fs::remove_file(&lut_path);
         let _ = std::fs::remove_file(&trajectory_path);
+    }
+
+    /// The falsifying test Phase 2 (gas-phase pressure/flux coupling)
+    /// exists to pass: two runs from *identical* starting lattices and
+    /// LUTs, differing only in `Pressures`, must reach different
+    /// steady-state coverage. Before this pass, `run_simulation` had no
+    /// pressure parameter at all -- two runs meant to represent different
+    /// feed-gas compositions were mechanically incapable of producing
+    /// different adsorption kinetics.
+    #[test]
+    fn run_simulation_raising_adsorption_pressure_shifts_steady_state_coverage() {
+        use crate::layout::{self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_CO, VACANT};
+        use crate::test_support::temp_path;
+
+        let width = 16;
+        let height = 16;
+
+        // Symmetric CO adsorption/desorption rates, every quantile bucket
+        // covered (same reasoning as the other occupancy-gated e2e tests):
+        // at pressure=1 this should hover near 50% CO coverage in the
+        // mean-field limit; a much higher relative pressure should push
+        // coverage well above that.
+        let mut records = Vec::new();
+        for bucket in 0..crate::occupancy::BUCKETS_PER_SPECIES as u8 {
+            records.push(ReactionRecord {
+                rate_q16: 1_000_000,
+                bin_id: bucket,
+                transition_a: ADS_CO, // adsorption: VACANT -> CO*
+                transition_b: 0,
+                is_bimolecular: false,
+            });
+            records.push(ReactionRecord {
+                rate_q16: 1_000_000,
+                bin_id: bucket,
+                transition_a: ADS_CO << 4, // desorption: CO* -> VACANT
+                transition_b: 0,
+                is_bimolecular: false,
+            });
+        }
+        let blocks = layout::pack_records_into_blocks(records);
+        let lut_path = temp_path("pressure_lut");
+        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        let lut = ReactionLut::open(&lut_path).unwrap();
+
+        let run_with_pressure = |tag: &str, pressures: Pressures| -> usize {
+            let lattice_path = temp_path(&format!("pressure_lattice_{tag}"));
+            let trajectory_path = temp_path(&format!("pressure_trajectory_{tag}"));
+            let mut lattice = SiteLattice::open(&lattice_path, width, height).unwrap();
+            for i in 0..width * height {
+                lattice.set(i, VACANT);
+            }
+
+            run_simulation(&mut lattice, &lut, 2, 20_000, &trajectory_path, &pressures).unwrap();
+
+            let co_count = (0..width * height).filter(|&i| lattice.get(i) == ADS_CO).count();
+
+            let _ = std::fs::remove_file(&lattice_path);
+            let _ = std::fs::remove_file(&trajectory_path);
+            co_count
+        };
+
+        let baseline_co = run_with_pressure("baseline", Pressures::ones());
+        let elevated_co = run_with_pressure(
+            "elevated",
+            Pressures { values: [1.0, 1.0, 20.0] },
+        );
+
+        let total_sites = width * height;
+        assert!(
+            elevated_co > baseline_co,
+            "elevated CO pressure ({elevated_co}/{total_sites} occupied) should raise steady-state \
+             coverage above the unpressured baseline ({baseline_co}/{total_sites})"
+        );
+        // Not just "higher" -- materially so, matching the mean-field
+        // expectation of near-50% at pressure=1 vs. well above that at a
+        // 20x relative pressure.
+        assert!(
+            elevated_co as f64 / total_sites as f64 > 0.7,
+            "20x CO pressure should push coverage well above 50%, got {elevated_co}/{total_sites}"
+        );
+
+        let _ = std::fs::remove_file(&lut_path);
     }
 }
