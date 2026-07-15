@@ -196,10 +196,30 @@ oc20_ingest: species O: 1368 adsorption-energy records  (15 with a real DFT-comp
 ```
 
 (There's also real barrier data for actual bimolecular surface reactions
-like CO oxidation itself, `O* + CO* -> CO2 + 2*` — but that's a two-site
-Langmuir-Hinshelwood step our single-site transition model can't
-represent without extending `engine.rs`/`layout.rs`, so it isn't wired up
-here.)
+like CO oxidation itself, `O* + CO* -> CO2 + 2*`. The engine now supports
+two-site reactions structurally — see "Bimolecular reactions" below — but
+`oc20_ingest` doesn't yet ingest this specific real data into one; it's a
+natural next step, not an architectural limitation anymore.)
+
+### Bimolecular reactions
+
+Each `ReactionLutBlock` lane carries a second `(reactant_mask << 4) |
+product_mask)` transition (`transition_b`) plus an `is_bimolecular` flag,
+alongside the original single-site `transition_a`. A monomolecular
+(adsorption/desorption) reaction only ever touches `transition_a`'s site,
+exactly as before; a bimolecular one atomically applies `transition_a` to
+a randomly sampled site and `transition_b` to one of its same-patch
+grid neighbors (up/down/left/right) -- constrained to the same patch
+(rather than possibly crossing into a neighboring `rayon` task's row
+band) so both sites update as a single atomic step in this patch's own
+trajectory, with no cross-thread synchronization needed. If the sampled
+site has no same-patch neighbor at all (a degenerate 1×1 patch), the
+event is skipped rather than forced onto an invalid site.
+
+`kinetica --generate-lut` synthesizes roughly 1 in 8 demo reactions as
+bimolecular so the path is exercised even without real data on hand;
+`oc20_ingest` currently only builds monomolecular reactions from either
+real data source.
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
 untracked — see `.gitignore`. `scripts/extract_energies.py`,

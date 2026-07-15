@@ -197,20 +197,40 @@ fn generate_demo_lut(path: &std::path::Path, count: usize) -> std::io::Result<()
     let block_count = count.div_ceil(ReactionLutBlock::LANES).max(1);
     let mut rng = gillespie::Rng::seeded(0xC0FF_EE00_C0FF_EE00);
 
-    // (rate_q16, bin_id, transition) triples -- `layout::pack_records_into_blocks`
-    // sorts these by bin_id and packs them into cache-line blocks; see its
-    // doc comment for why that ordering matters to `CompositionTable::build`.
-    let records: Vec<(u32, u8, u8)> = (0..block_count * ReactionLutBlock::LANES)
+    // `layout::pack_records_into_blocks` sorts these by bin_id and packs
+    // them into cache-line blocks; see its doc comment for why that
+    // ordering matters to `CompositionTable::build`. About 1 in 8 records
+    // are synthesized as bimolecular (two-site) reactions purely so
+    // `--generate-lut` exercises engine.rs's bimolecular path even without
+    // real Langmuir-Hinshelwood data on hand -- see `oc20_ingest.rs` for
+    // where a *real* bimolecular reaction (CO oxidation) is wired in.
+    let records: Vec<layout::ReactionRecord> = (0..block_count * ReactionLutBlock::LANES)
         .map(|_| {
             let raw = rng.next_u64();
             let rate_q16 = ((raw & 0x00FF_FFFF) as u32).max(1);
             let bin_id = (31 - rate_q16.leading_zeros()) as u8;
-            // Packed (reactant_mask << 4) | product_mask demo transition,
+            // Packed (reactant_mask << 4) | product_mask demo transitions,
             // restricted to the bitflags defined in layout.rs.
-            let reactant = ((raw >> 24) & 0x7) as u8;
-            let product = ((raw >> 27) & 0x7) as u8;
-            let transition = (reactant << 4) | product;
-            (rate_q16, bin_id, transition)
+            let reactant_a = ((raw >> 24) & 0x7) as u8;
+            let product_a = ((raw >> 27) & 0x7) as u8;
+            let transition_a = (reactant_a << 4) | product_a;
+
+            let is_bimolecular = (raw >> 30) & 0x7 == 0;
+            let reactant_b = ((raw >> 33) & 0x7) as u8;
+            let product_b = ((raw >> 36) & 0x7) as u8;
+            let transition_b = if is_bimolecular {
+                (reactant_b << 4) | product_b
+            } else {
+                0
+            };
+
+            layout::ReactionRecord {
+                rate_q16,
+                bin_id,
+                transition_a,
+                transition_b,
+                is_bimolecular,
+            }
         })
         .collect();
 

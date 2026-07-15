@@ -174,14 +174,14 @@ impl CompositionTable {
         let reaction_count = lut.len() * ReactionLutBlock::LANES;
 
         for reaction_id in 0..reaction_count {
-            let (rate_q16, bin_id, _transition) = lut.rate_of(reaction_id);
-            let bin = &mut bins[bin_id as usize % NUM_BINS];
+            let r = lut.rate_of(reaction_id);
+            let bin = &mut bins[r.bin_id as usize % NUM_BINS];
             if bin.count == 0 {
                 bin.start = reaction_id as u32;
             }
             bin.count += 1;
 
-            let rate = FixedPoint::from_q16(rate_q16);
+            let rate = FixedPoint::from_q16(r.rate_q16);
             bin.total_propensity = bin.total_propensity.saturating_add(rate);
             total = total.saturating_add(rate);
         }
@@ -249,8 +249,7 @@ impl CompositionTable {
         loop {
             let lane = rng.next_u32_below(bin.count);
             let reaction_id = bin.start + lane;
-            let (rate_q16, _, _) = lut.rate_of(reaction_id as usize);
-            let rate = FixedPoint::from_q16(rate_q16);
+            let rate = FixedPoint::from_q16(lut.rate_of(reaction_id as usize).rate_q16);
 
             let coin = rng.next_fixed(ceiling);
             if coin.0 < rate.0 {
@@ -274,8 +273,7 @@ impl CompositionTable {
             loop {
                 let lane = rng.next_u32_below(bin.count);
                 let reaction_id = bin.start + lane;
-                let (rate_q16, _, _) = lut.rate_of(reaction_id as usize);
-                let rate = FixedPoint::from_q16(rate_q16);
+                let rate = FixedPoint::from_q16(lut.rate_of(reaction_id as usize).rate_q16);
                 let coin = rng.next_fixed(ceiling);
                 if coin.0 < rate.0 {
                     return Some(reaction_id);
@@ -333,6 +331,16 @@ mod tests {
     use crate::test_support::temp_path;
 
     fn lut_from(records: Vec<(u32, u8, u8)>, tag: &str) -> (ReactionLut, std::path::PathBuf) {
+        let records = records
+            .into_iter()
+            .map(|(rate_q16, bin_id, transition_a)| layout::ReactionRecord {
+                rate_q16,
+                bin_id,
+                transition_a,
+                transition_b: 0,
+                is_bimolecular: false,
+            })
+            .collect();
         let blocks = layout::pack_records_into_blocks(records);
         let path = temp_path(tag);
         layout::write_lut(&path, &blocks).unwrap();

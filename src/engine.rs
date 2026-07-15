@@ -17,7 +17,7 @@ use std::path::Path;
 
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::gillespie::GillespieDomain;
+use crate::gillespie::{GillespieDomain, Rng};
 use crate::layout::{ReactionLut, SiteLattice};
 
 // ------------------------------------------------------------------------
@@ -58,6 +58,99 @@ fn apply_migration(data: &mut [u8], width: usize, row_local: usize, ev: Migratio
 // ------------------------------------------------------------------------
 // Per-patch local Gillespie loop
 // ------------------------------------------------------------------------
+
+/// Pick a uniformly random *same-patch* neighbor (up/down/left/right on the
+/// shared (x, y) grid) of `site_idx`, for a bimolecular reaction's second
+/// site. Deliberately constrained to stay within this patch rather than
+/// possibly landing in a neighboring patch: a monomolecular reaction's
+/// single-site update can be mirrored across a patch boundary
+/// fire-and-forget via `MigrationEvent` (see `apply_and_record`), but a
+/// bimolecular event needs *both* sites updated atomically as far as this
+/// patch's own trajectory is concerned, which a fire-and-forget mirror to
+/// a different thread can't guarantee. Returns `None` only when `site_idx`
+/// has no neighbor at all within the patch (a degenerate 1x1 patch) --
+/// callers should skip the event in that case rather than force one.
+fn same_patch_neighbor(rng: &mut Rng, site_idx: usize, width: usize, rows_in_band: usize) -> Option<usize> {
+    let row = site_idx / width;
+    let col = site_idx % width;
+
+    let mut candidates = [0usize; 4];
+    let mut count = 0usize;
+    if col > 0 {
+        candidates[count] = site_idx - 1; // left
+        count += 1;
+    }
+    if col + 1 < width {
+        candidates[count] = site_idx + 1; // right
+        count += 1;
+    }
+    if row > 0 {
+        candidates[count] = site_idx - width; // up
+        count += 1;
+    }
+    if row + 1 < rows_in_band {
+        candidates[count] = site_idx + width; // down
+        count += 1;
+    }
+
+    if count == 0 {
+        return None;
+    }
+    Some(candidates[rng.next_u32_below(count as u32) as usize])
+}
+
+/// Apply one site's `(reactant_mask << 4) | product_mask` transition in
+/// place, record it to the trajectory log, and mirror it across a patch
+/// boundary if the site sits on this patch's shared edge row. Shared by
+/// both the monomolecular path (called once) and the bimolecular path
+/// (called once per site) so the occupancy-update / logging / migration
+/// logic exists in exactly one place.
+#[allow(clippy::too_many_arguments)]
+fn apply_and_record(
+    data: &mut [u8],
+    width: usize,
+    rows_in_band: usize,
+    y0: usize,
+    site_idx: usize,
+    transition: u8,
+    reaction_id: u32,
+    sim_time_bits: u64,
+    trajectory_tx: &Sender<TrajectoryRecord>,
+    links: &BoundaryLinks,
+) {
+    // `transition` packs `(reactant_mask << 4) | product_mask`: clear the
+    // reactant's bits and OR in the product's, in place.
+    let reactant_mask = transition >> 4;
+    let product_mask = transition & 0x0F;
+    data[site_idx] = (data[site_idx] & !reactant_mask) | product_mask;
+
+    let _ = trajectory_tx.send(TrajectoryRecord {
+        sim_time_bits,
+        site_idx: (y0 * width + site_idx) as u32,
+        reaction_id,
+    });
+
+    // Mirror the update to a neighbor if it landed on this patch's shared
+    // edge row.
+    let row_local = site_idx / width;
+    let col = site_idx % width;
+    if row_local == 0 {
+        if let Some(tx) = &links.send_up {
+            let _ = tx.send(MigrationEvent {
+                col,
+                state: data[site_idx],
+            });
+        }
+    }
+    if row_local == rows_in_band - 1 {
+        if let Some(tx) = &links.send_down {
+            let _ = tx.send(MigrationEvent {
+                col,
+                state: data[site_idx],
+            });
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn run_patch(
@@ -100,42 +193,35 @@ fn run_patch(
         // the reaction's neighborhood template; this engine samples
         // uniformly over the patch's own sites, which is sufficient to
         // exercise the occupancy update and boundary-migration paths.
-        let site_idx = domain.rng.next_u32_below(data.len() as u32) as usize;
-        let (_, _, transition) = lut.rate_of(reaction_id as usize);
+        let site_a = domain.rng.next_u32_below(data.len() as u32) as usize;
+        let r = lut.rate_of(reaction_id as usize);
+        let sim_time_bits = domain.sim_time.to_bits();
 
-        // `transition` packs `(reactant_mask << 4) | product_mask`: clear
-        // the reactant's bits and OR in the product's, in place.
-        let reactant_mask = transition >> 4;
-        let product_mask = transition & 0x0F;
-        data[site_idx] = (data[site_idx] & !reactant_mask) | product_mask;
+        if r.is_bimolecular {
+            // Two-site (Langmuir-Hinshelwood-style) reaction: both sites
+            // transition atomically as far as this patch's own trajectory
+            // is concerned. Site B is a same-patch neighbor of site A (see
+            // `same_patch_neighbor`'s doc comment for why it's constrained
+            // that way); if site A has none (a degenerate 1x1 patch), this
+            // event is skipped rather than forced onto an invalid site.
+            if let Some(site_b) = same_patch_neighbor(&mut domain.rng, site_a, width, rows_in_band) {
+                apply_and_record(
+                    data, width, rows_in_band, y0, site_a, r.transition_a, reaction_id,
+                    sim_time_bits, trajectory_tx, &links,
+                );
+                apply_and_record(
+                    data, width, rows_in_band, y0, site_b, r.transition_b, reaction_id,
+                    sim_time_bits, trajectory_tx, &links,
+                );
+            }
+        } else {
+            apply_and_record(
+                data, width, rows_in_band, y0, site_a, r.transition_a, reaction_id,
+                sim_time_bits, trajectory_tx, &links,
+            );
+        }
 
-        let _ = trajectory_tx.send(TrajectoryRecord {
-            sim_time_bits: domain.sim_time.to_bits(),
-            site_idx: (y0 * width + site_idx) as u32,
-            reaction_id,
-        });
         let _ = tau; // waiting time already folded into domain.sim_time
-
-        // Mirror the update to a neighbor if it landed on this patch's
-        // shared edge row.
-        let row_local = site_idx / width;
-        let col = site_idx % width;
-        if row_local == 0 {
-            if let Some(tx) = &links.send_up {
-                let _ = tx.send(MigrationEvent {
-                    col,
-                    state: data[site_idx],
-                });
-            }
-        }
-        if row_local == rows_in_band - 1 {
-            if let Some(tx) = &links.send_down {
-                let _ = tx.send(MigrationEvent {
-                    col,
-                    state: data[site_idx],
-                });
-            }
-        }
     }
 }
 
@@ -405,4 +491,62 @@ fn run_trajectory_writer(rx: Receiver<TrajectoryRecord>, path: &Path) -> io::Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_patch_neighbor_returns_none_for_degenerate_1x1_patch() {
+        let mut rng = Rng::seeded(1);
+        assert_eq!(same_patch_neighbor(&mut rng, 0, 1, 1), None);
+    }
+
+    #[test]
+    fn same_patch_neighbor_always_stays_in_bounds_and_adjacent() {
+        let width = 5usize;
+        let rows_in_band = 4usize;
+        let mut rng = Rng::seeded(42);
+
+        for site_idx in 0..width * rows_in_band {
+            for _ in 0..20 {
+                let neighbor = same_patch_neighbor(&mut rng, site_idx, width, rows_in_band)
+                    .expect("every site in a >1x1 patch has at least one neighbor");
+                assert!(neighbor < width * rows_in_band, "neighbor out of patch bounds");
+
+                let (row, col) = (site_idx / width, site_idx % width);
+                let (n_row, n_col) = (neighbor / width, neighbor % width);
+                let manhattan_distance = row.abs_diff(n_row) + col.abs_diff(n_col);
+                assert_eq!(manhattan_distance, 1, "neighbor must be exactly one grid step away");
+            }
+        }
+    }
+
+    #[test]
+    fn same_patch_neighbor_never_crosses_a_row_band_edge() {
+        // A 1-wide patch forces every choice onto the vertical axis; the
+        // top and bottom rows must never pick an out-of-band neighbor.
+        let mut rng = Rng::seeded(7);
+        let rows_in_band = 3usize;
+
+        for _ in 0..50 {
+            let top = same_patch_neighbor(&mut rng, 0, 1, rows_in_band).unwrap();
+            assert_eq!(top, 1); // only valid neighbor of row 0 in a 1-wide patch is row 1
+
+            let bottom = same_patch_neighbor(&mut rng, rows_in_band - 1, 1, rows_in_band).unwrap();
+            assert_eq!(bottom, rows_in_band - 2);
+        }
+    }
+
+    #[test]
+    fn apply_migration_ignores_out_of_bounds_column() {
+        let mut data = vec![VACANT_FOR_TEST; 4];
+        // row_local=0, width=4, col=10 -> idx=10, out of bounds for a
+        // 4-byte patch -- must be a silent no-op, not a panic.
+        apply_migration(&mut data, 4, 0, MigrationEvent { col: 10, state: 0x01 });
+        assert_eq!(data, vec![VACANT_FOR_TEST; 4]);
+    }
+
+    const VACANT_FOR_TEST: u8 = 0x00;
 }

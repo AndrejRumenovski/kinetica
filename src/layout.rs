@@ -164,9 +164,9 @@ impl SiteLattice {
 /// neighboring block a different worker is writing. `repr(C)` is required
 /// alongside it: without it the compiler is free to reorder these fields,
 /// which would silently desync this struct's in-memory layout from the
-/// byte-for-byte format `reactions.lut` is written in on disk. The four
+/// byte-for-byte format `reactions.lut` is written in on disk. The five
 /// field arrays are sized so the struct is *exactly* 64 bytes with no
-/// trailing padding: `4*8 + 1*8 + 1*8 + 2*8 = 64`.
+/// trailing padding: `4*8 + 1*8 + 1*8 + 1*8 + 1*8 = 64`.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct ReactionLutBlock {
@@ -175,11 +175,25 @@ pub struct ReactionLutBlock {
     pub rate_q16: [u32; Self::LANES],
     /// Composition-rejection bin this lane's reaction currently belongs to.
     pub bin_id: [u8; Self::LANES],
-    /// Packed `(reactant_mask << 4) | product_mask` site transition.
-    pub transition: [u8; Self::LANES],
-    /// Activation energy in milli-eV, retained for diagnostics/re-fitting;
-    /// not read on the hot sampling path.
-    pub e_act_mev: [u16; Self::LANES],
+    /// Packed `(reactant_mask << 4) | product_mask` transition for the
+    /// reaction's primary site -- the only site touched for a
+    /// monomolecular (adsorption/desorption) reaction.
+    pub transition_a: [u8; Self::LANES],
+    /// Packed `(reactant_mask << 4) | product_mask` transition for a
+    /// *second*, spatially adjacent site. Meaningful only when
+    /// `is_bimolecular` is set (e.g. a Langmuir-Hinshelwood surface
+    /// reaction like `O* + CO* -> CO2 + 2*`, where site A's `O*` and site
+    /// B's `CO*` both clear to `VACANT` in the same event); `0` and
+    /// ignored otherwise.
+    pub transition_b: [u8; Self::LANES],
+    /// `1` if this lane is a two-site (bimolecular) reaction that touches
+    /// both `transition_a`'s and `transition_b`'s sites atomically; `0`
+    /// for an ordinary single-site (monomolecular) reaction that only
+    /// touches `transition_a`'s site. Kept as a full byte per lane (rather
+    /// than stealing a bit from another field) so this block's layout
+    /// stays simple fixed-width arrays with no bit-packing to unpack on
+    /// the hot path.
+    pub is_bimolecular: [u8; Self::LANES],
 }
 
 impl ReactionLutBlock {
@@ -298,24 +312,43 @@ impl ReactionLut {
     }
 
     /// Direct O(1) lookup of a single reaction record by its flat global
-    /// id, returning the `(rate_q16, bin_id, transition)` triple without
-    /// materializing an intermediate `ReactionRate` struct.
+    /// id, without materializing an intermediate `ReactionLutBlock` for
+    /// the caller to index into themselves.
     #[inline(always)]
-    pub fn rate_of(&self, reaction_id: usize) -> (u32, u8, u8) {
+    pub fn rate_of(&self, reaction_id: usize) -> ReactionRecord {
         let (block_idx, lane) = block_and_lane(reaction_id);
         let block = &self.as_slice()[block_idx];
-        (block.rate_q16[lane], block.bin_id[lane], block.transition[lane])
+        ReactionRecord {
+            rate_q16: block.rate_q16[lane],
+            bin_id: block.bin_id[lane],
+            transition_a: block.transition_a[lane],
+            transition_b: block.transition_b[lane],
+            is_bimolecular: block.is_bimolecular[lane] != 0,
+        }
     }
 }
 
-/// Pack `(rate_q16, bin_id, transition)` triples into `ReactionLutBlock`s,
-/// sorting by `bin_id` first (the invariant `CompositionTable::build`
-/// relies on to collapse bin membership to a `[start, count)` range). Used
-/// by both the synthetic demo generator (`main.rs`) and the real OC20
-/// ingestion tool (`bin/oc20_ingest.rs`) so the on-disk packing logic
-/// exists in exactly one place.
-pub fn pack_records_into_blocks(mut records: Vec<(u32, u8, u8)>) -> Vec<ReactionLutBlock> {
-    records.sort_by_key(|&(_, bin_id, _)| bin_id);
+/// One reaction record prior to AoSOA packing (or after unpacking a single
+/// lane back out via `ReactionLut::rate_of`) -- everything
+/// `pack_records_into_blocks` needs to place into one `ReactionLutBlock`
+/// lane. See `ReactionLutBlock`'s field docs for what each member means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReactionRecord {
+    pub rate_q16: u32,
+    pub bin_id: u8,
+    pub transition_a: u8,
+    pub transition_b: u8,
+    pub is_bimolecular: bool,
+}
+
+/// Pack `ReactionRecord`s into `ReactionLutBlock`s, sorting by `bin_id`
+/// first (the invariant `CompositionTable::build` relies on to collapse
+/// bin membership to a `[start, count)` range). Used by both the synthetic
+/// demo generator (`main.rs`) and the real data-ingestion tool
+/// (`bin/oc20_ingest.rs`) so the on-disk packing logic exists in exactly
+/// one place.
+pub fn pack_records_into_blocks(mut records: Vec<ReactionRecord>) -> Vec<ReactionLutBlock> {
+    records.sort_by_key(|r| r.bin_id);
 
     let block_count = records.len().div_ceil(ReactionLutBlock::LANES).max(1);
     let mut blocks = Vec::with_capacity(block_count);
@@ -323,20 +356,24 @@ pub fn pack_records_into_blocks(mut records: Vec<(u32, u8, u8)>) -> Vec<Reaction
     for chunk in records.chunks(ReactionLutBlock::LANES) {
         let mut rate_q16 = [0u32; ReactionLutBlock::LANES];
         let mut bin_id = [0u8; ReactionLutBlock::LANES];
-        let mut transition = [0u8; ReactionLutBlock::LANES];
-        let e_act_mev = [0u16; ReactionLutBlock::LANES];
+        let mut transition_a = [0u8; ReactionLutBlock::LANES];
+        let mut transition_b = [0u8; ReactionLutBlock::LANES];
+        let mut is_bimolecular = [0u8; ReactionLutBlock::LANES];
 
-        for (lane, &(rate, bin, trans)) in chunk.iter().enumerate() {
-            rate_q16[lane] = rate;
-            bin_id[lane] = bin;
-            transition[lane] = trans;
+        for (lane, r) in chunk.iter().enumerate() {
+            rate_q16[lane] = r.rate_q16;
+            bin_id[lane] = r.bin_id;
+            transition_a[lane] = r.transition_a;
+            transition_b[lane] = r.transition_b;
+            is_bimolecular[lane] = r.is_bimolecular as u8;
         }
 
         blocks.push(ReactionLutBlock {
             rate_q16,
             bin_id,
-            transition,
-            e_act_mev,
+            transition_a,
+            transition_b,
+            is_bimolecular,
         });
     }
 
@@ -376,9 +413,19 @@ mod tests {
         assert_eq!(block_and_lane(23), (2, 7));
     }
 
+    fn rec(rate_q16: u32, bin_id: u8, transition_a: u8) -> ReactionRecord {
+        ReactionRecord {
+            rate_q16,
+            bin_id,
+            transition_a,
+            transition_b: 0,
+            is_bimolecular: false,
+        }
+    }
+
     #[test]
     fn pack_records_into_blocks_sorts_by_bin_id_and_pads_last_block() {
-        let records = vec![(100u32, 3u8, 0x12u8), (50, 1, 0x21), (10, 0, 0x00)];
+        let records = vec![rec(100, 3, 0x12), rec(50, 1, 0x21), rec(10, 0, 0x00)];
         let blocks = pack_records_into_blocks(records);
         assert_eq!(blocks.len(), 1);
 
@@ -386,12 +433,13 @@ mod tests {
         assert_eq!((b.rate_q16[0], b.bin_id[0]), (10, 0));
         assert_eq!((b.rate_q16[1], b.bin_id[1]), (50, 1));
         assert_eq!((b.rate_q16[2], b.bin_id[2]), (100, 3));
-        assert_eq!(b.transition[2], 0x12);
+        assert_eq!(b.transition_a[2], 0x12);
 
         for lane in 3..ReactionLutBlock::LANES {
             assert_eq!(b.rate_q16[lane], 0);
             assert_eq!(b.bin_id[lane], 0);
-            assert_eq!(b.transition[lane], 0);
+            assert_eq!(b.transition_a[lane], 0);
+            assert_eq!(b.is_bimolecular[lane], 0);
         }
     }
 
@@ -402,16 +450,35 @@ mod tests {
 
     #[test]
     fn write_and_reopen_lut_round_trips_reaction_rates() {
-        let records = vec![(10u32, 0u8, 0x01u8), (20, 1, 0x02), (30, 2, 0x04), (40, 31, 0x00)];
+        let records = vec![rec(10, 0, 0x01), rec(20, 1, 0x02), rec(30, 2, 0x04), rec(40, 31, 0x00)];
         let blocks = pack_records_into_blocks(records.clone());
         let path = temp_path("lut_roundtrip");
         write_lut(&path, &blocks).unwrap();
 
         let lut = ReactionLut::open(&path).unwrap();
         assert_eq!(lut.len(), blocks.len());
-        for (i, &(rate, bin, trans)) in records.iter().enumerate() {
-            assert_eq!(lut.rate_of(i), (rate, bin, trans));
+        for (i, &expected) in records.iter().enumerate() {
+            assert_eq!(lut.rate_of(i), expected);
         }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_and_reopen_lut_round_trips_bimolecular_reaction() {
+        let records = vec![ReactionRecord {
+            rate_q16: 500,
+            bin_id: 4,
+            transition_a: 0x10, // O* -> vacant
+            transition_b: 0x20, // CO* -> vacant
+            is_bimolecular: true,
+        }];
+        let blocks = pack_records_into_blocks(records.clone());
+        let path = temp_path("lut_bimolecular_roundtrip");
+        write_lut(&path, &blocks).unwrap();
+
+        let lut = ReactionLut::open(&path).unwrap();
+        assert_eq!(lut.rate_of(0), records[0]);
 
         let _ = std::fs::remove_file(&path);
     }

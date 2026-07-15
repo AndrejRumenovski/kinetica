@@ -296,12 +296,18 @@ fn run(config: &Config) -> io::Result<()> {
         1.0
     };
 
-    let records: Vec<(u32, u8, u8)> = raw_rates
+    let records: Vec<layout::ReactionRecord> = raw_rates
         .into_iter()
-        .map(|(k, transition)| {
+        .map(|(k, transition_a)| {
             let rate_q16 = ((k * scale).round() as u64).clamp(1, u32::MAX as u64) as u32;
             let bin_id = (31 - rate_q16.leading_zeros()) as u8;
-            (rate_q16, bin_id, transition)
+            layout::ReactionRecord {
+                rate_q16,
+                bin_id,
+                transition_a,
+                transition_b: 0,
+                is_bimolecular: false,
+            }
         })
         .collect();
 
