@@ -37,6 +37,27 @@ pub const ADS_H: u8 = 0x04;
 /// lattice file, and callers that care should treat it as the latter.
 pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H;
 
+/// The three adsorbates this lattice tracks, in the species-index order
+/// (`0=O, 1=H, 2=CO`) every real-data producer/consumer agrees on:
+/// `oc20_ingest`'s `EnergyRecord::species`, the `OC20E002`/`OC20BI01`
+/// binary formats, and `occupancy.rs`'s per-species counters all index
+/// into this same array. Defined once here rather than duplicated in each
+/// of those places.
+pub const SPECIES_BITS: [u8; 3] = [ADS_O, ADS_H, ADS_CO];
+
+/// Apply a packed `(reactant_mask << 4) | product_mask` transition to a
+/// site's current occupancy byte: clear the reactant's bits and OR in the
+/// product's. Shared by `engine.rs` (which also handles trajectory
+/// logging/migration around this) and `occupancy.rs` (which only needs
+/// the byte-level transition itself), so this one-line rule exists in
+/// exactly one place.
+#[inline(always)]
+pub fn apply_transition(current: u8, transition: u8) -> u8 {
+    let reactant_mask = transition >> 4;
+    let product_mask = transition & 0x0F;
+    (current & !reactant_mask) | product_mask
+}
+
 // ------------------------------------------------------------------------
 // Bit-packed, memory-mapped site matrix
 // ------------------------------------------------------------------------
@@ -221,15 +242,68 @@ pub fn block_and_lane(reaction_id: usize) -> (usize, usize) {
     )
 }
 
-/// Read-only, memory-mapped view over a prebuilt `reactions.lut` file: a
-/// flat run of `ReactionLutBlock`s with no header, so mapping it is just a
-/// pointer cast over the file's bytes.
+/// Which selection semantics a `reactions.lut` file was built for. Both
+/// kinds share the exact same on-disk `ReactionLutBlock` layout -- what
+/// differs is how the *engine* interprets `bin_id` and picks a site to fire
+/// on, not the bytes themselves. Recorded in the file's magic header so
+/// `main.rs` can dispatch to the right engine path automatically instead of
+/// relying on a CLI flag staying in sync with how the file was built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LutKind {
+    /// `bin_id` is a composition-rejection magnitude class
+    /// (`31 - rate_q16.leading_zeros()`); every reaction is an
+    /// independent, always-available channel with a fixed propensity.
+    /// Written by `main.rs`'s `--generate-lut` synthetic demo generator.
+    /// Selected via `gillespie::CompositionTable`/`GillespieDomain`.
+    Static,
+    /// `bin_id` is a quantile-bucket index (0..`occupancy::
+    /// BUCKETS_PER_SPECIES`) for monomolecular reactions, unused for
+    /// bimolecular ones; propensity is `rate_q16` scaled by how many
+    /// lattice sites currently match the reaction's reactant state.
+    /// Written by `oc20_ingest`. Selected via `occupancy::OccupancyCounters`.
+    OccupancyGated,
+}
+
+impl LutKind {
+    const fn magic(self) -> &'static [u8; 8] {
+        match self {
+            LutKind::Static => b"KMCSTAT1",
+            LutKind::OccupancyGated => b"KMCOCC01",
+        }
+    }
+
+    fn from_magic(magic: &[u8]) -> io::Result<Self> {
+        match magic {
+            m if m == LutKind::Static.magic() => Ok(LutKind::Static),
+            m if m == LutKind::OccupancyGated.magic() => Ok(LutKind::OccupancyGated),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reactions.lut has an unrecognized magic header",
+            )),
+        }
+    }
+}
+
+/// Every `reactions.lut` file starts with one 64-byte (cache-line-sized)
+/// header: an 8-byte magic (see `LutKind`) followed by 56 reserved/zeroed
+/// bytes. 64 rather than a bare 8 bytes specifically so the block array
+/// that follows stays 64-byte aligned relative to the mmap's page-aligned
+/// base -- `ReactionLutBlock` is `repr(align(64))`, and offsetting by
+/// anything not a multiple of 64 would break that invariant for every
+/// block after the first.
+const LUT_HEADER_SIZE: usize = 64;
+
+/// Read-only, memory-mapped view over a prebuilt `reactions.lut` file: an
+/// `LUT_HEADER_SIZE`-byte magic header followed by a flat run of
+/// `ReactionLutBlock`s, so mapping it (past the header) is just a pointer
+/// cast over the file's bytes.
 pub struct ReactionLut {
     // Kept only to hold the mapping alive for the lifetime of `blocks`;
     // never read directly after `open` validates and casts it.
     _mmap: Mmap,
     blocks: *const ReactionLutBlock,
     len: usize,
+    kind: LutKind,
 }
 
 // SAFETY: `ReactionLut` is a read-only view over mapped file bytes with no
@@ -243,8 +317,8 @@ unsafe impl Send for ReactionLut {}
 unsafe impl Sync for ReactionLut {}
 
 impl ReactionLut {
-    /// Map `path` and validate it as a whole number of correctly-aligned
-    /// `ReactionLutBlock`s.
+    /// Map `path`, validate its magic header, and validate the remaining
+    /// bytes as a whole number of correctly-aligned `ReactionLutBlock`s.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let file = std::fs::File::open(path)?;
 
@@ -253,32 +327,46 @@ impl ReactionLut {
         // treated as a static build artifact for the lifetime of the run.
         let mmap = unsafe { Mmap::map(&file)? };
 
-        let block_size = std::mem::size_of::<ReactionLutBlock>();
-        if mmap.len() % block_size != 0 {
+        if mmap.len() < LUT_HEADER_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "reactions.lut length is not a whole number of 64-byte AoSOA blocks",
+                "reactions.lut is too short to contain a header",
+            ));
+        }
+        let kind = LutKind::from_magic(&mmap[0..8])?;
+
+        let body_len = mmap.len() - LUT_HEADER_SIZE;
+        let block_size = std::mem::size_of::<ReactionLutBlock>();
+        if !body_len.is_multiple_of(block_size) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reactions.lut body length is not a whole number of 64-byte AoSOA blocks",
             ));
         }
 
-        let ptr = mmap.as_ptr();
+        // SAFETY-relevant: `LUT_HEADER_SIZE` (64) is itself a multiple of
+        // `align_of::<ReactionLutBlock>()` (64), so offsetting a
+        // page-aligned base by it preserves 64-byte alignment -- the
+        // `align_offset` check below is defensive, not expected to fire.
+        let ptr = unsafe { mmap.as_ptr().add(LUT_HEADER_SIZE) };
         if ptr.align_offset(std::mem::align_of::<ReactionLutBlock>()) != 0 {
             // mmap bases are page-aligned (>= 4096 bytes) on every platform
             // this project targets, which is always a multiple of 64; this
             // branch exists as a defensive check, not an expected path.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "reactions.lut mapping is not 64-byte aligned",
+                "reactions.lut block array is not 64-byte aligned",
             ));
         }
 
-        let len = mmap.len() / block_size;
+        let len = body_len / block_size;
         let blocks = ptr as *const ReactionLutBlock;
 
         Ok(Self {
             _mmap: mmap,
             blocks,
             len,
+            kind,
         })
     }
 
@@ -290,6 +378,11 @@ impl ReactionLut {
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    #[inline(always)]
+    pub fn kind(&self) -> LutKind {
+        self.kind
     }
 
     /// The full LUT as a typed slice of cache-line blocks.
@@ -380,9 +473,12 @@ pub fn pack_records_into_blocks(mut records: Vec<ReactionRecord>) -> Vec<Reactio
     blocks
 }
 
-/// Write `blocks` verbatim to `path` as the raw bytes `ReactionLut::open`
-/// expects to map back in.
-pub fn write_lut(path: impl AsRef<Path>, blocks: &[ReactionLutBlock]) -> io::Result<()> {
+/// Write `kind`'s magic header followed by `blocks` verbatim to `path`, as
+/// the raw bytes `ReactionLut::open` expects to map back in.
+pub fn write_lut(path: impl AsRef<Path>, kind: LutKind, blocks: &[ReactionLutBlock]) -> io::Result<()> {
+    let mut header = [0u8; LUT_HEADER_SIZE];
+    header[0..8].copy_from_slice(kind.magic());
+
     // SAFETY: `ReactionLutBlock` is `repr(C, align(64))`, `Copy`, and every
     // field is a plain fixed-width integer array with no padding bytes
     // (enforced by the `size_of::<ReactionLutBlock>() == 64` assertion
@@ -397,7 +493,9 @@ pub fn write_lut(path: impl AsRef<Path>, blocks: &[ReactionLutBlock]) -> io::Res
         )
     };
 
-    std::fs::File::create(path)?.write_all(bytes)
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(&header)?;
+    file.write_all(bytes)
 }
 
 #[cfg(test)]
@@ -453,9 +551,10 @@ mod tests {
         let records = vec![rec(10, 0, 0x01), rec(20, 1, 0x02), rec(30, 2, 0x04), rec(40, 31, 0x00)];
         let blocks = pack_records_into_blocks(records.clone());
         let path = temp_path("lut_roundtrip");
-        write_lut(&path, &blocks).unwrap();
+        write_lut(&path, LutKind::Static, &blocks).unwrap();
 
         let lut = ReactionLut::open(&path).unwrap();
+        assert_eq!(lut.kind(), LutKind::Static);
         assert_eq!(lut.len(), blocks.len());
         for (i, &expected) in records.iter().enumerate() {
             assert_eq!(lut.rate_of(i), expected);
@@ -475,9 +574,10 @@ mod tests {
         }];
         let blocks = pack_records_into_blocks(records.clone());
         let path = temp_path("lut_bimolecular_roundtrip");
-        write_lut(&path, &blocks).unwrap();
+        write_lut(&path, LutKind::OccupancyGated, &blocks).unwrap();
 
         let lut = ReactionLut::open(&path).unwrap();
+        assert_eq!(lut.kind(), LutKind::OccupancyGated);
         assert_eq!(lut.rate_of(0), records[0]);
 
         let _ = std::fs::remove_file(&path);
@@ -486,7 +586,28 @@ mod tests {
     #[test]
     fn open_rejects_file_with_length_not_multiple_of_block_size() {
         let path = temp_path("lut_bad_len");
-        std::fs::write(&path, [0u8; 100]).unwrap(); // not a multiple of 64
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(LutKind::Static.magic());
+        bytes.extend_from_slice(&[0u8; 50]); // body not a multiple of 64
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_file_shorter_than_header() {
+        let path = temp_path("lut_too_short");
+        std::fs::write(&path, [0u8; 10]).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_unrecognized_magic() {
+        let path = temp_path("lut_bad_magic");
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(b"BOGUSMAG");
+        std::fs::write(&path, &bytes).unwrap();
         assert!(ReactionLut::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }

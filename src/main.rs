@@ -152,8 +152,12 @@ fn run(config: &Config) -> std::io::Result<()> {
 
     println!("kinetica: mapping reaction LUT {}", config.lut_path.display());
     let lut = ReactionLut::open(&config.lut_path)?;
+    let engine_name = match lut.kind() {
+        layout::LutKind::Static => "static composition-rejection (gillespie.rs)",
+        layout::LutKind::OccupancyGated => "occupancy-gated (occupancy.rs)",
+    };
     println!(
-        "kinetica: {} blocks ({} reactions) mapped from {}",
+        "kinetica: {} blocks ({} reactions) mapped from {} -- {engine_name} engine",
         lut.len(),
         lut.len() * ReactionLutBlock::LANES,
         config.lut_path.display()
@@ -235,5 +239,5 @@ fn generate_demo_lut(path: &std::path::Path, count: usize) -> std::io::Result<()
         .collect();
 
     let blocks = layout::pack_records_into_blocks(records);
-    layout::write_lut(path, &blocks)
+    layout::write_lut(path, layout::LutKind::Static, &blocks)
 }

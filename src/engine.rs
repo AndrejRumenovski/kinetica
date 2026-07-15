@@ -18,7 +18,8 @@ use std::path::Path;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::gillespie::{GillespieDomain, Rng};
-use crate::layout::{ReactionLut, SiteLattice};
+use crate::layout::{LutKind, ReactionLut, ReactionLutBlock, SiteLattice};
+use crate::occupancy::OccupancyCounters;
 
 // ------------------------------------------------------------------------
 // Cross-patch boundary migration
@@ -52,6 +53,28 @@ fn apply_migration(data: &mut [u8], width: usize, row_local: usize, ev: Migratio
     let idx = row_local * width + ev.col;
     if idx < data.len() {
         data[idx] = ev.state;
+    }
+}
+
+/// Same as `apply_migration`, but also keeps `counters` in sync -- a
+/// migration mirrors an occupancy change that happened on a *different*
+/// patch, so the occupancy-gated path's live counts need to see it too,
+/// not just the raw bytes.
+#[allow(clippy::too_many_arguments)]
+fn apply_migration_occupancy_gated(
+    data: &mut [u8],
+    width: usize,
+    rows_in_band: usize,
+    row_local: usize,
+    ev: MigrationEvent,
+    counters: &mut OccupancyCounters,
+    seed: u64,
+) {
+    let idx = row_local * width + ev.col;
+    if idx < data.len() {
+        let old = data[idx];
+        data[idx] = ev.state;
+        counters.on_occupancy_change(data, idx, width, rows_in_band, old, ev.state, seed);
     }
 }
 
@@ -118,11 +141,7 @@ fn apply_and_record(
     trajectory_tx: &Sender<TrajectoryRecord>,
     links: &BoundaryLinks,
 ) {
-    // `transition` packs `(reactant_mask << 4) | product_mask`: clear the
-    // reactant's bits and OR in the product's, in place.
-    let reactant_mask = transition >> 4;
-    let product_mask = transition & 0x0F;
-    data[site_idx] = (data[site_idx] & !reactant_mask) | product_mask;
+    data[site_idx] = crate::layout::apply_transition(data[site_idx], transition);
 
     let _ = trajectory_tx.send(TrajectoryRecord {
         sim_time_bits,
@@ -225,6 +244,87 @@ fn run_patch(
     }
 }
 
+/// The occupancy-gated counterpart to `run_patch`, used for `KMCOCC01`
+/// LUTs. Structurally the same per-step shape (drain migrations, pick a
+/// reaction, apply it, advance simulated time) but every reaction- and
+/// site-selection decision is routed through `occupancy::OccupancyCounters`
+/// instead of `gillespie::GillespieDomain` + a uniformly random site pick --
+/// see `occupancy.rs`'s module doc for why. `apply_and_record` (the actual
+/// byte-level mutation, trajectory logging, and boundary migration) is
+/// reused unchanged from the static path; this function's own job is only
+/// selecting *what* to apply and keeping `counters` in sync afterward.
+#[allow(clippy::too_many_arguments)]
+fn run_patch_occupancy_gated(
+    band: (usize, usize),
+    width: usize,
+    data: &mut [u8],
+    lut: &ReactionLut,
+    links: BoundaryLinks,
+    steps: u64,
+    seed: u64,
+    trajectory_tx: &Sender<TrajectoryRecord>,
+) {
+    let (y0, y1) = band;
+    let rows_in_band = y1 - y0;
+
+    let reaction_count = lut.len() * ReactionLutBlock::LANES;
+    let templates: Vec<_> = (0..reaction_count).map(|id| lut.rate_of(id)).collect();
+
+    let mut counters = OccupancyCounters::new(data, width, seed);
+    let mut rng = Rng::seeded(seed);
+    let mut sim_time = 0.0f64;
+
+    for _ in 0..steps {
+        if let Some(rx) = &links.recv_from_above {
+            for ev in rx.try_iter() {
+                apply_migration_occupancy_gated(data, width, rows_in_band, 0, ev, &mut counters, seed);
+            }
+        }
+        if let Some(rx) = &links.recv_from_below {
+            for ev in rx.try_iter() {
+                apply_migration_occupancy_gated(
+                    data, width, rows_in_band, rows_in_band - 1, ev, &mut counters, seed,
+                );
+            }
+        }
+
+        let total = counters.total_propensity(&templates);
+        if total <= 0.0 {
+            break; // domain gone fully quiescent: no template's reactant exists anywhere
+        }
+        let u = ((rng.next_u64() >> 11) as f64) * (1.1102230246251565e-16); // 2^-53
+        let u = u.max(f64::MIN_POSITIVE);
+        let tau = -u.ln() / total;
+        sim_time += tau;
+
+        let Some((reaction_id, site_a, site_b)) =
+            counters.select_event(&templates, data, width, rows_in_band, &mut rng, seed)
+        else {
+            break; // structurally unreachable given total > 0 above, but handled defensively
+        };
+        let r = templates[reaction_id as usize];
+        let sim_time_bits = sim_time.to_bits();
+
+        let old_a = data[site_a];
+        apply_and_record(
+            data, width, rows_in_band, y0, site_a, r.transition_a, reaction_id,
+            sim_time_bits, trajectory_tx, &links,
+        );
+        let new_a = data[site_a];
+        counters.on_occupancy_change(data, site_a, width, rows_in_band, old_a, new_a, seed);
+
+        if let Some(site_b) = site_b {
+            let old_b = data[site_b];
+            apply_and_record(
+                data, width, rows_in_band, y0, site_b, r.transition_b, reaction_id,
+                sim_time_bits, trajectory_tx, &links,
+            );
+            let new_b = data[site_b];
+            counters.on_occupancy_change(data, site_b, width, rows_in_band, old_b, new_b, seed);
+        }
+    }
+}
+
 // ------------------------------------------------------------------------
 // Work-stealing fan-out
 // ------------------------------------------------------------------------
@@ -290,8 +390,13 @@ pub fn run_simulation(
             // same decomposition reproduces the same trajectory.
             let seed = 0x5EED_0000_0000_0000u64 ^ (i as u64);
 
-            scope.spawn(move |_| {
-                run_patch((y0, y1), width, data, lut, links, steps_per_patch, seed, &tx);
+            scope.spawn(move |_| match lut.kind() {
+                LutKind::Static => {
+                    run_patch((y0, y1), width, data, lut, links, steps_per_patch, seed, &tx)
+                }
+                LutKind::OccupancyGated => run_patch_occupancy_gated(
+                    (y0, y1), width, data, lut, links, steps_per_patch, seed, &tx,
+                ),
             });
         }
     });
@@ -549,4 +654,145 @@ mod tests {
     }
 
     const VACANT_FOR_TEST: u8 = 0x00;
+
+    /// The falsifying test this whole occupancy-gating pass exists to
+    /// pass: drive the *actual* `run_simulation` pipeline (spatial
+    /// decomposition, migration, everything -- not just
+    /// `OccupancyCounters` in isolation) over a mixed-occupancy lattice
+    /// for many steps against an `OccupancyGated` LUT, then confirm no
+    /// site ever ends up holding more than one adsorbate at once. Before
+    /// this pass, an adsorption event applied via a bitwise OR to an
+    /// already-occupied site (no precondition check) could and would
+    /// produce exactly that invalid state -- see the chemistry review's
+    /// "kMC correctness" finding.
+    #[test]
+    fn run_simulation_occupancy_gated_never_produces_an_invalid_multi_bit_site() {
+        use crate::layout::{
+            self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_CO, ADS_H, ADS_O,
+            OCCUPANCY_MASK, VACANT,
+        };
+        use crate::test_support::temp_path;
+
+        let lattice_path = temp_path("occ_e2e_lattice");
+        let lut_path = temp_path("occ_e2e_lut");
+        let trajectory_path = temp_path("occ_e2e_trajectory");
+
+        let width = 8;
+        let height = 8;
+        let mut lattice = SiteLattice::open(&lattice_path, width, height).unwrap();
+
+        // Mixed initial occupancy: every species (and vacancy) represented,
+        // so both adsorption (onto an already-occupied neighbor) and
+        // desorption paths get real exercise.
+        let states = [VACANT, ADS_O, ADS_H, ADS_CO];
+        for i in 0..width * height {
+            lattice.set(i, states[i % states.len()]);
+        }
+
+        // Adsorption + desorption for all 3 species, covering *every*
+        // quantile bucket (0..BUCKETS_PER_SPECIES) -- exactly like a real
+        // oc20_ingest-built LUT. A template only ever matches sites whose
+        // `occupancy::site_bucket` hash lands in its own bucket, so
+        // covering just one bucket would leave most sites with no
+        // matching template at all and barely exercise anything.
+        let mut records = Vec::new();
+        for &bit in &[ADS_O, ADS_H, ADS_CO] {
+            for bucket in 0..crate::occupancy::BUCKETS_PER_SPECIES as u8 {
+                records.push(ReactionRecord {
+                    rate_q16: 1_000_000,
+                    bin_id: bucket,
+                    transition_a: bit,
+                    transition_b: 0,
+                    is_bimolecular: false,
+                });
+                records.push(ReactionRecord {
+                    rate_q16: 1_000_000,
+                    bin_id: bucket,
+                    transition_a: bit << 4,
+                    transition_b: 0,
+                    is_bimolecular: false,
+                });
+            }
+        }
+        let blocks = layout::pack_records_into_blocks(records);
+        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        let lut = ReactionLut::open(&lut_path).unwrap();
+        assert_eq!(lut.kind(), LutKind::OccupancyGated);
+
+        run_simulation(&mut lattice, &lut, 2, 2000, &trajectory_path).unwrap();
+
+        for i in 0..width * height {
+            let byte = lattice.get(i);
+            assert_eq!(
+                byte & !OCCUPANCY_MASK,
+                0,
+                "site {i} has bits outside OCCUPANCY_MASK: {byte:#04x}"
+            );
+            assert!(
+                (byte & OCCUPANCY_MASK).count_ones() <= 1,
+                "site {i} holds more than one adsorbate simultaneously: {byte:#04x}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&lattice_path);
+        let _ = std::fs::remove_file(&lut_path);
+        let _ = std::fs::remove_file(&trajectory_path);
+    }
+
+    /// Propensity must genuinely track coverage, not just avoid corrupting
+    /// occupancy: a lattice with exactly one O*-occupied site and only a
+    /// desorption template (no adsorption to replenish it) must desorb
+    /// that one site and then go quiescent -- ending up fully vacant,
+    /// never panicking or spinning once nothing matches anymore.
+    #[test]
+    fn run_simulation_occupancy_gated_goes_quiescent_once_reactant_is_depleted() {
+        use crate::layout::{self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_O, VACANT};
+        use crate::test_support::temp_path;
+
+        let lattice_path = temp_path("occ_quiescent_lattice");
+        let lut_path = temp_path("occ_quiescent_lut");
+        let trajectory_path = temp_path("occ_quiescent_trajectory");
+
+        let width = 4;
+        let height = 4;
+        let mut lattice = SiteLattice::open(&lattice_path, width, height).unwrap();
+        for i in 0..width * height {
+            lattice.set(i, VACANT);
+        }
+        lattice.set(5, ADS_O); // exactly one O*-occupied site
+
+        // A desorption template for *every* bucket (0..BUCKETS_PER_SPECIES),
+        // not just one -- exactly like a real oc20_ingest-built LUT. Site
+        // 5's actual bucket assignment is a hash of its own index (see
+        // `occupancy::site_bucket`), so a test LUT covering only one
+        // bucket could easily miss it entirely (which is itself worth
+        // knowing: bucket coverage has to be complete per species/
+        // direction for occupancy gating to work at all).
+        let records: Vec<_> = (0..crate::occupancy::BUCKETS_PER_SPECIES as u8)
+            .map(|bucket| ReactionRecord {
+                rate_q16: u32::MAX,
+                bin_id: bucket,
+                transition_a: ADS_O << 4, // desorption only -- nothing replenishes O*
+                transition_b: 0,
+                is_bimolecular: false,
+            })
+            .collect();
+        let blocks = layout::pack_records_into_blocks(records);
+        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        let lut = ReactionLut::open(&lut_path).unwrap();
+
+        // Steps far beyond what's needed -- if the domain didn't correctly
+        // go quiescent (total_propensity == 0 breaking the loop), this
+        // would still terminate, but the point is confirming the *state*
+        // afterward is fully vacant, not that it doesn't hang.
+        run_simulation(&mut lattice, &lut, 1, 1000, &trajectory_path).unwrap();
+
+        for i in 0..width * height {
+            assert_eq!(lattice.get(i), VACANT, "site {i} should be vacant after the only O* desorbed");
+        }
+
+        let _ = std::fs::remove_file(&lattice_path);
+        let _ = std::fs::remove_file(&lut_path);
+        let _ = std::fs::remove_file(&trajectory_path);
+    }
 }

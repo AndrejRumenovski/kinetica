@@ -46,18 +46,38 @@
 //! for OC20, `scripts/extract_catalysis_hub.py` for Catalysis-Hub.org) each
 //! emit the flat binary format this tool consumes as `--input` -- see
 //! `scripts/oc20e_format.py` for the exact byte layout.
+//!
+//! **Output is a small, quantile-bucketed catalogue, not one record per
+//! DFT sample.** A `--input` file typically carries hundreds of adsorption-
+//! energy records per species (one per real DFT calculation this species
+//! happened to appear in, across many different surfaces). Earlier
+//! versions of this tool turned every single one into its own independent
+//! `ReactionRecord` -- which meant propensity had no way to reflect how
+//! much of a species the lattice actually had on it, since a static list
+//! of "reactions" has no notion of the live surface state at all (see
+//! `kinetica::occupancy` for the fix on the engine side). This tool's half
+//! of that fix is `bucket_by_quantile`: each species' samples are sorted
+//! by reaction energy and split into `BUCKETS_PER_SPECIES` (4) roughly
+//! equal groups, and each group collapses to *one* representative
+//! adsorption (and, usually, desorption) `ReactionRecord` built from the
+//! group's mean energy (mean real Ea too, when any group member has one).
+//! This keeps real, meaningful heterogeneity -- a genuinely fast-reacting
+//! quartile of surfaces versus a genuinely slow-reacting one -- without
+//! either collapsing to a single averaged number per species or keeping
+//! hundreds of individually-untracked channels the engine has no way to
+//! gate on actual occupancy.
 
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use kinetica::layout::{self, ReactionLutBlock};
+use kinetica::layout::{self, ReactionLutBlock, SPECIES_BITS};
+use kinetica::occupancy::BUCKETS_PER_SPECIES;
 
-/// The three adsorbates kinetica's lattice bitflags (layout.rs) model,
-/// matching OC20's global adsorbate-index table
-/// (`mapping_adsorbates_2020may12.txt`: 0 = *O, 1 = *H, 5 = *CO) as
-/// remapped to a dense 0..3 range by the extraction scripts.
-const SPECIES_BITS: [u8; 3] = [layout::ADS_O, layout::ADS_H, layout::ADS_CO];
+/// `SPECIES_BITS`'s index order, named -- matches OC20's global
+/// adsorbate-index table (`mapping_adsorbates_2020may12.txt`: 0 = *O,
+/// 1 = *H, 5 = *CO) as remapped to a dense 0..3 range by the extraction
+/// scripts.
 const SPECIES_NAMES: [&str; 3] = ["O", "H", "CO"];
 
 const MAGIC: &[u8; 8] = b"OC20E002";
@@ -163,6 +183,7 @@ fn usage() -> String {
 /// diagnostics), and -- rarely -- a genuine DFT-computed activation energy
 /// in eV, when the source publishes one instead of just the reaction
 /// energy.
+#[derive(Clone, Copy)]
 struct EnergyRecord {
     species: u8,
     energy_ev: f64,
@@ -259,6 +280,60 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
     Ok(records)
 }
 
+/// One quantile bucket's summary: how many real DFT samples fell into it,
+/// their mean reaction energy (what BEP is applied to when nothing better
+/// is available), and the mean of just the members that carried a real
+/// activation energy, if any did.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BucketSummary {
+    mean_energy_ev: f64,
+    real_ea_ev: Option<f64>,
+    sample_count: usize,
+}
+
+/// Split `records` into up to `num_buckets` roughly-equal-sized groups by
+/// sorted reaction energy, and summarize each into one `BucketSummary`.
+/// Bucketing by reaction energy (the direct DFT observable) rather than by
+/// derived activation energy keeps the split meaningful even for the
+/// majority of records that don't have a real Ea to sort by. Never
+/// creates more buckets than there are records -- with `N < num_buckets`
+/// samples this gracefully degrades to one bucket per sample, i.e. the
+/// same per-record behavior this function replaces.
+fn bucket_by_quantile(records: &[EnergyRecord], num_buckets: usize) -> Vec<BucketSummary> {
+    if records.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted = records.to_vec();
+    sorted.sort_by(|a, b| a.energy_ev.total_cmp(&b.energy_ev));
+
+    let n = sorted.len();
+    let buckets = num_buckets.clamp(1, n);
+    let mut summaries = Vec::with_capacity(buckets);
+
+    for b in 0..buckets {
+        let start = b * n / buckets;
+        let end = (b + 1) * n / buckets;
+        let group = &sorted[start..end];
+
+        let mean_energy_ev = group.iter().map(|r| r.energy_ev).sum::<f64>() / group.len() as f64;
+        let real_eas: Vec<f64> = group.iter().filter_map(|r| r.real_ea_ev).collect();
+        let real_ea_ev = if real_eas.is_empty() {
+            None
+        } else {
+            Some(real_eas.iter().sum::<f64>() / real_eas.len() as f64)
+        };
+
+        summaries.push(BucketSummary {
+            mean_energy_ev,
+            real_ea_ev,
+            sample_count: group.len(),
+        });
+    }
+
+    summaries
+}
+
 /// The activation energy for a reaction: a genuine DFT-computed barrier
 /// when the source provided one, otherwise the BEP estimate from its
 /// reaction energy.
@@ -314,28 +389,42 @@ fn run(config: &Config) -> io::Result<()> {
     // cheating -- so there is currently no real-energy source for CO
     // anywhere in this dataset bundle. A `--input` built from `train` will
     // therefore always show 0 CO records; that is expected, not a bug.
-    let mut species_counts = [0usize; SPECIES_BITS.len()];
-    let mut species_real_ea_counts = [0usize; SPECIES_BITS.len()];
-    for rec in &energy_records {
-        species_counts[rec.species as usize] += 1;
-        if rec.real_ea_ev.is_some() {
-            species_real_ea_counts[rec.species as usize] += 1;
-        }
+    let mut by_species: [Vec<EnergyRecord>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for &rec in &energy_records {
+        by_species[rec.species as usize].push(rec);
     }
-    for ((name, count), real_ea_count) in SPECIES_NAMES
-        .iter()
-        .zip(species_counts.iter())
-        .zip(species_real_ea_counts.iter())
-    {
-        let note = if *count == 0 {
+
+    let mut bucketed_by_species: [Vec<BucketSummary>; 3] = Default::default();
+    for species in 0..SPECIES_BITS.len() {
+        let count = by_species[species].len();
+        let real_ea_count = by_species[species]
+            .iter()
+            .filter(|r| r.real_ea_ev.is_some())
+            .count();
+        let note = if count == 0 {
             "  (absent from --input; reactions.lut will have no reactions for this species)"
                 .to_string()
-        } else if *real_ea_count > 0 {
+        } else if real_ea_count > 0 {
             format!("  ({real_ea_count} with a real DFT-computed activation energy, not BEP)")
         } else {
             String::new()
         };
-        println!("oc20_ingest: species {name}: {count} adsorption-energy records{note}");
+        println!(
+            "oc20_ingest: species {}: {count} adsorption-energy records{note}",
+            SPECIES_NAMES[species]
+        );
+
+        let buckets = bucket_by_quantile(&by_species[species], BUCKETS_PER_SPECIES);
+        if !buckets.is_empty() {
+            let sizes: Vec<String> = buckets.iter().map(|b| b.sample_count.to_string()).collect();
+            println!(
+                "oc20_ingest: species {}: collapsed into {} quantile bucket(s) (sizes: {})",
+                SPECIES_NAMES[species],
+                buckets.len(),
+                sizes.join(", ")
+            );
+        }
+        bucketed_by_species[species] = buckets;
     }
 
     let bimolecular_records = match &config.bimolecular_input {
@@ -370,33 +459,36 @@ fn run(config: &Config) -> io::Result<()> {
         }
     }
 
-    // Each input sample normally yields TWO reactions on the lattice:
-    // adsorption (VACANT -> ADS_X, forward reaction energy = the relaxed
-    // adsorption energy itself) and desorption (ADS_X -> VACANT, the
+    // Each quantile bucket normally yields TWO reactions on the lattice:
+    // adsorption (VACANT -> ADS_X, forward reaction energy = the bucket's
+    // mean relaxed adsorption energy) and desorption (ADS_X -> VACANT, the
     // reverse). Using Ea_rev = Ea_fwd - dE_rxn keeps the pair
     // thermodynamically consistent (same forward/reverse ratio a real
     // free-energy landscape would give) regardless of whether Ea_fwd came
     // from a real barrier or BEP. The desorption half is skipped for a
     // species covered by `replaces_desorption` -- see above.
     //
-    // `(rate, transition_a, transition_b, is_bimolecular)` -- transition_b
-    // is only meaningful (and non-zero) for the bimolecular records
-    // appended below.
-    let mut raw_rates: Vec<(f64, u8, u8, bool)> =
-        Vec::with_capacity(energy_records.len() * 2 + bimolecular_records.len());
-    let mut desorption_count = 0usize;
-    for rec in &energy_records {
-        let species_bit = SPECIES_BITS[rec.species as usize];
+    // `(rate, transition_a, transition_b, is_bimolecular, bucket_id)` --
+    // transition_b is only meaningful (and non-zero) for the bimolecular
+    // records appended below; bucket_id becomes each `ReactionRecord`'s
+    // `bin_id` (unused/0 for bimolecular templates -- see `occupancy.rs`).
+    let mut raw_rates: Vec<(f64, u8, u8, bool, u8)> = Vec::new();
+    let mut ads_count = 0usize;
+    let mut des_count = 0usize;
+    for species in 0..SPECIES_BITS.len() {
+        let species_bit = SPECIES_BITS[species];
+        for (bucket_idx, bucket) in bucketed_by_species[species].iter().enumerate() {
+            let ea_fwd = activation_energy_ev(bucket.mean_energy_ev, bucket.real_ea_ev, config);
+            let k_ads = rate_from_activation(ea_fwd, config);
+            raw_rates.push((k_ads, species_bit, 0, false, bucket_idx as u8)); // 0x0_species (adsorption)
+            ads_count += 1;
 
-        let ea_fwd = activation_energy_ev(rec.energy_ev, rec.real_ea_ev, config);
-        let k_ads = rate_from_activation(ea_fwd, config);
-        raw_rates.push((k_ads, species_bit, 0, false)); // transition = 0x0_species (adsorption)
-
-        if !replaces_desorption[rec.species as usize] {
-            let ea_rev = (ea_fwd - rec.energy_ev).max(0.0);
-            let k_des = rate_from_activation(ea_rev, config);
-            raw_rates.push((k_des, species_bit << 4, 0, false)); // transition = species_0x0 (desorption)
-            desorption_count += 1;
+            if !replaces_desorption[species] {
+                let ea_rev = (ea_fwd - bucket.mean_energy_ev).max(0.0);
+                let k_des = rate_from_activation(ea_rev, config);
+                raw_rates.push((k_des, species_bit << 4, 0, false, bucket_idx as u8)); // species_0x0 (desorption)
+                des_count += 1;
+            }
         }
     }
     for (name, replaced) in SPECIES_NAMES.iter().zip(replaces_desorption.iter()) {
@@ -414,13 +506,17 @@ fn run(config: &Config) -> io::Result<()> {
     // no reverse reaction is built: the gas product leaving the surface
     // isn't a single elementary step back onto two sites, so there's no
     // thermodynamically meaningful Ea_rev to derive here (unlike the
-    // monomolecular adsorption/desorption pair above).
+    // monomolecular adsorption/desorption pair above). Kept un-bucketed
+    // (bucket_id = 0, unused by the engine for bimolecular templates --
+    // see `occupancy::OccupancyCounters::live_count`): there are only a
+    // handful of these real barriers, not enough to meaningfully quantile-
+    // split.
     for rec in &bimolecular_records {
         let bit_a = SPECIES_BITS[rec.species_a as usize];
         let bit_b = SPECIES_BITS[rec.species_b as usize];
         let k = rate_from_activation(rec.ea_ev, config);
         // transition_a/b = species_0x0 (each site: occupied -> vacant).
-        raw_rates.push((k, bit_a << 4, bit_b << 4, true));
+        raw_rates.push((k, bit_a << 4, bit_b << 4, true, 0));
     }
 
     // Rescale into the Q16.16 fixed-point domain `ReactionLutBlock` uses:
@@ -429,15 +525,14 @@ fn run(config: &Config) -> io::Result<()> {
     // directly. Since kMC event selection only depends on *ratios* between
     // propensities, uniformly rescaling every rate by the same factor
     // changes nothing about which reaction is likeliest to fire -- it only
-    // changes the absolute wall-clock/tau units, which this synthetic
-    // engine doesn't otherwise calibrate against real time anyway. The
-    // scale is chosen so the single fastest reaction (mono- or bimolecular
-    // alike -- both compete for the same propensity budget) lands just
-    // under 2^31, leaving headroom in the u32 field and keeping bin_id
-    // (log2 of this value) comfortably inside CompositionTable's 32 bins.
+    // changes the absolute wall-clock/tau units, which this engine doesn't
+    // otherwise calibrate against real time anyway. The scale is chosen so
+    // the single fastest reaction (mono- or bimolecular alike -- both
+    // compete for the same propensity budget) lands just under 2^31,
+    // leaving headroom in the u32 field.
     let max_k = raw_rates
         .iter()
-        .map(|&(k, _, _, _)| k)
+        .map(|&(k, _, _, _, _)| k)
         .fold(0.0_f64, f64::max);
     let scale = if max_k > 0.0 {
         (1u64 << 31) as f64 / max_k
@@ -447,12 +542,15 @@ fn run(config: &Config) -> io::Result<()> {
 
     let records: Vec<layout::ReactionRecord> = raw_rates
         .into_iter()
-        .map(|(k, transition_a, transition_b, is_bimolecular)| {
+        .map(|(k, transition_a, transition_b, is_bimolecular, bucket_id)| {
             let rate_q16 = ((k * scale).round() as u64).clamp(1, u32::MAX as u64) as u32;
-            let bin_id = (31 - rate_q16.leading_zeros()) as u8;
             layout::ReactionRecord {
                 rate_q16,
-                bin_id,
+                // `bin_id`: the quantile bucket index for a monomolecular
+                // template (0 and unused for a bimolecular one) -- *not*
+                // a composition-rejection magnitude class here, unlike
+                // `LutKind::Static` LUTs. See `occupancy.rs`.
+                bin_id: bucket_id,
                 transition_a,
                 transition_b,
                 is_bimolecular,
@@ -464,14 +562,14 @@ fn run(config: &Config) -> io::Result<()> {
         "oc20_ingest: built {} reactions ({} adsorption + {} desorption + {} bimolecular), \
          rate scale factor {:.3e}",
         records.len(),
-        energy_records.len(),
-        desorption_count,
+        ads_count,
+        des_count,
         bimolecular_records.len(),
         scale
     );
 
     let blocks: Vec<ReactionLutBlock> = layout::pack_records_into_blocks(records);
-    layout::write_lut(&config.out, &blocks)?;
+    layout::write_lut(&config.out, layout::LutKind::OccupancyGated, &blocks)?;
 
     println!(
         "oc20_ingest: wrote {} blocks ({} reactions) to {}",
@@ -579,6 +677,75 @@ mod tests {
         .map(|s| s.to_string());
         let c = Config::parse(args).unwrap();
         assert_eq!(c.bimolecular_input, Some(PathBuf::from("bi.bin")));
+    }
+
+    fn energy_record(energy_ev: f64, real_ea_ev: Option<f64>) -> EnergyRecord {
+        EnergyRecord {
+            species: 0,
+            energy_ev,
+            sid: 0,
+            real_ea_ev,
+        }
+    }
+
+    #[test]
+    fn bucket_by_quantile_empty_input_yields_no_buckets() {
+        assert!(bucket_by_quantile(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn bucket_by_quantile_degenerates_gracefully_with_fewer_samples_than_buckets() {
+        let records = vec![energy_record(-1.0, None), energy_record(-0.5, None)];
+        let buckets = bucket_by_quantile(&records, 4);
+        // Never more buckets than samples -- each of the 2 records gets
+        // its own bucket, matching the old one-record-per-channel
+        // behavior this replaces.
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].sample_count, 1);
+        assert_eq!(buckets[1].sample_count, 1);
+        assert!((buckets[0].mean_energy_ev - (-1.0)).abs() < 1e-9);
+        assert!((buckets[1].mean_energy_ev - (-0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn bucket_by_quantile_splits_into_roughly_equal_sorted_groups() {
+        // 8 records, energies 0..8 in a shuffled order -- must sort first,
+        // then split into 4 buckets of 2 each: {0,1},{2,3},{4,5},{6,7}.
+        let energies = [5.0, 1.0, 7.0, 0.0, 3.0, 6.0, 2.0, 4.0];
+        let records: Vec<EnergyRecord> = energies.iter().map(|&e| energy_record(e, None)).collect();
+        let buckets = bucket_by_quantile(&records, 4);
+
+        assert_eq!(buckets.len(), 4);
+        for b in &buckets {
+            assert_eq!(b.sample_count, 2);
+        }
+        assert!((buckets[0].mean_energy_ev - 0.5).abs() < 1e-9); // mean(0,1)
+        assert!((buckets[1].mean_energy_ev - 2.5).abs() < 1e-9); // mean(2,3)
+        assert!((buckets[2].mean_energy_ev - 4.5).abs() < 1e-9); // mean(4,5)
+        assert!((buckets[3].mean_energy_ev - 6.5).abs() < 1e-9); // mean(6,7)
+    }
+
+    #[test]
+    fn bucket_by_quantile_means_only_the_real_ea_members_within_a_bucket() {
+        let records = vec![
+            energy_record(0.0, Some(0.10)),
+            energy_record(0.1, None),
+            energy_record(0.2, Some(0.30)),
+        ];
+        // All 3 sort into one bucket (num_buckets=1) -- the bucket's
+        // real_ea_ev must average only the 2 members that had one, not
+        // treat the missing one as 0.
+        let buckets = bucket_by_quantile(&records, 1);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].sample_count, 3);
+        assert!((buckets[0].real_ea_ev.unwrap() - 0.20).abs() < 1e-9); // mean(0.10, 0.30)
+    }
+
+    #[test]
+    fn bucket_by_quantile_real_ea_is_none_when_no_member_has_one() {
+        let records = vec![energy_record(0.0, None), energy_record(0.1, None)];
+        let buckets = bucket_by_quantile(&records, 1);
+        assert_eq!(buckets[0].real_ea_ev, None);
     }
 
     fn push_record(bytes: &mut Vec<u8>, species: u8, energy_mev: i32, sid: u32, real_ea_mev: Option<i32>) {
@@ -810,6 +977,62 @@ mod tests {
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&bi_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn run_collapses_many_samples_into_bucketed_templates_not_one_per_sample() {
+        let input_path = temp_path("run_bucketing_input");
+        let out_path = temp_path("run_bucketing_out.lut");
+
+        // 12 real O adsorption-energy records -- more than BUCKETS_PER_SPECIES
+        // (4), so this must collapse to 4 adsorption + 4 desorption
+        // templates, not 12 + 12.
+        let mut mono_bytes = Vec::new();
+        mono_bytes.extend_from_slice(MAGIC);
+        mono_bytes.extend_from_slice(&12u32.to_le_bytes());
+        for i in 0..12 {
+            push_record(&mut mono_bytes, 0, -100 * i, i as u32, None);
+        }
+        std::fs::write(&input_path, &mono_bytes).unwrap();
+
+        let config = Config {
+            input: input_path.clone(),
+            bimolecular_input: None,
+            out: out_path.clone(),
+            alpha: 0.87,
+            beta_ev: 0.0,
+            nu: 1.0e13,
+            temperature_k: 298.15,
+        };
+        run(&config).unwrap();
+
+        let lut = layout::ReactionLut::open(&out_path).unwrap();
+        assert_eq!(lut.kind(), layout::LutKind::OccupancyGated);
+        let reaction_count = lut.len() * ReactionLutBlock::LANES;
+        let real_records: Vec<_> = (0..reaction_count)
+            .map(|id| lut.rate_of(id))
+            .filter(|r| r.rate_q16 > 0)
+            .collect();
+
+        // 4 buckets x (adsorption + desorption) = 8, not 12 + 12 = 24.
+        assert_eq!(real_records.len(), 8);
+
+        let ads_bin_ids: std::collections::BTreeSet<u8> = real_records
+            .iter()
+            .filter(|r| r.transition_a == layout::ADS_O)
+            .map(|r| r.bin_id)
+            .collect();
+        assert_eq!(ads_bin_ids, [0u8, 1, 2, 3].into_iter().collect());
+
+        let des_bin_ids: std::collections::BTreeSet<u8> = real_records
+            .iter()
+            .filter(|r| r.transition_a == layout::ADS_O << 4)
+            .map(|r| r.bin_id)
+            .collect();
+        assert_eq!(des_bin_ids, [0u8, 1, 2, 3].into_iter().collect());
+
+        let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&out_path);
     }
 }

@@ -6,6 +6,7 @@
 pub mod engine;
 pub mod gillespie;
 pub mod layout;
+pub mod occupancy;
 
 /// Shared by `layout`'s and `gillespie`'s test modules, both of which need
 /// a real on-disk file to back a `SiteLattice`/`ReactionLut` mmap (neither

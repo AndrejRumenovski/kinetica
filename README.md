@@ -5,12 +5,20 @@ single-workstation, OC20-scale surface reaction simulation, written in
 pure Rust.
 
 The lattice lives as a memory-mapped file rather than in heap-resident
-`Vec`s, next-reaction selection is O(1) regardless of how many reaction
-channels are active (composition-rejection sampling over fixed-point
-propensities), and the simulation is spatially decomposed into
-independently-scheduled `rayon` work-stealing patches whose fired-reaction
-trajectory is streamed out through a double-buffered `io_uring` writer so
-no compute thread ever blocks on disk I/O.
+`Vec`s, and the simulation is spatially decomposed into independently-
+scheduled `rayon` work-stealing patches whose fired-reaction trajectory is
+streamed out through a double-buffered `io_uring` writer so no compute
+thread ever blocks on disk I/O.
+
+Two reaction-selection engines coexist, auto-selected from a magic header
+in `reactions.lut` itself (no CLI flag to keep in sync): a **static**
+composition-rejection sampler (O(1) next-reaction selection regardless of
+how many fixed-rate channels are active — `kinetica --generate-lut`'s
+synthetic demo mode) and an **occupancy-gated** one (real, `oc20_ingest`-
+built data — propensity scales with how many lattice sites *currently*
+match a reaction's reactant state, so a reaction can only ever fire where
+its reactant genuinely is). See "Occupancy-gated kMC" below for why the
+second one exists and how it works.
 
 ## Building
 
@@ -29,9 +37,10 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 
 | Path                    | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
-| `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing |
-| `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic |
-| `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing patches, crossbeam boundary migration, double-buffered `io_uring` trajectory writer |
+| `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind` |
+| `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
+| `src/occupancy.rs`       | Live per-patch occupancy counters + bounded-rejection site selection -- the `OccupancyGated`/real-data engine |
+| `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing patches, crossbeam boundary migration, double-buffered `io_uring` trajectory writer, dispatch between the two engines |
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
 | `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
@@ -58,6 +67,55 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `--patches`           | available CPUs      | Spatial domains / rayon tasks            |
 | `--steps`             | `1000000`           | Gillespie steps per patch                |
 | `--generate-lut <N>`  | —                   | Synthesize `N` demo reactions into `--lut-path` instead of using a real one |
+
+## Occupancy-gated kMC
+
+Earlier versions of this engine treated every reaction as an independent,
+always-available channel: `gillespie::CompositionTable` built its
+propensity index once from `reactions.lut` alone, never touching the
+lattice, and a fired reaction was applied to a *uniformly random* site
+with no check that the site actually held the reactant. For
+`--generate-lut`'s synthetic demo data that's a reasonable simplification
+(the point is exercising the HPC architecture, not real chemistry). For
+real, `oc20_ingest`-built data it was a genuine correctness gap: an
+adsorption event applied via a bitwise OR to an already-occupied site
+would silently set two adsorbate bits on the same site at once, and
+propensities had no way to reflect the surface actually running out of a
+species to desorb or filling up so there was nowhere left to adsorb.
+
+`src/occupancy.rs` fixes this for real-data LUTs. Every lattice site's
+"which quantile bucket does this site belong to, for a given species" is a
+deterministic hash of its own index (`occupancy::site_bucket`) — no
+per-site storage. Each patch keeps a live count, per (species, bucket), of
+how many sites are currently vacant (what an adsorption template's
+propensity scales with) or occupied by that species (what a desorption
+template scales with), plus a live count of adjacent (O\*, CO\*) and
+(H\*, H\*) site pairs for the two bimolecular reactions — all updated in
+O(1) amortized time per fired event, never rescanned. Site selection uses
+bounded rejection sampling (try a random candidate, verify it actually
+matches, retry on a miss, fall back to a guaranteed deterministic scan
+after enough misses): simpler than an exact O(1) free-list per bucket, and
+still never fires on the wrong site, at a known, honest cost — a bucket
+that's extremely sparse relative to the whole patch can need many
+attempts. The natural next optimization, if that ever matters in practice,
+is an explicit per-bucket free-list; not built yet.
+
+**Both engines share the on-disk `ReactionLutBlock` format** but interpret
+it differently, so `reactions.lut` now starts with an 8-byte magic header
+(`KMCSTAT1` for `--generate-lut`'s static LUTs, `KMCOCC01` for
+`oc20_ingest`'s occupancy-gated ones) that `kinetica`'s `run()` reads to
+pick the right engine automatically — no flag to remember or get out of
+sync with how the file was actually built. For an occupancy-gated LUT,
+`bin_id` means "which quantile bucket" (0..4) rather than "composition-
+rejection magnitude class"; see `oc20_ingest`'s docs for where that bucket
+index comes from.
+
+**This intentionally didn't try to fix everything at once.** Pooling real
+DFT samples from many different metals/facets onto one idealized lattice,
+and the lattice's generic square/4-neighbor geometry not matching any real
+crystallographic surface, are both still open — occupancy-gating changes
+*how* a reaction is selected and applied, not *what* chemistry the
+underlying rate constants represent.
 
 ## Building `reactions.lut` from real data
 
@@ -193,7 +251,22 @@ is visible, e.g.:
 
 ```
 oc20_ingest: species O: 1368 adsorption-energy records  (15 with a real DFT-computed activation energy, not BEP)
+oc20_ingest: species O: collapsed into 4 quantile bucket(s) (sizes: 342, 342, 342, 342)
 ```
+
+That second line is `bucket_by_quantile` at work: `oc20_ingest` doesn't
+build one `ReactionRecord` per DFT sample (hundreds per species) — it
+sorts a species' samples by reaction energy, splits them into
+`BUCKETS_PER_SPECIES` (4) roughly-equal groups, and collapses each group
+into one representative adsorption/desorption template built from the
+group's mean energy (mean real Ea too, if any group member has one). This
+is what makes occupancy-gating (above) tractable: a handful of templates
+per species, each genuinely tied to a live count of matching lattice
+sites, rather than hundreds of statically-always-available channels with
+no notion of the lattice's current state. It also keeps real
+heterogeneity — a genuinely fast-reacting quartile of surfaces versus a
+genuinely slow-reacting one — rather than washing everything out into one
+averaged number.
 
 **There's also real barrier data for actual bimolecular surface reactions
 like CO oxidation itself, `O* + CO* -> CO2 + 2*`** — see "Bimolecular
@@ -205,17 +278,31 @@ Each `ReactionLutBlock` lane carries a second `(reactant_mask << 4) |
 product_mask)` transition (`transition_b`) plus an `is_bimolecular` flag,
 alongside the original single-site `transition_a`. A monomolecular
 (adsorption/desorption) reaction only ever touches `transition_a`'s site,
-exactly as before; a bimolecular one atomically applies `transition_a` to
-a randomly sampled site and `transition_b` to one of its same-patch
-grid neighbors (up/down/left/right) -- constrained to the same patch
-(rather than possibly crossing into a neighboring `rayon` task's row
-band) so both sites update as a single atomic step in this patch's own
-trajectory, with no cross-thread synchronization needed. If the sampled
-site has no same-patch neighbor at all (a degenerate 1×1 patch), the
-event is skipped rather than forced onto an invalid site.
+exactly as before. How the two sites get *chosen* differs by engine (see
+"Occupancy-gated kMC" above):
+
+- **Static** (`--generate-lut` demo data): site A is a uniformly random
+  patch site; site B is one of its same-patch grid neighbors
+  (up/down/left/right), picked without checking either site's actual
+  occupancy -- fine for exercising the architecture, not meant to be
+  chemically exact.
+- **Occupancy-gated** (real, `oc20_ingest`-built data): site A is
+  rejection-sampled until it genuinely holds the reaction's first
+  reactant species; site B is deterministically checked among site A's
+  (up to four) neighbors for the second reactant species, retrying the
+  whole pair on a miss. A bimolecular reaction can only ever fire on a
+  site pair that actually has both reactants present.
+
+Both constrain site B to the *same patch* as site A (rather than possibly
+crossing into a neighboring `rayon` task's row band), so both sites update
+as a single atomic step in that patch's own trajectory with no cross-
+thread synchronization needed. If site A has no same-patch neighbor at all
+(a degenerate 1×1 patch), the event is skipped rather than forced onto an
+invalid site.
 
 `kinetica --generate-lut` synthesizes roughly 1 in 8 demo reactions as
-bimolecular so the path is exercised even without real data on hand.
+bimolecular so the static path is exercised even without real data on
+hand.
 
 **`oc20_ingest` now also builds real bimolecular reactions from
 Catalysis-Hub data.** `scripts/extract_catalysis_hub.py`'s real-barrier

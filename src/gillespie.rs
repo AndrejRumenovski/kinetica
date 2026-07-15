@@ -343,7 +343,7 @@ mod tests {
             .collect();
         let blocks = layout::pack_records_into_blocks(records);
         let path = temp_path(tag);
-        layout::write_lut(&path, &blocks).unwrap();
+        layout::write_lut(&path, layout::LutKind::Static, &blocks).unwrap();
         let lut = ReactionLut::open(&path).unwrap();
         (lut, path)
     }
