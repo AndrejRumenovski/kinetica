@@ -144,13 +144,11 @@ impl OccupancyCounters {
             // toward any template's live count, so it simply can never be
             // selected as a reactant; the engine never writes such a state.
 
-            let row = site_idx / width;
-            let col = site_idx % width;
-            if col + 1 < width {
-                counters.add_pair(state, patch_data[site_idx + 1]);
-            }
-            if row + 1 < rows {
-                counters.add_pair(state, patch_data[site_idx + width]);
+            for neighbor_idx in crate::topology::forward_neighbors(site_idx, width, rows)
+                .into_iter()
+                .flatten()
+            {
+                counters.add_pair(state, patch_data[neighbor_idx]);
             }
         }
 
@@ -220,27 +218,14 @@ impl OccupancyCounters {
             self.occupied_count[species][bucket] += 1;
         }
 
-        // Re-evaluate every pair touching this site (up to all four
-        // neighbors this time -- unlike `new`'s full-scan pass, this
-        // only ever looks at one site's incident edges, so there's no
+        // Re-evaluate every pair touching this site (up to all of its
+        // neighbors this time -- unlike `new`'s full-scan pass, this only
+        // ever looks at one site's incident edges, so there's no
         // double-counting risk to avoid).
-        let row = site_idx / width;
-        let col = site_idx % width;
-        let mut neighbors = [None; 4];
-        if col > 0 {
-            neighbors[0] = Some(site_idx - 1);
-        }
-        if col + 1 < width {
-            neighbors[1] = Some(site_idx + 1);
-        }
-        if row > 0 {
-            neighbors[2] = Some(site_idx - width);
-        }
-        if row + 1 < rows_in_band {
-            neighbors[3] = Some(site_idx + width);
-        }
-
-        for neighbor_idx in neighbors.into_iter().flatten() {
+        for neighbor_idx in crate::topology::all_neighbors(site_idx, width, rows_in_band)
+            .into_iter()
+            .flatten()
+        {
             let neighbor_state = patch_data[neighbor_idx];
             self.remove_pair(old_state, neighbor_state);
             self.add_pair(new_state, neighbor_state);
@@ -423,21 +408,10 @@ fn neighbor_with_state(
     rows_in_band: usize,
     state: u8,
 ) -> Option<usize> {
-    let row = site_idx / width;
-    let col = site_idx % width;
-    if col > 0 && patch_data[site_idx - 1] == state {
-        return Some(site_idx - 1);
-    }
-    if col + 1 < width && patch_data[site_idx + 1] == state {
-        return Some(site_idx + 1);
-    }
-    if row > 0 && patch_data[site_idx - width] == state {
-        return Some(site_idx - width);
-    }
-    if row + 1 < rows_in_band && patch_data[site_idx + width] == state {
-        return Some(site_idx + width);
-    }
-    None
+    crate::topology::all_neighbors(site_idx, width, rows_in_band)
+        .into_iter()
+        .flatten()
+        .find(|&idx| patch_data[idx] == state)
 }
 
 #[cfg(test)]

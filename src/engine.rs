@@ -94,25 +94,11 @@ fn apply_migration_occupancy_gated(
 /// has no neighbor at all within the patch (a degenerate 1x1 patch) --
 /// callers should skip the event in that case rather than force one.
 fn same_patch_neighbor(rng: &mut Rng, site_idx: usize, width: usize, rows_in_band: usize) -> Option<usize> {
-    let row = site_idx / width;
-    let col = site_idx % width;
-
-    let mut candidates = [0usize; 4];
+    let all = crate::topology::all_neighbors(site_idx, width, rows_in_band);
+    let mut candidates = [0usize; crate::topology::MAX_NEIGHBORS];
     let mut count = 0usize;
-    if col > 0 {
-        candidates[count] = site_idx - 1; // left
-        count += 1;
-    }
-    if col + 1 < width {
-        candidates[count] = site_idx + 1; // right
-        count += 1;
-    }
-    if row > 0 {
-        candidates[count] = site_idx - width; // up
-        count += 1;
-    }
-    if row + 1 < rows_in_band {
-        candidates[count] = site_idx + width; // down
+    for n in all.into_iter().flatten() {
+        candidates[count] = n;
         count += 1;
     }
 
