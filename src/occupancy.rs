@@ -68,11 +68,14 @@ fn species_index(species_bit: u8) -> Option<usize> {
 /// identical adsorption kinetics -- the same rate-constant table applied
 /// regardless of how much of each gas was actually being fed in.
 ///
-/// Desorption and bimolecular templates are untouched: pressure only
-/// gates a reaction that consumes a gas-phase molecule (an adsorption
-/// step, `VACANT -> species`), not one that's already conditioned on
-/// something already sitting on the surface. `ones()` reproduces exactly
-/// the pre-pressure-coupling propensities (every multiplier 1.0).
+/// Desorption and bimolecular *recombination* templates (CO-oxidation,
+/// H2-recombination) are untouched -- pressure only gates a reaction that
+/// consumes a gas-phase molecule, which includes both monomolecular
+/// adsorption *and* genuine two-site dissociative adsorption
+/// (`2* + O2(g)/H2(g) -> 2 species*`, see `oc20_ingest`), but not a
+/// reaction that's already conditioned on something already sitting on
+/// the surface. `ones()` reproduces exactly the pre-pressure-coupling
+/// propensities (every multiplier 1.0).
 #[derive(Clone, Copy, Debug)]
 pub struct Pressures {
     pub values: [f64; 3],
@@ -84,17 +87,18 @@ impl Pressures {
     }
 }
 
-/// `1.0` for every template except a monomolecular adsorption one, where
-/// it's that species' relative partial pressure -- the single point
-/// pressure enters the propensity calculation, kept separate from
-/// `live_count` since a pressure multiplier isn't a physical site count.
+/// `1.0` for every template except one that consumes a gas-phase
+/// molecule -- monomolecular adsorption, or genuine two-site dissociative
+/// adsorption (`2* + O2(g)/H2(g) -> 2 species*`) -- where it's that
+/// species' relative partial pressure. Kept separate from `live_count`
+/// since a pressure multiplier isn't a physical site count. A bimolecular
+/// *recombination* template (CO-oxidation, H2-recombination) consumes an
+/// occupied pair, not a gas-phase reactant, so it's untouched, same as
+/// monomolecular desorption.
 fn pressure_factor(template: &ReactionRecord, pressures: &Pressures) -> f64 {
-    if template.is_bimolecular {
-        return 1.0;
-    }
     let reactant_mask = template.transition_a >> 4;
     if reactant_mask != 0 {
-        return 1.0; // desorption: no gas-phase reactant to gate on
+        return 1.0; // desorption or recombination: no gas-phase reactant
     }
     let product_mask = template.transition_a & 0x0F;
     species_index(product_mask)
@@ -150,6 +154,17 @@ pub struct OccupancyCounters {
     /// Live count of adjacent (H*, H*) site pairs -- H2-recombination's
     /// propensity.
     h2_pairs: u32,
+    /// Live count of adjacent (VACANT, VACANT) site pairs -- the shared
+    /// pool every genuine two-site dissociative-adsorption template
+    /// (`2* + O2(g) -> 2 O*`, `2* + H2(g) -> 2 H*`) draws its propensity
+    /// from. Deliberately one shared counter, not per-species: any
+    /// adjacent vacant pair is a real landing site for *either* gas, so
+    /// O2's and H2's dissociative-adsorption templates compete for the
+    /// same physical pool, same as monomolecular adsorption templates
+    /// already compete for `vacant_count`'s single-site pool -- only each
+    /// template's own `rate_q16` (and, via `pressure_factor`, its own
+    /// species' relative pressure) differentiates them.
+    vacant_pairs: u32,
 }
 
 impl OccupancyCounters {
@@ -165,6 +180,7 @@ impl OccupancyCounters {
             occupied_count: [[0; BUCKETS_PER_SPECIES]; 3],
             co_ox_pairs: 0,
             h2_pairs: 0,
+            vacant_pairs: 0,
         };
         if width == 0 {
             return counters;
@@ -205,6 +221,9 @@ impl OccupancyCounters {
         if a == ADS_H && b == ADS_H {
             self.h2_pairs += 1;
         }
+        if a == layout::VACANT && b == layout::VACANT {
+            self.vacant_pairs += 1;
+        }
     }
 
     fn remove_pair(&mut self, a: u8, b: u8) {
@@ -213,6 +232,9 @@ impl OccupancyCounters {
         }
         if a == ADS_H && b == ADS_H {
             self.h2_pairs = self.h2_pairs.saturating_sub(1);
+        }
+        if a == layout::VACANT && b == layout::VACANT {
+            self.vacant_pairs = self.vacant_pairs.saturating_sub(1);
         }
     }
 
@@ -280,7 +302,13 @@ impl OccupancyCounters {
     fn live_count(&self, template: &ReactionRecord) -> u64 {
         if template.is_bimolecular {
             let reactant_a = template.transition_a >> 4;
-            if reactant_a == ADS_O || reactant_a == ADS_CO {
+            if reactant_a == layout::VACANT {
+                // Dissociative adsorption (2* + gas -> 2 species*): both
+                // sites start VACANT -- draws from the shared adjacent-
+                // vacant-pair pool, same one every dissociating species'
+                // template competes for (see `vacant_pairs`'s doc comment).
+                self.vacant_pairs as u64
+            } else if reactant_a == ADS_O || reactant_a == ADS_CO {
                 self.co_ox_pairs as u64
             } else {
                 self.h2_pairs as u64
@@ -431,7 +459,8 @@ impl OccupancyCounters {
             }
         }
         // Deterministic fallback, same guarantee as the monomolecular
-        // case: `co_ox_pairs`/`h2_pairs` being positive means a matching
+        // case: `co_ox_pairs`/`h2_pairs`/`vacant_pairs` (whichever backs
+        // this template's `live_count`) being positive means a matching
         // pair genuinely exists somewhere in the patch.
         (0..n).find_map(|candidate| {
             if patch_data[candidate] != species_a_bit {
@@ -771,5 +800,104 @@ mod tests {
             counters.select_event(&templates, &data, width, 4, &mut rng, 1, &Pressures::ones()),
             None
         );
+    }
+
+    fn dissociative_ads_template(species_bit: u8, rate: u32) -> ReactionRecord {
+        ReactionRecord {
+            rate_q16: rate,
+            bin_id: 0,
+            transition_a: species_bit, // reactant=VACANT(0), product=species, both sites
+            transition_b: species_bit,
+            is_bimolecular: true,
+        }
+    }
+
+    /// The falsifying test Phase 3 (genuine two-site dissociative
+    /// adsorption) exists to pass: a dissociative-adsorption template must
+    /// only ever fire on a real adjacent *vacant* pair, never on a lone
+    /// vacant site with no vacant neighbor -- mirroring the existing
+    /// recombination-direction bimolecular test, but for the reverse
+    /// (gas-consuming) direction this phase adds.
+    #[test]
+    fn select_event_dissociative_adsorption_only_fires_on_a_genuinely_adjacent_vacant_pair() {
+        let width = 6;
+        let height = 6;
+        let seed = 11u64;
+        let mut data = vec![ADS_O; width * height];
+        // One real adjacent vacant pair at (10, 11); a lone, non-adjacent
+        // vacant site elsewhere that must never be chosen as a partner
+        // since it has no vacant neighbor.
+        data[10] = VACANT;
+        data[11] = VACANT;
+        data[30] = VACANT;
+        let counters = OccupancyCounters::new(&data, width, seed);
+        assert_eq!(counters.vacant_pairs, 1);
+
+        let templates = vec![dissociative_ads_template(ADS_H, u32::MAX)];
+
+        let mut rng = rng();
+        for _ in 0..200 {
+            if let Some((_, site_a, site_b)) =
+                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+            {
+                let site_b = site_b.expect("dissociative adsorption must return a second site");
+                assert_eq!(data[site_a], VACANT);
+                assert_eq!(data[site_b], VACANT);
+                let neighbors: Vec<usize> = crate::topology::all_neighbors(site_a, width, height)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert!(
+                    neighbors.contains(&site_b),
+                    "dissociative-adsorption sites must be topology-adjacent"
+                );
+            }
+        }
+    }
+
+    /// Coverage-dependent rate: a dissociative-adsorption template's
+    /// propensity must genuinely track how many adjacent vacant pairs
+    /// currently exist, not fire at a fixed rate regardless of coverage --
+    /// the whole point of this phase versus the pseudo-monomolecular
+    /// approximation it replaces.
+    #[test]
+    fn total_propensity_for_dissociative_adsorption_tracks_vacant_pair_count() {
+        let width = 6;
+        let height = 6;
+        let seed = 21u64;
+
+        let mostly_vacant = vec![VACANT; width * height];
+        let counters_high = OccupancyCounters::new(&mostly_vacant, width, seed);
+
+        let mut mostly_occupied = vec![ADS_O; width * height];
+        mostly_occupied[10] = VACANT;
+        mostly_occupied[11] = VACANT; // exactly one adjacent vacant pair
+        let counters_low = OccupancyCounters::new(&mostly_occupied, width, seed);
+        assert_eq!(counters_low.vacant_pairs, 1);
+        assert!(counters_high.vacant_pairs > counters_low.vacant_pairs);
+
+        let templates = vec![dissociative_ads_template(ADS_H, 1000)];
+        let propensity_high = counters_high.total_propensity(&templates, &Pressures::ones());
+        let propensity_low = counters_low.total_propensity(&templates, &Pressures::ones());
+
+        assert!(
+            propensity_high > propensity_low,
+            "a lattice with more adjacent vacant pairs should have higher dissociative-adsorption \
+             propensity: high={propensity_high}, low={propensity_low}"
+        );
+        // Exact linear relationship: rate_q16 * vacant_pairs.
+        assert_eq!(propensity_low, 1000.0 * counters_low.vacant_pairs as f64);
+    }
+
+    #[test]
+    fn pressure_couples_dissociative_adsorption_same_as_monomolecular() {
+        let pressures = Pressures { values: [1.0, 7.0, 1.0] };
+        let template = dissociative_ads_template(ADS_H, 1);
+        assert_eq!(pressure_factor(&template, &pressures), 7.0);
+
+        // A recombination-direction bimolecular template (occupied
+        // reactant) must stay untouched by the same pressure vector.
+        let recombination = bimolecular_template(ADS_H, ADS_H, 1);
+        assert_eq!(pressure_factor(&recombination, &pressures), 1.0);
     }
 }

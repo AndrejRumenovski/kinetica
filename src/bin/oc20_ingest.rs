@@ -80,6 +80,14 @@ use kinetica::occupancy::BUCKETS_PER_SPECIES;
 /// scripts.
 const SPECIES_NAMES: [&str; 3] = ["O", "H", "CO"];
 
+/// Species indices whose adsorption is genuinely a two-site dissociative
+/// step (`2* + X2(g) -> 2 X*`) rather than a single-site one: O (from
+/// `O2gas` at 0.5 stoichiometry) and H (from `H2gas` at 0.5
+/// stoichiometry) -- see `extract_catalysis_hub.py`'s `SPECIES_PATTERNS`.
+/// CO adsorbs molecularly (`COgas` at 1.0 stoichiometry, one site), so it
+/// keeps the ordinary monomolecular adsorption/desorption pair unchanged.
+const DISSOCIATIVE_SPECIES: [usize; 2] = [0, 1]; // O, H
+
 const MAGIC: &[u8; 8] = b"OC20E003";
 /// species(1) + energy_mev(4) + sid(4) + has_real_ea(1) + real_ea_mev(4)
 /// + metal(1) + facet(2).
@@ -611,28 +619,49 @@ fn run(config: &Config) -> io::Result<()> {
     }
 
     // Each quantile bucket normally yields TWO reactions on the lattice:
-    // adsorption (VACANT -> ADS_X, forward reaction energy = the bucket's
-    // mean relaxed adsorption energy) and desorption (ADS_X -> VACANT, the
-    // reverse). Using Ea_rev = Ea_fwd - dE_rxn keeps the pair
-    // thermodynamically consistent (same forward/reverse ratio a real
-    // free-energy landscape would give) regardless of whether Ea_fwd came
-    // from a real barrier or BEP. The desorption half is skipped for a
-    // species covered by `replaces_desorption` -- see above.
+    // adsorption and desorption (the reverse), thermodynamically
+    // consistent via Ea_rev = Ea_fwd - dE_rxn regardless of whether Ea_fwd
+    // came from a real barrier or BEP. The desorption half is skipped for
+    // a species covered by `replaces_desorption` -- see above.
+    //
+    // For O and H (`DISSOCIATIVE_SPECIES`), the adsorption half is built
+    // as a genuine two-site *dissociative* event (`2* + O2(g)/H2(g) ->
+    // 2 species*`, `is_bimolecular = true`, both sites VACANT -> species)
+    // instead of the pseudo-monomolecular approximation (one site,
+    // `VACANT -> species`) used previously -- the underlying energy is
+    // exactly the same per-atom DFT value this pipeline already extracts
+    // (see `SPECIES_PATTERNS`'s 0.5 stoichiometry), the fix is applying it
+    // to a correctly-gated *pair* of sites (drawing from
+    // `occupancy::OccupancyCounters::vacant_pairs`) rather than two
+    // independent single sites with no coverage-blocking relationship to
+    // each other. CO adsorbs molecularly (one site) and keeps the
+    // original monomolecular form unchanged. Desorption is untouched
+    // either way -- this only corrects the adsorption direction.
     //
     // `(rate, transition_a, transition_b, is_bimolecular, bucket_id)` --
-    // transition_b is only meaningful (and non-zero) for the bimolecular
-    // records appended below; bucket_id becomes each `ReactionRecord`'s
-    // `bin_id` (unused/0 for bimolecular templates -- see `occupancy.rs`).
+    // transition_b is only meaningful (and non-zero) for a bimolecular
+    // record; bucket_id becomes each `ReactionRecord`'s `bin_id` (unused/0
+    // for bimolecular templates -- see `occupancy.rs`).
     let mut raw_rates: Vec<(f64, u8, u8, bool, u8)> = Vec::new();
     let mut ads_count = 0usize;
+    let mut dissociative_ads_count = 0usize;
     let mut des_count = 0usize;
     for species in 0..SPECIES_BITS.len() {
         let species_bit = SPECIES_BITS[species];
+        let dissociative = DISSOCIATIVE_SPECIES.contains(&species);
         for (bucket_idx, bucket) in bucketed_by_species[species].iter().enumerate() {
             let ea_fwd = activation_energy_ev(bucket.mean_energy_ev, bucket.real_ea_ev, config);
             let k_ads = rate_from_activation(ea_fwd, config);
-            raw_rates.push((k_ads, species_bit, 0, false, bucket_idx as u8)); // 0x0_species (adsorption)
-            ads_count += 1;
+            if dissociative {
+                // transition_a = transition_b = 0x0_species (both sites:
+                // vacant -> species), un-bucketed like other bimolecular
+                // records -- see `occupancy::OccupancyCounters::live_count`.
+                raw_rates.push((k_ads, species_bit, species_bit, true, 0));
+                dissociative_ads_count += 1;
+            } else {
+                raw_rates.push((k_ads, species_bit, 0, false, bucket_idx as u8)); // 0x0_species (adsorption)
+                ads_count += 1;
+            }
 
             if !replaces_desorption[species] {
                 let ea_rev = (ea_fwd - bucket.mean_energy_ev).max(0.0);
@@ -710,11 +739,13 @@ fn run(config: &Config) -> io::Result<()> {
         .collect();
 
     println!(
-        "oc20_ingest: built {} reactions ({} adsorption + {} desorption + {} bimolecular), \
+        "oc20_ingest: built {} reactions ({} monomolecular adsorption + {} desorption + \
+         {} dissociative-adsorption bimolecular + {} recombination bimolecular), \
          rate scale factor {:.3e}",
         records.len(),
         ads_count,
         des_count,
+        dissociative_ads_count,
         bimolecular_records.len(),
         scale
     );
@@ -1143,12 +1174,16 @@ mod tests {
         let bi_path = temp_path("run_bi_bimolecular_input");
         let out_path = temp_path("run_bi_out.lut");
 
-        // One ordinary O adsorption/desorption pair, so `energy_records`
-        // isn't empty (run() rejects that up front).
+        // One ordinary CO adsorption/desorption pair (CO adsorbs
+        // molecularly, not dissociatively, so this stays a plain
+        // monomolecular pair -- keeps this test focused on the
+        // recombination bimolecular record below, not on O/H's separate
+        // dissociative-adsorption behavior), so `energy_records` isn't
+        // empty (run() rejects that up front).
         let mut mono_bytes = Vec::new();
         mono_bytes.extend_from_slice(MAGIC);
         mono_bytes.extend_from_slice(&1u32.to_le_bytes());
-        push_record(&mut mono_bytes, 0, -500, 1, None);
+        push_record(&mut mono_bytes, 2, -500, 1, None);
         std::fs::write(&input_path, &mono_bytes).unwrap();
 
         // One real CO-oxidation barrier: O* + CO* -> CO2 + 2*, Ea = 1.0 eV.
@@ -1235,8 +1270,11 @@ mod tests {
             .map(|id| lut.rate_of(id))
             .filter(|r| r.rate_q16 > 0)
             .collect();
-        // O adsorption + O desorption + H adsorption + 1 bimolecular
-        // (H desorption is replaced, not built).
+        // O desorption (monomolecular) + O dissociative adsorption
+        // (bimolecular, both species are dissociative -- see
+        // DISSOCIATIVE_SPECIES) + H dissociative adsorption (bimolecular)
+        // + 1 recombination bimolecular (H desorption is replaced, not
+        // built).
         assert_eq!(real_records.len(), 4);
 
         let o_desorption = real_records
@@ -1254,16 +1292,28 @@ mod tests {
             "H's monomolecular desorption must be replaced by the bimolecular record"
         );
 
-        let h_adsorption = real_records
+        let o_dissociative_adsorption = real_records
             .iter()
-            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_H)
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_O && r.transition_b == layout::ADS_O)
             .count();
-        assert_eq!(h_adsorption, 1, "H's adsorption reaction is unaffected");
+        assert_eq!(o_dissociative_adsorption, 1, "O's dissociative adsorption is built regardless of desorption replacement");
 
-        let bimolecular: Vec<_> = real_records.into_iter().filter(|r| r.is_bimolecular).collect();
-        assert_eq!(bimolecular.len(), 1);
-        assert_eq!(bimolecular[0].transition_a, layout::ADS_H << 4);
-        assert_eq!(bimolecular[0].transition_b, layout::ADS_H << 4);
+        let h_dissociative_adsorption = real_records
+            .iter()
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H && r.transition_b == layout::ADS_H)
+            .count();
+        assert_eq!(
+            h_dissociative_adsorption, 1,
+            "H's dissociative adsorption is unaffected by desorption replacement -- only desorption is replaced"
+        );
+
+        let recombination_bimolecular: Vec<_> = real_records
+            .iter()
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H << 4)
+            .collect();
+        assert_eq!(recombination_bimolecular.len(), 1);
+        assert_eq!(recombination_bimolecular[0].transition_a, layout::ADS_H << 4);
+        assert_eq!(recombination_bimolecular[0].transition_b, layout::ADS_H << 4);
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&bi_path);
@@ -1275,14 +1325,18 @@ mod tests {
         let input_path = temp_path("run_bucketing_input");
         let out_path = temp_path("run_bucketing_out.lut");
 
-        // 12 real O adsorption-energy records -- more than BUCKETS_PER_SPECIES
-        // (4), so this must collapse to 4 adsorption + 4 desorption
-        // templates, not 12 + 12.
+        // 12 real CO adsorption-energy records -- more than
+        // BUCKETS_PER_SPECIES (4), so this must collapse to 4 adsorption +
+        // 4 desorption templates, not 12 + 12. CO specifically (not O/H):
+        // this test is about quantile-bucketing behavior in general, which
+        // is orthogonal to O/H's separate dissociative-adsorption handling
+        // (dissociative-adsorption records are deliberately un-bucketed,
+        // bin_id always 0 -- see DISSOCIATIVE_SPECIES).
         let mut mono_bytes = Vec::new();
         mono_bytes.extend_from_slice(MAGIC);
         mono_bytes.extend_from_slice(&12u32.to_le_bytes());
         for i in 0..12 {
-            push_record(&mut mono_bytes, 0, -100 * i, i as u32, None);
+            push_record(&mut mono_bytes, 2, -100 * i, i as u32, None);
         }
         std::fs::write(&input_path, &mono_bytes).unwrap();
 
@@ -1312,17 +1366,93 @@ mod tests {
 
         let ads_bin_ids: std::collections::BTreeSet<u8> = real_records
             .iter()
-            .filter(|r| r.transition_a == layout::ADS_O)
+            .filter(|r| r.transition_a == layout::ADS_CO)
             .map(|r| r.bin_id)
             .collect();
         assert_eq!(ads_bin_ids, [0u8, 1, 2, 3].into_iter().collect());
 
         let des_bin_ids: std::collections::BTreeSet<u8> = real_records
             .iter()
-            .filter(|r| r.transition_a == layout::ADS_O << 4)
+            .filter(|r| r.transition_a == layout::ADS_CO << 4)
             .map(|r| r.bin_id)
             .collect();
         assert_eq!(des_bin_ids, [0u8, 1, 2, 3].into_iter().collect());
+
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    /// The falsifying test Phase 3 (genuine two-site dissociative
+    /// adsorption) exists to pass at the ingest level: O and H (both
+    /// dissociate from a diatomic gas) must build a bimolecular
+    /// `VACANT -> species` record on both sites for adsorption, while CO
+    /// (adsorbs molecularly) keeps the original monomolecular form.
+    #[test]
+    fn run_builds_dissociative_adsorption_for_o_and_h_but_not_co() {
+        let input_path = temp_path("run_dissociative_input");
+        let out_path = temp_path("run_dissociative_out.lut");
+
+        let mut mono_bytes = Vec::new();
+        mono_bytes.extend_from_slice(MAGIC);
+        mono_bytes.extend_from_slice(&3u32.to_le_bytes());
+        push_record(&mut mono_bytes, 0, -500, 1, None); // O
+        push_record(&mut mono_bytes, 1, -400, 2, None); // H
+        push_record(&mut mono_bytes, 2, -300, 3, None); // CO
+        std::fs::write(&input_path, &mono_bytes).unwrap();
+
+        let config = Config {
+            input: input_path.clone(),
+            bimolecular_input: None,
+            out: out_path.clone(),
+            alpha: 0.87,
+            beta_ev: 0.0,
+            nu: 1.0e13,
+            temperature_k: 298.15,
+            metal: None,
+            facet: None,
+        };
+        run(&config).unwrap();
+
+        let lut = layout::ReactionLut::open(&out_path).unwrap();
+        let reaction_count = lut.len() * ReactionLutBlock::LANES;
+        let real_records: Vec<_> = (0..reaction_count)
+            .map(|id| lut.rate_of(id))
+            .filter(|r| r.rate_q16 > 0)
+            .collect();
+
+        for (name, bit) in [("O", layout::ADS_O), ("H", layout::ADS_H)] {
+            let dissociative = real_records
+                .iter()
+                .filter(|r| r.is_bimolecular && r.transition_a == bit && r.transition_b == bit)
+                .count();
+            assert_eq!(dissociative, 1, "{name} adsorption must be a two-site dissociative record");
+            let monomolecular_ads = real_records
+                .iter()
+                .filter(|r| !r.is_bimolecular && r.transition_a == bit)
+                .count();
+            assert_eq!(monomolecular_ads, 0, "{name} must not also have a monomolecular adsorption record");
+        }
+
+        let co_monomolecular_ads = real_records
+            .iter()
+            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_CO)
+            .count();
+        assert_eq!(co_monomolecular_ads, 1, "CO adsorbs molecularly -- must stay monomolecular");
+        let co_dissociative = real_records
+            .iter()
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_CO)
+            .count();
+        assert_eq!(co_dissociative, 0, "CO must not be built as a dissociative-adsorption record");
+
+        // Desorption is untouched for all three species regardless of the
+        // adsorption-direction change.
+        for bit in [layout::ADS_O, layout::ADS_H, layout::ADS_CO] {
+            let desorption = real_records
+                .iter()
+                .filter(|r| !r.is_bimolecular && r.transition_a == bit << 4)
+                .count();
+            assert_eq!(desorption, 1);
+        }
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&out_path);

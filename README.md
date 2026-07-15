@@ -420,6 +420,29 @@ invalid site.
 bimolecular so the static path is exercised even without real data on
 hand.
 
+**Dissociative adsorption (O2, H2).** O2 and H2 adsorb *dissociatively* —
+the real elementary step is `2* + O2(g) -> 2 O*` / `2* + H2(g) -> 2 H*`,
+consuming two adjacent sites at once, not one. Earlier versions modeled
+this as two independent monomolecular events (`VACANT -> O*` twice),
+energetically correct per atom (the extracted DFT energy already uses the
+right 0.5-stoichiometry-per-atom convention) but kinetically wrong — two
+single-site channels have no notion that they're really one two-site
+event, so there's no site-pair-blocking coverage dependence: a lattice
+running out of *adjacent* vacant pairs (as opposed to just vacant sites)
+kept adsorbing at the same rate. `oc20_ingest` now builds these species'
+adsorption as genuine `is_bimolecular` records instead — same reaction
+data and BEP/Arrhenius model as before, just correctly gated on
+`occupancy::OccupancyCounters::vacant_pairs` (a live count of adjacent
+*vacant* pairs, shared by both species' templates the same way
+`vacant_count` is already shared across monomolecular adsorption
+templates). CO adsorbs molecularly (one site) and is unaffected —
+`oc20_ingest`'s `DISSOCIATIVE_SPECIES` names exactly the two species this
+applies to. Desorption is untouched for both: this only corrects the
+adsorption direction. Pressure-coupled the same as monomolecular
+adsorption (see "Gas-phase pressure coupling" above) — verified against
+the real Pd(111) `reactions.lut`: `--pressure-h2 15.0` raises H coverage
+from 10.8% to 29.2%, zero invalid occupancy states.
+
 **`oc20_ingest` can also build real bimolecular reactions from
 Catalysis-Hub data — though not, currently, for the Pd(111)-filtered build
 this repo ships (see "Lattice geometry and target surface: Pd(111)" above
