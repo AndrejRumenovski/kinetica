@@ -219,12 +219,10 @@ bimolecular so the path is exercised even without real data on hand.
 
 **`oc20_ingest` now also builds real bimolecular reactions from
 Catalysis-Hub data.** `scripts/extract_catalysis_hub.py`'s real-barrier
-sweep also picks out genuine `O* + CO* -> CO2 + 2*` CO-oxidation
-barriers (e.g. from `StreibelMicrokinetic2021`, "Microkinetic Modeling of
-Propene Combustion" — real NEB barriers around 0.98-1.21 eV on Pd) and
-writes them to a second, parallel binary file (`OC20BI01` format — see
-`scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that file to
-`oc20_ingest --bimolecular-input`:
+sweep also picks out genuine two-site recombination barriers
+(`BIMOLECULAR_PATTERNS`) and writes them to a second, parallel binary
+file (`OC20BI01` format — see `scripts/oc20e_format.py`) via
+`--bimolecular-out`. Pass that file to `oc20_ingest --bimolecular-input`:
 
 ```sh
 python3 scripts/extract_catalysis_hub.py \
@@ -240,18 +238,50 @@ Unlike the monomolecular adsorption/desorption pair, a bimolecular record
 only ever builds a *single* forward `ReactionRecord` — there's no BEP
 fallback for a two-species step (a bimolecular record is only emitted
 when Catalysis-Hub reports a real activation energy), and no reverse
-reaction is derived: CO2 leaving the surface as gas isn't the reverse of
-a single elementary step back onto two sites, so there's no
+reaction is derived: the gas product leaving the surface isn't the
+reverse of a single elementary step back onto two sites, so there's no
 thermodynamically meaningful `Ea_rev` the way there is for
-adsorption/desorption. These real barriers are rare — typically 1-3
-records per run, since it depends on which handful of publications in
-this live, growing database happen to report a genuine two-site NEB
-barrier for this exact reaction — but real all the same, and the two
-known ones so far land right in the ~1 eV range you'd expect for CO
-oxidation's rate-limiting step. `oc20_ingest` logs how many it loaded and
-folds their rates into the same Q16.16 rescaling pass as every other
-reaction, so the fastest reaction overall (mono- or bimolecular) still
-anchors the scale factor.
+adsorption/desorption. These real barriers are rare and vary run to run
+just like the rest of this live, growing database (see above) — a
+record you know exists (e.g. by sid) may not show up on a given run's
+cursor pagination, so if you're chasing a specific one, try again —
+currently two patterns are matched:
+
+- **`O* + CO* -> CO2 + 2*`** (e.g. `StreibelMicrokinetic2021`,
+  "Microkinetic Modeling of Propene Combustion" — real NEB barriers of
+  ~0.98-1.21 eV on Pd).
+- **`2 H* -> H2 + 2*`** (e.g. "Dynamics and Hysteresis of Hydrogen
+  Interaction..." — ~0.35 eV). This one is *homoatomic* (both sites are
+  the same species), and `oc20_ingest` treats that specially: it
+  **replaces** H's monomolecular desorption reaction rather than adding
+  a third rate channel alongside it. The existing monomolecular H
+  adsorption/desorption pair already approximates H2 dissociative
+  adsorption/associative desorption as a single-site event (using half
+  the H2 dissociation energy per H atom — see `SPECIES_PATTERNS`); a
+  real two-site measurement of the same physical recombination event
+  isn't a *second* reaction, it's a more accurate model of the same one.
+  Building both would just split one real process's propensity across
+  two channels at different levels of approximation. H's monomolecular
+  *adsorption* is untouched — these barriers say nothing about the
+  adsorption direction, only the (already-known-to-be-two-site)
+  recombinative desorption.
+
+`oc20_ingest` logs which species had their desorption replaced this way,
+and folds every rate (mono- and bimolecular alike) into the same Q16.16
+rescaling pass, so the single fastest reaction overall still anchors the
+scale factor.
+
+**What was checked and doesn't apply here:** a full scan of every real
+DFT-barrier reaction in the database (1000+ records) involving two of
+our three tracked species turned up one more candidate, `H* + CO* ->
+CHO*` (~0.97 eV) — but its product is an adsorbed formyl species
+(`CHOstar`), not a gas + two vacant sites, so it can't be represented
+without a fourth adsorbate bit in `layout.rs`'s occupancy mask. No
+genuine two-site O2 recombination record with a real barrier exists in
+the data either (only the same single-site 0.5-stoichiometry pattern
+already covered by the monomolecular path). So within the current
+three-species (O/H/CO) model, CO oxidation and H2 recombination are the
+only two real bimolecular reactions the live data actually supports.
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
 untracked — see `.gitignore`. `scripts/extract_energies.py`,

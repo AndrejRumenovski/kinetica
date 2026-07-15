@@ -31,6 +31,17 @@
 //! relation `Ea_rev = Ea_fwd - dE_rxn` to derive the reverse (desorption)
 //! barrier -- BEP never enters the picture for these reactions.
 //!
+//! `--bimolecular-input` adds a third kind of record: real two-site
+//! recombination barriers (CO oxidation, `O* + CO* -> CO2 + 2*`; H2
+//! recombination, `2 H* -> H2 + 2*`), which the engine represents natively
+//! as `is_bimolecular` reactions. These never use BEP and never get a
+//! derived reverse reaction. For a *homoatomic* one (both sites the same
+//! species, e.g. the H2 case), this tool goes one step further and skips
+//! building that species' monomolecular desorption reaction entirely --
+//! see `run`'s `replaces_desorption` for why building both would just be
+//! the same physical event modeled twice at two levels of approximation,
+//! not two distinct reactions.
+//!
 //! Upstream of this tool, small Python scripts (`scripts/extract_energies.py`
 //! for OC20, `scripts/extract_catalysis_hub.py` for Catalysis-Hub.org) each
 //! emit the flat binary format this tool consumes as `--input` -- see
@@ -339,18 +350,41 @@ fn run(config: &Config) -> io::Result<()> {
         );
     }
 
-    // Each input sample yields TWO reactions on the lattice: adsorption
-    // (VACANT -> ADS_X, forward reaction energy = the relaxed adsorption
-    // energy itself) and desorption (ADS_X -> VACANT, the reverse). Using
-    // Ea_rev = Ea_fwd - dE_rxn keeps the pair thermodynamically consistent
-    // (same forward/reverse ratio a real free-energy landscape would give)
-    // regardless of whether Ea_fwd came from a real barrier or BEP.
+    // A *homoatomic* bimolecular record (species_a == species_b, e.g.
+    // 2 H* -> H2 + 2*) is a genuine two-site measurement of the same
+    // physical process the monomolecular desorption reaction below
+    // already approximates as a single-site event (using half the
+    // dissociative-adsorption energy per atom -- see SPECIES_PATTERNS in
+    // extract_catalysis_hub.py). Building both would give that species
+    // two independent rate channels for the same real-world event, which
+    // isn't "more detail," just double-counted propensity split across
+    // two models of one thing. So wherever a homoatomic bimolecular
+    // record exists for a species, it *replaces* that species'
+    // monomolecular desorption reaction below rather than supplementing
+    // it; adsorption is untouched, since these records say nothing about
+    // the adsorption direction.
+    let mut replaces_desorption = [false; SPECIES_BITS.len()];
+    for rec in &bimolecular_records {
+        if rec.species_a == rec.species_b {
+            replaces_desorption[rec.species_a as usize] = true;
+        }
+    }
+
+    // Each input sample normally yields TWO reactions on the lattice:
+    // adsorption (VACANT -> ADS_X, forward reaction energy = the relaxed
+    // adsorption energy itself) and desorption (ADS_X -> VACANT, the
+    // reverse). Using Ea_rev = Ea_fwd - dE_rxn keeps the pair
+    // thermodynamically consistent (same forward/reverse ratio a real
+    // free-energy landscape would give) regardless of whether Ea_fwd came
+    // from a real barrier or BEP. The desorption half is skipped for a
+    // species covered by `replaces_desorption` -- see above.
     //
     // `(rate, transition_a, transition_b, is_bimolecular)` -- transition_b
     // is only meaningful (and non-zero) for the bimolecular records
     // appended below.
     let mut raw_rates: Vec<(f64, u8, u8, bool)> =
         Vec::with_capacity(energy_records.len() * 2 + bimolecular_records.len());
+    let mut desorption_count = 0usize;
     for rec in &energy_records {
         let species_bit = SPECIES_BITS[rec.species as usize];
 
@@ -358,17 +392,29 @@ fn run(config: &Config) -> io::Result<()> {
         let k_ads = rate_from_activation(ea_fwd, config);
         raw_rates.push((k_ads, species_bit, 0, false)); // transition = 0x0_species (adsorption)
 
-        let ea_rev = (ea_fwd - rec.energy_ev).max(0.0);
-        let k_des = rate_from_activation(ea_rev, config);
-        raw_rates.push((k_des, species_bit << 4, 0, false)); // transition = species_0x0 (desorption)
+        if !replaces_desorption[rec.species as usize] {
+            let ea_rev = (ea_fwd - rec.energy_ev).max(0.0);
+            let k_des = rate_from_activation(ea_rev, config);
+            raw_rates.push((k_des, species_bit << 4, 0, false)); // transition = species_0x0 (desorption)
+            desorption_count += 1;
+        }
+    }
+    for (name, replaced) in SPECIES_NAMES.iter().zip(replaces_desorption.iter()) {
+        if *replaced {
+            println!(
+                "oc20_ingest: species {name}: monomolecular desorption replaced by real \
+                 bimolecular recombination records (see --bimolecular-input)"
+            );
+        }
     }
 
-    // Bimolecular records (e.g. CO oxidation, O* + CO* -> CO2 + 2*) carry a
-    // real DFT-computed forward barrier only -- no BEP fallback exists for
-    // a two-species step, and no reverse reaction is built: CO2 leaving the
-    // surface as gas isn't a single elementary step back onto two sites, so
-    // there's no thermodynamically meaningful Ea_rev to derive here (unlike
-    // the monomolecular adsorption/desorption pair above).
+    // Bimolecular records (e.g. CO oxidation, O* + CO* -> CO2 + 2*; H2
+    // recombination, 2 H* -> H2 + 2*) carry a real DFT-computed forward
+    // barrier only -- no BEP fallback exists for a two-species step, and
+    // no reverse reaction is built: the gas product leaving the surface
+    // isn't a single elementary step back onto two sites, so there's no
+    // thermodynamically meaningful Ea_rev to derive here (unlike the
+    // monomolecular adsorption/desorption pair above).
     for rec in &bimolecular_records {
         let bit_a = SPECIES_BITS[rec.species_a as usize];
         let bit_b = SPECIES_BITS[rec.species_b as usize];
@@ -419,7 +465,7 @@ fn run(config: &Config) -> io::Result<()> {
          rate scale factor {:.3e}",
         records.len(),
         energy_records.len(),
-        energy_records.len(),
+        desorption_count,
         bimolecular_records.len(),
         scale
     );
@@ -686,6 +732,81 @@ mod tests {
         let r = bimolecular[0];
         assert_eq!(r.transition_a, layout::ADS_O << 4); // O* -> vacant
         assert_eq!(r.transition_b, layout::ADS_CO << 4); // CO* -> vacant
+
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&bi_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn run_replaces_monomolecular_desorption_only_for_the_homoatomic_species() {
+        let input_path = temp_path("run_bi_homo_input");
+        let bi_path = temp_path("run_bi_homo_bimolecular_input");
+        let out_path = temp_path("run_bi_homo_out.lut");
+
+        // One O record and one H record -- O should keep both its
+        // adsorption and desorption reactions; H should keep only
+        // adsorption once a homoatomic bimolecular record exists for it.
+        let mut mono_bytes = Vec::new();
+        mono_bytes.extend_from_slice(MAGIC);
+        mono_bytes.extend_from_slice(&2u32.to_le_bytes());
+        push_record(&mut mono_bytes, 0, -500, 1, None); // O
+        push_record(&mut mono_bytes, 1, -400, 2, None); // H
+        std::fs::write(&input_path, &mono_bytes).unwrap();
+
+        // One real H2 recombination barrier: 2 H* -> H2 + 2*, Ea = 0.35 eV.
+        let mut bi_bytes = Vec::new();
+        bi_bytes.extend_from_slice(MAGIC_BI);
+        bi_bytes.extend_from_slice(&1u32.to_le_bytes());
+        push_bimolecular_record(&mut bi_bytes, 1, 1, -33, 99, 350);
+        std::fs::write(&bi_path, &bi_bytes).unwrap();
+
+        let config = Config {
+            input: input_path.clone(),
+            bimolecular_input: Some(bi_path.clone()),
+            out: out_path.clone(),
+            alpha: 0.87,
+            beta_ev: 0.0,
+            nu: 1.0e13,
+            temperature_k: 298.15,
+        };
+        run(&config).unwrap();
+
+        let lut = layout::ReactionLut::open(&out_path).unwrap();
+        let reaction_count = lut.len() * ReactionLutBlock::LANES;
+        let real_records: Vec<_> = (0..reaction_count)
+            .map(|id| lut.rate_of(id))
+            .filter(|r| r.rate_q16 > 0)
+            .collect();
+        // O adsorption + O desorption + H adsorption + 1 bimolecular
+        // (H desorption is replaced, not built).
+        assert_eq!(real_records.len(), 4);
+
+        let o_desorption = real_records
+            .iter()
+            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_O << 4)
+            .count();
+        assert_eq!(o_desorption, 1, "O's monomolecular desorption must be untouched");
+
+        let h_desorption = real_records
+            .iter()
+            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_H << 4)
+            .count();
+        assert_eq!(
+            h_desorption, 0,
+            "H's monomolecular desorption must be replaced by the bimolecular record"
+        );
+
+        let h_adsorption = real_records
+            .iter()
+            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_H)
+            .count();
+        assert_eq!(h_adsorption, 1, "H's adsorption reaction is unaffected");
+
+        let bimolecular: Vec<_> = real_records.into_iter().filter(|r| r.is_bimolecular).collect();
+        assert_eq!(bimolecular.len(), 1);
+        assert_eq!(bimolecular[0].transition_a, layout::ADS_H << 4);
+        assert_eq!(bimolecular[0].transition_b, layout::ADS_H << 4);
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&bi_path);
