@@ -35,8 +35,9 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
 | `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
-| `scripts/extract_energies.py` | Pulls `(species, energy, sid)` records from OC20 IS2RE LMDB shards |
-| `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API |
+| `scripts/extract_energies.py` | Pulls adsorption-energy records from OC20 IS2RE LMDB shards |
+| `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API, plus real transition-state barriers where they exist |
+| `scripts/oc20e_format.py`     | Shared binary format both extraction scripts write |
 
 ## Running the simulator
 
@@ -151,16 +152,12 @@ reactions. (Checked directly: OC20's `100k` train split already contains
 `all` split — re-extracting a bigger split won't find more O/H data
 either.)
 
-### Alternative/supplemental source: Catalysis-Hub.org (fills the CO gap)
+### Alternative/supplemental source: Catalysis-Hub.org (fills the CO gap, and has some real barriers)
 
 [Catalysis-Hub.org](https://catalysis-hub.org) is a separate, curated
 database of DFT chemisorption/reaction energies across many publications,
 queryable live over a public GraphQL API — no multi-GB download needed.
-Unlike OC20 it has real `*CO` adsorption data. It does *not* generally
-have real transition-state activation energies either (the schema has an
-`activationEnergy` field, but it comes back `null` for effectively every
-reaction queried), so it still feeds the same BEP/Arrhenius rate model,
-just with a real CO data source OC20 alone can't provide:
+Unlike OC20 it has real `*CO` adsorption data:
 
 ```sh
 python3 scripts/extract_catalysis_hub.py --out data/oc20/energies_catalysis_hub.bin
@@ -169,17 +166,43 @@ cargo run --release --bin oc20_ingest -- \
     --out reactions.lut
 ```
 
-`scripts/extract_catalysis_hub.py` paginates the API for the elementary
-adsorption step `star + <gas> -> <adsorbate>star` per species (`O2gas`
-at 0.5 stoichiometry, `H2gas` at 0.5, `COgas` at 1.0), keeping only exact
-matches (no co-adsorbates or lumped multi-step reactions), and writes the
-same `OC20E001` flat binary format `extract_energies.py` does — `oc20_ingest`
-consumes either source unchanged. Uses only the Python standard library
-(`urllib`, `json`, `base64`) — no pip install needed, unlike the OC20 path.
-A full run (no `--limit-per-species`) takes a few minutes and yields on
-the order of 1.3k O + 12.5k H + 5.7k CO real reactions.
+`scripts/extract_catalysis_hub.py` runs two passes. The bulk sweep
+paginates the API for the elementary adsorption step
+`star + <gas> -> <adsorbate>star` per species (`O2gas` at 0.5
+stoichiometry, `H2gas` at 0.5, `COgas` at 1.0), keeping only exact matches
+(no co-adsorbates or lumped multi-step reactions) — reaction energies
+only, same as OC20, so `oc20_ingest` still applies BEP to these. Uses only
+the Python standard library (`urllib`, `json`, `base64`) — no pip install
+needed, unlike the OC20 path. A full run (no `--limit-per-species`) takes
+a few minutes and yields on the order of 1-1.5k O, 8-12k H, and 5-6k CO
+real reactions (varies run to run — this is a live, growing database).
+
+**A small second pass finds genuine transition-state barriers.** Most
+entries in this database, like OC20, only have relaxation/adsorption
+energies — the schema's `activationEnergy` field is `null` for the
+overwhelming majority of its 158k+ reactions. But a handful of
+publications (`FalsigOn2014`, `WangUniversal2011`, `CatappTrends2008`,
+`JiangTrends2009`, and others) *do* report real NEB/dimer-method barriers
+for O₂, H₂, and CO dissociative/molecular adsorption across several metal
+surfaces — around 40 records as of this writing. `oc20_ingest` uses these
+directly for the forward (adsorption) direction instead of the BEP
+estimate, deriving the reverse (desorption) barrier from the same
+thermodynamic-consistency relation (`Ea_rev = Ea_fwd - dE_rxn`) it always
+uses. It logs how many records per species carried a real barrier so this
+is visible, e.g.:
+
+```
+oc20_ingest: species O: 1368 adsorption-energy records  (15 with a real DFT-computed activation energy, not BEP)
+```
+
+(There's also real barrier data for actual bimolecular surface reactions
+like CO oxidation itself, `O* + CO* -> CO2 + 2*` — but that's a two-site
+Langmuir-Hinshelwood step our single-site transition model can't
+represent without extending `engine.rs`/`layout.rs`, so it isn't wired up
+here.)
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
-untracked — see `.gitignore`. `scripts/extract_energies.py` and
-`scripts/extract_catalysis_hub.py` are both tracked; only the downloads,
-extractions, and generated `.bin` files under `data/` are not.
+untracked — see `.gitignore`. `scripts/extract_energies.py`,
+`scripts/extract_catalysis_hub.py`, and `scripts/oc20e_format.py` (the
+shared binary format both scripts write) are all tracked; only the
+downloads, extractions, and generated `.bin` files under `data/` are not.

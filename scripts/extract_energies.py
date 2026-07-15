@@ -14,24 +14,18 @@ torch_geometric installed (see `AnyStub` below) -- we only care about two
 plain-Python scalar attributes (`sid`, `y_relaxed`), every torch Tensor
 attribute on the object is discarded immediately.
 
-Output format (little-endian, no external crates needed to read it in Rust):
-    magic:        8 bytes  b"OC20E001"
-    record_count: u32
-    records[count]:
-        species:    u8   (0 = O, 1 = H, 2 = CO)
-        energy_mev: i32  (relaxed adsorption energy, milli-eV)
-        sid:        u32  (OC20 system id, for traceability only)
+Output format: see oc20e_format.py. OC20 never provides real
+transition-state barriers, so every record here has `has_real_ea=False`.
 """
 
 import argparse
 import io
 import pickle
-import struct
 import sys
 
 import lmdb
 
-MAGIC = b"OC20E001"
+from oc20e_format import write_records
 
 # OC20's global adsorbate-index table (mapping_adsorbates_2020may12.txt)
 # assigns these three indices to exactly the three adsorbates kinetica's
@@ -104,17 +98,9 @@ def extract(lmdb_path, sid_to_species, out):
             if energy_ev is None:
                 continue
             energy_mev = int(round(energy_ev * 1000.0))
-            records.append((species, energy_mev, sid))
+            records.append((species, energy_mev, sid, False, 0))
     env.close()
     return records
-
-
-def write_records(records, out_path):
-    with open(out_path, "wb") as f:
-        f.write(MAGIC)
-        f.write(struct.pack("<I", len(records)))
-        for species, energy_mev, sid in records:
-            f.write(struct.pack("<BiI", species, energy_mev, sid))
 
 
 def main():

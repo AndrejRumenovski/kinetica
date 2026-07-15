@@ -1,38 +1,44 @@
-"""Extraction: Catalysis-Hub.org GraphQL API -> the same flat OC20E001
-binary format `scripts/extract_energies.py` produces, so `oc20_ingest`
-consumes either source unchanged.
+"""Extraction: Catalysis-Hub.org GraphQL API -> the same flat binary
+format `scripts/extract_energies.py` produces (see oc20e_format.py), so
+`oc20_ingest` consumes either source unchanged.
 
 Catalysis-Hub (https://catalysis-hub.org) is a curated database of DFT
 chemisorption/reaction energies across many publications -- unlike OC20,
 it has real `*CO` adsorption data (OC20 holds `*CO` out of train/val
-entirely; see scripts/extract_energies.py's docstring). It does *not*
-generally have real transition-state activation energies either (the
-`activationEnergy` field exists in its schema but is null for effectively
-every entry queried), so this still feeds the same BEP + Arrhenius rate
-model `oc20_ingest` already applies -- it just adds a real CO data source
-that OC20 alone cannot provide.
+entirely; see scripts/extract_energies.py's docstring).
 
-This queries the public GraphQL endpoint for clean, single-site adsorption
-reactions of the form `star + <gas> -> <adsorbate>star` for each of our
-three species, paginating with Relay-style cursors, and keeps only
-reactions whose reactant/product dictionaries are an *exact* match for
-that pattern (no co-adsorbates, no multi-step lumped reactions).
+Two passes:
 
-Output format: identical to extract_energies.py's OC20E001 flat binary --
-see that script's docstring for the exact byte layout. `sid` here is the
-numeric suffix of Catalysis-Hub's own opaque reaction id (e.g.
-"UmVhY3Rpb246NDQ4ODE1" base64-decodes to "Reaction:448815" -> sid 448815),
-kept only for traceability.
+1. `fetch_species_records` -- the bulk sweep. Clean, single-site
+   adsorption reactions `star + <gas> -> <adsorbate>star` for each of our
+   three species, keeping only *exact* reactant/product matches (no
+   co-adsorbates, no multi-step lumped reactions). This is the large
+   majority of records (tens of thousands) but reaction energies only --
+   `oc20_ingest` derives an activation energy from these via BEP.
+
+2. `fetch_real_barrier_records` -- a small, separate sweep for reactions
+   with a real (non-null) `activationEnergy`: genuine DFT-computed
+   transition-state barriers, not a BEP estimate. These are rare (most
+   entries in this database, like OC20, only have relaxation/adsorption
+   energies) and use looser matching than pass 1 (some publications here
+   omit the explicit `star` reactant or use a different stoichiometry
+   convention for O2/H2 dissociative adsorption), so it isn't safe to
+   reuse `is_clean_adsorption`'s strict check for them. Records from this
+   pass are merged into pass 1's by `sid`: if the same underlying
+   reaction was already found by the bulk sweep, its `has_real_ea`/
+   `real_ea_mev` fields are upgraded in place; otherwise it's added as a
+   new record (this happens for the O2/H2 entries, which use a
+   stoichiometry the bulk sweep's strict filter rejects).
 """
 
 import argparse
 import base64
 import json
-import struct
 import sys
 import urllib.request
 
-MAGIC = b"OC20E001"
+from oc20e_format import write_records
+
 API_URL = "https://api.catalysis-hub.org/graphql"
 
 # (species index, gas reactant key, gas stoichiometry, adsorbed product key)
@@ -41,6 +47,17 @@ SPECIES_PATTERNS = [
     (0, "O2gas", 0.5, "Ostar"),
     (1, "H2gas", 0.5, "Hstar"),
     (2, "COgas", 1.0, "COstar"),
+]
+
+# Looser per-species key sets for the real-barrier pass: just "does this
+# reaction's product side consist of exactly one unit of our adsorbate,
+# and does its reactant side consist only of keys we recognize as a gas
+# reference or vacant site for that species" -- no stoichiometry check,
+# since this small curated subset isn't internally consistent about it.
+REAL_BARRIER_PATTERNS = [
+    (0, {"star", "O2gas", "Ogas"}, "Ostar"),
+    (1, {"star", "H2gas"}, "Hstar"),
+    (2, {"star", "COgas"}, "COstar"),
 ]
 
 PAGE_SIZE = 100
@@ -85,7 +102,8 @@ def is_clean_adsorption(reactants, products, gas_key, gas_stoich, product_key):
 
 
 def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None):
-    records = []
+    """Bulk sweep: returns {sid: (species, energy_mev, sid, False, 0)}."""
+    records = {}
     after = None
     while True:
         after_clause = f', after: "{after}"' if after else ""
@@ -108,7 +126,8 @@ def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None)
             energy_ev = node["reactionEnergy"]
             if energy_ev is None:
                 continue
-            records.append((species, int(round(energy_ev * 1000.0)), sid_from_id(node["id"])))
+            sid = sid_from_id(node["id"])
+            records[sid] = (species, int(round(energy_ev * 1000.0)), sid, False, 0)
 
         print(
             f"  ...{gas_key}: scanned to {len(records)} matches "
@@ -125,12 +144,56 @@ def fetch_species_records(species, gas_key, gas_stoich, product_key, limit=None)
     return records
 
 
-def write_records(records, out_path):
-    with open(out_path, "wb") as f:
-        f.write(MAGIC)
-        f.write(struct.pack("<I", len(records)))
-        for species, energy_mev, sid in records:
-            f.write(struct.pack("<BiI", species, energy_mev, sid & 0xFFFFFFFF))
+def fetch_real_barrier_records():
+    """Real-barrier sweep: returns {sid: (species, energy_mev, sid, True, ea_mev)}
+    for every reaction with a non-null `activationEnergy` matching one of
+    `REAL_BARRIER_PATTERNS`."""
+    records = {}
+    seen_ids = set()
+    after = None
+    while True:
+        after_clause = f', after: "{after}"' if after else ""
+        query = f"""{{
+          reactions(first: {PAGE_SIZE}, activationEnergy: -100, op: ">"{after_clause}) {{
+            pageInfo {{ hasNextPage endCursor }}
+            edges {{ node {{ id reactants products activationEnergy reactionEnergy }} }}
+          }}
+        }}"""
+        data = graphql_query(query)["reactions"]
+
+        for edge in data["edges"]:
+            node = edge["node"]
+            if node["id"] in seen_ids:
+                continue
+            seen_ids.add(node["id"])
+
+            reactants = json.loads(node["reactants"])
+            products = json.loads(node["products"])
+            for species, gas_keys, product_key in REAL_BARRIER_PATTERNS:
+                if set(products.keys()) != {product_key}:
+                    continue
+                if abs(products.get(product_key, 0) - 1.0) > 1e-6:
+                    continue
+                if not set(reactants.keys()) <= gas_keys:
+                    continue
+                energy_ev = node["reactionEnergy"]
+                if energy_ev is None:
+                    continue
+                sid = sid_from_id(node["id"])
+                records[sid] = (
+                    species,
+                    int(round(energy_ev * 1000.0)),
+                    sid,
+                    True,
+                    int(round(node["activationEnergy"] * 1000.0)),
+                )
+                break
+
+        if not data["pageInfo"]["hasNextPage"]:
+            break
+        after = data["pageInfo"]["endCursor"]
+
+    return records
 
 
 def main():
@@ -140,19 +203,37 @@ def main():
         "--limit-per-species",
         type=int,
         default=None,
-        help="cap records fetched per species (default: no cap)",
+        help="cap records fetched per species in the bulk sweep (default: no cap)",
+    )
+    parser.add_argument(
+        "--skip-real-barriers",
+        action="store_true",
+        help="skip the (fast) real-activation-energy sweep",
     )
     args = parser.parse_args()
 
-    all_records = []
+    by_sid = {}
     for species, gas_key, gas_stoich, product_key in SPECIES_PATTERNS:
         print(f"fetching clean {product_key} adsorption reactions...", file=sys.stderr)
         records = fetch_species_records(
             species, gas_key, gas_stoich, product_key, args.limit_per_species
         )
         print(f"  -> {len(records)} clean {product_key} records", file=sys.stderr)
-        all_records.extend(records)
+        by_sid.update(records)
 
+    if not args.skip_real_barriers:
+        print("fetching real (non-BEP) activation-energy reactions...", file=sys.stderr)
+        real_barrier_records = fetch_real_barrier_records()
+        new_count = sum(1 for sid in real_barrier_records if sid not in by_sid)
+        upgraded_count = len(real_barrier_records) - new_count
+        by_sid.update(real_barrier_records)
+        print(
+            f"  -> {len(real_barrier_records)} real-barrier records "
+            f"({upgraded_count} upgraded existing, {new_count} newly added)",
+            file=sys.stderr,
+        )
+
+    all_records = list(by_sid.values())
     write_records(all_records, args.out)
     print(f"wrote {len(all_records)} total records to {args.out}", file=sys.stderr)
 

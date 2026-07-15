@@ -4,3 +4,4 @@
 trajectory.bin
 /data/
 /PROMPT.md
+__pycache__/
