@@ -201,11 +201,28 @@ O/H/CO adsorption/desorption chemistry and **zero *recombination*
 bimolecular reactions** (CO-oxidation, H2-recombination) — rather than
 quietly keeping the old cross-facet/cross-composition bimolecular records
 under a "Pd" label that would itself be exactly the kind of pooling this
-change exists to eliminate. Restoring recombination chemistry on a real,
-single, chemically-clean surface is future work (see "Next step" in the
-project handoff). A different real bimolecular reaction — water splitting
-— *does* survive strict Pd(111) filtering; see "Broader reaction coverage:
-OH\* and water splitting" below.
+change exists to eliminate.
+
+**A follow-up, metal-unfiltered survey closed the obvious next question —
+"is there a different metal where this data isn't compromised?" — with a
+checked no.** Scanning every real-barrier record in the database (not just
+Pd's), merged across several passes to work around this database's own
+run-to-run pagination flakiness (see "These real barriers are rare and
+vary run to run" below), turns up only **5 real recombination records in
+total**, covering just these same two reactions, and every one of them is
+on Pd — Pd(211), oxide-modified Pd, or `PdH`-hydride, never a clean
+single-element (111) facet. No other metal has a real recombination
+barrier for either reaction, at any facet. So this was never a
+Pd-specific gap to route around by picking a better metal (option (b) in
+the project handoff's "Next step" list) — real recombination
+transition-state calculations are simply rare in this literature across
+the board, and Pd happens to be the only metal anyone has published them
+for. Restoring recombination chemistry on a real, clean single-crystal
+surface is therefore waiting on this data source publishing more such
+calculations, not on a smarter choice of target metal. A different real
+bimolecular reaction — water splitting — *does* survive strict Pd(111)
+filtering; see "Broader reaction coverage: OH\* and water splitting"
+below.
 
 ## Broader reaction coverage: OH* and water splitting
 
@@ -562,7 +579,13 @@ own `reactions.lut` therefore ships with real dissociative-adsorption
 bimolecular chemistry but zero recombination bimolecular chemistry — not
 a gap in the mechanism, just where the real single-surface data currently
 lands. For CO-oxidation specifically, an unfiltered extraction or
-`--metal Pd --facet 211` still finds the real barrier.
+`--metal Pd --facet 211` still finds the real barrier. A
+metal-unfiltered survey of the *whole* database (see "Real bimolecular
+(CO-oxidation, H2-recombination) barriers are absent from a strict
+Pd(111) build" above) confirms there is no other metal to switch to
+instead: only 5 real recombination records exist across the entire
+database, all on Pd, none on a clean (111) facet — a data-source coverage
+gap, not a Pd-specific one.
 
 These real barriers are rare and vary run to run just like the rest of
 this live, growing database (see above) — a record you know exists (e.g.
