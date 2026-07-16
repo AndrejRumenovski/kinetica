@@ -3,12 +3,32 @@
 //!
 //! This module wires the memory layout (`layout.rs`) and the O(1) reaction
 //! sampler (`gillespie.rs`) into the macro-scale execution pipeline: the
-//! lattice is cut into row-band patches, each patch gets its own
+//! lattice is cut into row-band patches, each patch gets its own fully
 //! independent local Gillespie loop running on a `rayon` work-stealing
-//! thread, patches exchange boundary-crossing state over lock-free
-//! `crossbeam_channel` rings, and every fired reaction is drained into a
-//! double-buffered `io_uring` writer so compute threads never block on
-//! storage latency.
+//! thread, and every fired reaction is drained into a double-buffered
+//! `io_uring` writer so compute threads never block on storage latency.
+//!
+//! **Patches do not communicate with each other at all** -- deliberately.
+//! An earlier version of this module had them mirror boundary-row
+//! occupancy changes across patches over `crossbeam_channel` rings, but a
+//! code audit found that mechanism unconditionally overwrote the
+//! *receiving* patch's own real edge-row site with the sender's mirrored
+//! value: row N (one patch's last row) and row N+1 (the next patch's
+//! first row) are two distinct, physically adjacent lattice sites, and
+//! `SiteLattice::split_row_bands_mut` allocates no separate ghost/halo
+//! buffer for a mirror to land in instead, so the "mirror" silently
+//! clobbered genuine data. It was removed rather than given a proper
+//! ghost buffer, because reaction selection doesn't actually need
+//! cross-patch awareness in the first place: a bimolecular reaction's
+//! second site is always a `same_patch_neighbor` (never across a
+//! boundary, by construction -- see its doc comment), and a monomolecular
+//! reaction has no neighbor dependency at all. The one real cost of
+//! removing it: pairs that would physically span a patch boundary (one
+//! site in each of two adjacent patches) are never counted toward any
+//! bimolecular template's live weight, and never fire -- a small, honest,
+//! *bounded* edge effect (it scales with the number of patch boundaries,
+//! not with lattice size) rather than the unbounded data corruption the
+//! old mechanism caused.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -22,78 +42,18 @@ use crate::layout::{LutKind, ReactionLut, ReactionLutBlock, SiteLattice};
 use crate::occupancy::{OccupancyCounters, Pressures};
 
 // ------------------------------------------------------------------------
-// Cross-patch boundary migration
-// ------------------------------------------------------------------------
-
-/// One occupancy update that needs to be mirrored into a neighboring
-/// patch's boundary row, because the reaction that produced it touched a
-/// site on the edge of this patch's domain.
-#[derive(Clone, Copy, Debug)]
-pub struct MigrationEvent {
-    /// Column within the row (shared coordinate space across all patches,
-    /// since every patch spans the lattice's full width).
-    pub col: usize,
-    /// New occupancy byte to write at that column in the neighbor's
-    /// adjacent boundary row.
-    pub state: u8,
-}
-
-/// The two inbound/outbound `crossbeam_channel` links a single patch uses
-/// to exchange boundary state with its vertical neighbors. Endpoints are
-/// `None` at the top and bottom edges of the whole lattice, where there is
-/// no neighbor to talk to.
-struct BoundaryLinks {
-    send_up: Option<Sender<MigrationEvent>>,
-    send_down: Option<Sender<MigrationEvent>>,
-    recv_from_above: Option<Receiver<MigrationEvent>>,
-    recv_from_below: Option<Receiver<MigrationEvent>>,
-}
-
-fn apply_migration(data: &mut [u8], width: usize, row_local: usize, ev: MigrationEvent) {
-    let idx = row_local * width + ev.col;
-    if idx < data.len() {
-        data[idx] = ev.state;
-    }
-}
-
-/// Same as `apply_migration`, but also keeps `counters` in sync -- a
-/// migration mirrors an occupancy change that happened on a *different*
-/// patch, so the occupancy-gated path's live counts need to see it too,
-/// not just the raw bytes.
-#[allow(clippy::too_many_arguments)]
-fn apply_migration_occupancy_gated(
-    data: &mut [u8],
-    width: usize,
-    rows_in_band: usize,
-    row_local: usize,
-    ev: MigrationEvent,
-    counters: &mut OccupancyCounters,
-    seed: u64,
-) {
-    let idx = row_local * width + ev.col;
-    if idx < data.len() {
-        let old = data[idx];
-        data[idx] = ev.state;
-        counters.on_occupancy_change(data, idx, width, rows_in_band, old, ev.state, seed);
-    }
-}
-
-// ------------------------------------------------------------------------
 // Per-patch local Gillespie loop
 // ------------------------------------------------------------------------
 
 /// Pick a uniformly random *same-patch* neighbor (one of `site_idx`'s up
 /// to six hex-topology neighbors, see `topology::all_neighbors`) for a
 /// bimolecular reaction's second site. Deliberately constrained to stay
-/// within this patch rather than
-/// possibly landing in a neighboring patch: a monomolecular reaction's
-/// single-site update can be mirrored across a patch boundary
-/// fire-and-forget via `MigrationEvent` (see `apply_and_record`), but a
-/// bimolecular event needs *both* sites updated atomically as far as this
-/// patch's own trajectory is concerned, which a fire-and-forget mirror to
-/// a different thread can't guarantee. Returns `None` only when `site_idx`
-/// has no neighbor at all within the patch (a degenerate 1x1 patch) --
-/// callers should skip the event in that case rather than force one.
+/// within this patch rather than possibly landing in a neighboring patch
+/// -- patches never communicate (see this module's doc comment), so a
+/// partner site outside this patch's own slice couldn't be read or
+/// updated correctly at all. Returns `None` only when `site_idx` has no
+/// neighbor at all within the patch (a degenerate 1x1 patch) -- callers
+/// should skip the event in that case rather than force one.
 fn same_patch_neighbor(rng: &mut Rng, site_idx: usize, width: usize, rows_in_band: usize) -> Option<usize> {
     let all = crate::topology::all_neighbors(site_idx, width, rows_in_band);
     let mut candidates = [0usize; crate::topology::MAX_NEIGHBORS];
@@ -110,23 +70,20 @@ fn same_patch_neighbor(rng: &mut Rng, site_idx: usize, width: usize, rows_in_ban
 }
 
 /// Apply one site's `(reactant_mask << 4) | product_mask` transition in
-/// place, record it to the trajectory log, and mirror it across a patch
-/// boundary if the site sits on this patch's shared edge row. Shared by
-/// both the monomolecular path (called once) and the bimolecular path
-/// (called once per site) so the occupancy-update / logging / migration
-/// logic exists in exactly one place.
+/// place and record it to the trajectory log. Shared by both the
+/// monomolecular path (called once) and the bimolecular path (called once
+/// per site) so the occupancy-update / logging logic exists in exactly
+/// one place.
 #[allow(clippy::too_many_arguments)]
 fn apply_and_record(
     data: &mut [u8],
     width: usize,
-    rows_in_band: usize,
     y0: usize,
     site_idx: usize,
     transition: u8,
     reaction_id: u32,
     sim_time_bits: u64,
     trajectory_tx: &Sender<TrajectoryRecord>,
-    links: &BoundaryLinks,
 ) {
     data[site_idx] = crate::layout::apply_transition(data[site_idx], transition);
 
@@ -135,36 +92,13 @@ fn apply_and_record(
         site_idx: (y0 * width + site_idx) as u32,
         reaction_id,
     });
-
-    // Mirror the update to a neighbor if it landed on this patch's shared
-    // edge row.
-    let row_local = site_idx / width;
-    let col = site_idx % width;
-    if row_local == 0 {
-        if let Some(tx) = &links.send_up {
-            let _ = tx.send(MigrationEvent {
-                col,
-                state: data[site_idx],
-            });
-        }
-    }
-    if row_local == rows_in_band - 1 {
-        if let Some(tx) = &links.send_down {
-            let _ = tx.send(MigrationEvent {
-                col,
-                state: data[site_idx],
-            });
-        }
-    }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_patch(
     band: (usize, usize),
     width: usize,
     data: &mut [u8],
     lut: &ReactionLut,
-    links: BoundaryLinks,
     steps: u64,
     seed: u64,
     trajectory_tx: &Sender<TrajectoryRecord>,
@@ -174,22 +108,6 @@ fn run_patch(
     let mut domain = GillespieDomain::new(lut, seed);
 
     for _ in 0..steps {
-        // Drain any migrations that arrived from neighbors since the last
-        // step before this patch acts on its own boundary rows, so a
-        // reaction this step sees the neighbor's latest state rather than
-        // a stale one. `try_iter` never blocks -- an empty channel just
-        // yields nothing, keeping this patch's thread free-running.
-        if let Some(rx) = &links.recv_from_above {
-            for ev in rx.try_iter() {
-                apply_migration(data, width, 0, ev);
-            }
-        }
-        if let Some(rx) = &links.recv_from_below {
-            for ev in rx.try_iter() {
-                apply_migration(data, width, rows_in_band - 1, ev);
-            }
-        }
-
         let Some((reaction_id, tau)) = domain.step(lut) else {
             break; // domain gone fully quiescent
         };
@@ -198,7 +116,7 @@ fn run_patch(
         // patch. A full transition-state model would derive the site from
         // the reaction's neighborhood template; this engine samples
         // uniformly over the patch's own sites, which is sufficient to
-        // exercise the occupancy update and boundary-migration paths.
+        // exercise the occupancy update.
         let site_a = domain.rng.next_u32_below(data.len() as u32) as usize;
         let r = lut.rate_of(reaction_id as usize);
         let sim_time_bits = domain.sim_time.to_bits();
@@ -211,20 +129,11 @@ fn run_patch(
             // that way); if site A has none (a degenerate 1x1 patch), this
             // event is skipped rather than forced onto an invalid site.
             if let Some(site_b) = same_patch_neighbor(&mut domain.rng, site_a, width, rows_in_band) {
-                apply_and_record(
-                    data, width, rows_in_band, y0, site_a, r.transition_a, reaction_id,
-                    sim_time_bits, trajectory_tx, &links,
-                );
-                apply_and_record(
-                    data, width, rows_in_band, y0, site_b, r.transition_b, reaction_id,
-                    sim_time_bits, trajectory_tx, &links,
-                );
+                apply_and_record(data, width, y0, site_a, r.transition_a, reaction_id, sim_time_bits, trajectory_tx);
+                apply_and_record(data, width, y0, site_b, r.transition_b, reaction_id, sim_time_bits, trajectory_tx);
             }
         } else {
-            apply_and_record(
-                data, width, rows_in_band, y0, site_a, r.transition_a, reaction_id,
-                sim_time_bits, trajectory_tx, &links,
-            );
+            apply_and_record(data, width, y0, site_a, r.transition_a, reaction_id, sim_time_bits, trajectory_tx);
         }
 
         let _ = tau; // waiting time already folded into domain.sim_time
@@ -232,21 +141,20 @@ fn run_patch(
 }
 
 /// The occupancy-gated counterpart to `run_patch`, used for `KMCOCC01`
-/// LUTs. Structurally the same per-step shape (drain migrations, pick a
-/// reaction, apply it, advance simulated time) but every reaction- and
-/// site-selection decision is routed through `occupancy::OccupancyCounters`
-/// instead of `gillespie::GillespieDomain` + a uniformly random site pick --
-/// see `occupancy.rs`'s module doc for why. `apply_and_record` (the actual
-/// byte-level mutation, trajectory logging, and boundary migration) is
-/// reused unchanged from the static path; this function's own job is only
-/// selecting *what* to apply and keeping `counters` in sync afterward.
+/// LUTs. Structurally the same per-step shape (pick a reaction, apply it,
+/// advance simulated time) but every reaction- and site-selection decision
+/// is routed through `occupancy::OccupancyCounters` instead of
+/// `gillespie::GillespieDomain` + a uniformly random site pick -- see
+/// `occupancy.rs`'s module doc for why. `apply_and_record` (the actual
+/// byte-level mutation and trajectory logging) is reused unchanged from
+/// the static path; this function's own job is only selecting *what* to
+/// apply and keeping `counters` in sync afterward.
 #[allow(clippy::too_many_arguments)]
 fn run_patch_occupancy_gated(
     band: (usize, usize),
     width: usize,
     data: &mut [u8],
     lut: &ReactionLut,
-    links: BoundaryLinks,
     steps: u64,
     seed: u64,
     trajectory_tx: &Sender<TrajectoryRecord>,
@@ -263,19 +171,6 @@ fn run_patch_occupancy_gated(
     let mut sim_time = 0.0f64;
 
     for _ in 0..steps {
-        if let Some(rx) = &links.recv_from_above {
-            for ev in rx.try_iter() {
-                apply_migration_occupancy_gated(data, width, rows_in_band, 0, ev, &mut counters, seed);
-            }
-        }
-        if let Some(rx) = &links.recv_from_below {
-            for ev in rx.try_iter() {
-                apply_migration_occupancy_gated(
-                    data, width, rows_in_band, rows_in_band - 1, ev, &mut counters, seed,
-                );
-            }
-        }
-
         let total = counters.total_propensity(&templates, pressures);
         if total <= 0.0 {
             break; // domain gone fully quiescent: no template's reactant exists anywhere
@@ -294,19 +189,13 @@ fn run_patch_occupancy_gated(
         let sim_time_bits = sim_time.to_bits();
 
         let old_a = data[site_a];
-        apply_and_record(
-            data, width, rows_in_band, y0, site_a, r.transition_a, reaction_id,
-            sim_time_bits, trajectory_tx, &links,
-        );
+        apply_and_record(data, width, y0, site_a, r.transition_a, reaction_id, sim_time_bits, trajectory_tx);
         let new_a = data[site_a];
         counters.on_occupancy_change(data, site_a, width, rows_in_band, old_a, new_a, seed);
 
         if let Some(site_b) = site_b {
             let old_b = data[site_b];
-            apply_and_record(
-                data, width, rows_in_band, y0, site_b, r.transition_b, reaction_id,
-                sim_time_bits, trajectory_tx, &links,
-            );
+            apply_and_record(data, width, y0, site_b, r.transition_b, reaction_id, sim_time_bits, trajectory_tx);
             let new_b = data[site_b];
             counters.on_occupancy_change(data, site_b, width, rows_in_band, old_b, new_b, seed);
         }
@@ -338,54 +227,25 @@ pub fn run_simulation(
 
     let width = lattice.width;
     let bands = lattice.split_row_bands_mut(num_patches);
-    let n = bands.len();
-
-    // Wire up one bounded channel pair per boundary between vertically
-    // adjacent patches, up front -- these are the lock-free atomic rings
-    // patches use to cross domain boundaries; nothing here is a global
-    // lock, and every channel is only ever touched by the exactly two
-    // patches on either side of its boundary.
-    let mut send_up: Vec<Option<Sender<MigrationEvent>>> = (0..n).map(|_| None).collect();
-    let mut send_down: Vec<Option<Sender<MigrationEvent>>> = (0..n).map(|_| None).collect();
-    let mut recv_from_above: Vec<Option<Receiver<MigrationEvent>>> = (0..n).map(|_| None).collect();
-    let mut recv_from_below: Vec<Option<Receiver<MigrationEvent>>> = (0..n).map(|_| None).collect();
-
-    for i in 0..n.saturating_sub(1) {
-        let (tx_down, rx_down) = crossbeam_channel::bounded::<MigrationEvent>(1024);
-        send_down[i] = Some(tx_down);
-        recv_from_above[i + 1] = Some(rx_down);
-
-        let (tx_up, rx_up) = crossbeam_channel::bounded::<MigrationEvent>(1024);
-        send_up[i + 1] = Some(tx_up);
-        recv_from_below[i] = Some(rx_up);
-    }
 
     // Each patch's local Gillespie loop is spawned as an independent
     // `rayon` task; the work-stealing scheduler fans these out across
     // however many CPU cores are available and steals idle patches' work
-    // if some finish early, with no global execution lock -- the only
-    // cross-thread coordination is the bounded channels above and the
-    // unbounded trajectory channel.
+    // if some finish early, with no global execution lock and no
+    // cross-patch communication at all -- the only cross-thread
+    // coordination is the unbounded trajectory channel every patch shares.
     rayon::scope(|scope| {
         for (i, (y0, y1, data)) in bands.into_iter().enumerate() {
-            let links = BoundaryLinks {
-                send_up: send_up[i].take(),
-                send_down: send_down[i].take(),
-                recv_from_above: recv_from_above[i].take(),
-                recv_from_below: recv_from_below[i].take(),
-            };
             let tx = trajectory_tx.clone();
             // Distinct, deterministic per-patch seed so re-running the
             // same decomposition reproduces the same trajectory.
             let seed = 0x5EED_0000_0000_0000u64 ^ (i as u64);
 
             scope.spawn(move |_| match lut.kind() {
-                LutKind::Static => {
-                    run_patch((y0, y1), width, data, lut, links, steps_per_patch, seed, &tx)
+                LutKind::Static => run_patch((y0, y1), width, data, lut, steps_per_patch, seed, &tx),
+                LutKind::OccupancyGated => {
+                    run_patch_occupancy_gated((y0, y1), width, data, lut, steps_per_patch, seed, &tx, pressures)
                 }
-                LutKind::OccupancyGated => run_patch_occupancy_gated(
-                    (y0, y1), width, data, lut, links, steps_per_patch, seed, &tx, pressures,
-                ),
             });
         }
     });
@@ -644,20 +504,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn apply_migration_ignores_out_of_bounds_column() {
-        let mut data = vec![VACANT_FOR_TEST; 4];
-        // row_local=0, width=4, col=10 -> idx=10, out of bounds for a
-        // 4-byte patch -- must be a silent no-op, not a panic.
-        apply_migration(&mut data, 4, 0, MigrationEvent { col: 10, state: 0x01 });
-        assert_eq!(data, vec![VACANT_FOR_TEST; 4]);
-    }
-
-    const VACANT_FOR_TEST: u8 = 0x00;
-
     /// The falsifying test this whole occupancy-gating pass exists to
     /// pass: drive the *actual* `run_simulation` pipeline (spatial
-    /// decomposition, migration, everything -- not just
+    /// decomposition, everything -- not just
     /// `OccupancyCounters` in isolation) over a mixed-occupancy lattice
     /// for many steps against an `OccupancyGated` LUT, then confirm no
     /// site ever ends up holding more than one adsorbate at once. Before
@@ -739,45 +588,74 @@ mod tests {
         let _ = std::fs::remove_file(&trajectory_path);
     }
 
-    /// KNOWN BUG, DOCUMENTED NOT FIXED YET: this test currently asserts the
-    /// *buggy* behavior, not the correct one -- it exists to pin down a
-    /// confirmed correctness gap found in a code audit, not to guard
-    /// correct behavior. `apply_migration_occupancy_gated` mirrors a
-    /// boundary reaction into the *neighboring* patch, but there is no
-    /// separate ghost/halo row for that mirror to land in
-    /// (`SiteLattice::split_row_bands_mut` produces strictly
-    /// non-overlapping bands) -- so it overwrites the neighbor's own real,
-    /// physically distinct edge-row site instead. Row N (one patch's last
-    /// row) and row N+1 (the next patch's first row) are two different
-    /// lattice sites; this mechanism currently forces them to hold
-    /// identical state after any boundary reaction, silently corrupting
-    /// the receiving patch's genuine occupancy. Invisible to every other
-    /// test in this file, since none of them check anything about
-    /// boundary-adjacent-but-distinct sites -- they only assert "no site
-    /// holds more than one species bit," which this bug never violates.
-    /// TODO once fixed (a real per-boundary ghost buffer, decoupled from
-    /// each patch's own real `data` slice): invert this assertion to
-    /// `assert_eq!(data[0], ADS_H)` -- the real site must NOT change.
+    /// Regression test for a fixed correctness bug: a code audit found the
+    /// old cross-patch boundary-migration mechanism unconditionally
+    /// overwrote a receiving patch's own real edge-row site with a
+    /// neighboring patch's mirrored state, treating two physically
+    /// distinct, merely-adjacent sites as if they had to be identical.
+    /// That mechanism has since been removed entirely (see this module's
+    /// doc comment for why removing it, rather than giving it a proper
+    /// ghost buffer, is the correct fix). Drives the *actual*
+    /// `run_simulation` pipeline with 2 patches: patch 0's real last row
+    /// is all `ADS_O` with a fast desorption template (so it fires and
+    /// changes); patch 1's real first row -- a different physical site,
+    /// merely adjacent to patch 0's last row -- is all `ADS_H` with no
+    /// template matching H at all, so it must stay exactly `ADS_H` for
+    /// the entire run regardless of what happens on patch 0's boundary.
     #[test]
-    fn known_bug_boundary_migration_currently_overwrites_neighbors_real_site() {
-        use crate::layout::{ADS_H, VACANT};
+    fn run_simulation_patches_never_touch_each_others_real_boundary_row() {
+        use crate::layout::{self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_H, ADS_O, VACANT};
+        use crate::test_support::temp_path;
+
+        let lattice_path = temp_path("boundary_lattice");
+        let lut_path = temp_path("boundary_lut");
+        let trajectory_path = temp_path("boundary_trajectory");
 
         let width = 4;
-        let rows_in_band = 2;
-        let mut data = vec![ADS_H, ADS_H, ADS_H, ADS_H, VACANT, VACANT, VACANT, VACANT];
-        let seed = 1u64;
-        let mut counters = OccupancyCounters::new(&data, width, seed);
+        let height = 4;
+        let mut lattice = SiteLattice::open(&lattice_path, width, height).unwrap();
+        for i in 0..width * height {
+            lattice.set(i, VACANT);
+        }
+        for col in 0..width {
+            lattice.set(width + col, ADS_O); // row 1: patch 0's real last row
+            lattice.set(2 * width + col, ADS_H); // row 2: patch 1's real first row
+        }
 
-        // Simulates patch 0's row 1 (a different, merely-adjacent physical
-        // site) sending "I just became VACANT" after an O* desorbed there.
-        let ev = MigrationEvent { col: 0, state: VACANT };
-        apply_migration_occupancy_gated(&mut data, width, rows_in_band, 0, ev, &mut counters, seed);
+        let mut records = Vec::new();
+        for bucket in 0..crate::occupancy::BUCKETS_PER_SPECIES as u8 {
+            records.push(ReactionRecord {
+                rate_q16: u32::MAX,
+                bin_id: bucket,
+                transition_a: ADS_O << 4, // desorption: O* -> vacant
+                transition_b: 0,
+                is_bimolecular: false,
+            });
+        }
+        let blocks = layout::pack_records_into_blocks(records);
+        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        let lut = ReactionLut::open(&lut_path).unwrap();
 
-        assert_eq!(
-            data[0], VACANT,
-            "documents the bug: data[0] was ADS_H (this patch's own real site), now silently \
-             overwritten by a different site's mirrored state"
-        );
+        run_simulation(&mut lattice, &lut, 2, 500, &trajectory_path, &Pressures::ones()).unwrap();
+
+        for col in 0..width {
+            assert_eq!(
+                lattice.get(2 * width + col),
+                ADS_H,
+                "row 2 col {col} must stay ADS_H -- no template matches H, and patch 0's \
+                 boundary reactions on the adjacent-but-distinct row 1 must never touch it"
+            );
+        }
+        // Sanity check the other half of the scenario: row 1's O* really
+        // did desorb (otherwise row 2 staying ADS_H would be a vacuous
+        // pass rather than a real test of cross-patch isolation).
+        for col in 0..width {
+            assert_eq!(lattice.get(width + col), VACANT, "row 1 col {col} should have desorbed");
+        }
+
+        let _ = std::fs::remove_file(&lattice_path);
+        let _ = std::fs::remove_file(&lut_path);
+        let _ = std::fs::remove_file(&trajectory_path);
     }
 
     /// Propensity must genuinely track coverage, not just avoid corrupting
