@@ -171,7 +171,12 @@ fn run_patch_occupancy_gated(
     let mut sim_time = 0.0f64;
 
     for _ in 0..steps {
-        let total = counters.total_propensity(&templates, pressures);
+        // Computed once and shared between the waiting-time draw (needs
+        // `total`) and the reaction-selection draw (needs both) -- avoids
+        // two separate O(template count) passes recomputing the same
+        // per-template weight every fired event.
+        let weights = counters.weights(&templates, pressures);
+        let total: f64 = weights.iter().sum();
         if total <= 0.0 {
             break; // domain gone fully quiescent: no template's reactant exists anywhere
         }
@@ -181,7 +186,7 @@ fn run_patch_occupancy_gated(
         sim_time += tau;
 
         let Some((reaction_id, site_a, site_b)) =
-            counters.select_event(&templates, data, width, rows_in_band, &mut rng, pressures)
+            counters.select_event(&templates, &weights, total, data, width, rows_in_band, &mut rng)
         else {
             break; // structurally unreachable given total > 0 above, but handled defensively
         };

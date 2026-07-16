@@ -105,6 +105,24 @@ impl SiteLattice {
         let len = width
             .checked_mul(height)
             .expect("lattice dimensions overflow usize");
+        // `engine.rs`'s `TrajectoryRecord.site_idx` and the global
+        // reaction-id math both narrow a site's flat index to `u32` --
+        // fine on a 64-bit `usize`, which comfortably exceeds `u32::MAX`
+        // (~4.29 billion) long before this check does, but a lattice
+        // genuinely that large would silently wrap those logged indices
+        // rather than fail loudly. Reject it here instead, at construction
+        // time, rather than let corruption surface downstream in a
+        // trajectory log no one's watching this check for.
+        if len > u32::MAX as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "lattice of {width}x{height} ({len} sites) exceeds u32::MAX sites \
+                     ({}); site indices would silently wrap in the trajectory log",
+                    u32::MAX
+                ),
+            ));
+        }
 
         let file = OpenOptions::new()
             .read(true)
@@ -645,6 +663,22 @@ mod tests {
         assert_eq!(lattice.get(0), VACANT);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A code audit flagged `u32` site-index overflow at very large
+    /// lattice sizes as untested: `engine.rs`'s `TrajectoryRecord.site_idx`
+    /// narrows a site's flat index to `u32`, so a lattice with more than
+    /// `u32::MAX` sites would silently wrap it. `open` now rejects that
+    /// case outright rather than letting it surface downstream. Chosen
+    /// dimensions (100,000 x 100,000 = 10 billion sites) exceed `u32::MAX`
+    /// (~4.29 billion) without needing to actually allocate anything --
+    /// this must fail before `set_len`/`mmap`, not after.
+    #[test]
+    fn open_rejects_lattice_dimensions_exceeding_u32_max_sites() {
+        let path = temp_path("lattice_too_large");
+        let result = SiteLattice::open(&path, 100_000, 100_000);
+        assert!(result.is_err(), "10 billion sites must be rejected, not silently wrapped");
+        assert!(!path.exists(), "must fail before creating/sizing the backing file");
     }
 
     #[test]

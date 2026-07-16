@@ -300,19 +300,12 @@ impl OccupancyCounters {
 
         for site_idx in 0..patch_data.len() {
             let state = patch_data[site_idx];
-            if state == layout::VACANT {
-                for (species, &bit) in SPECIES_BITS.iter().enumerate() {
-                    let bucket = site_bucket(site_idx, bit, seed);
-                    counters.vacant_sets[species].insert(site_idx, bucket);
-                }
-            } else if let Some(species) = species_index(state) {
-                let bucket = site_bucket(site_idx, state, seed);
-                counters.occupied_sets[species].insert(site_idx, bucket);
-            }
-            // Any other bit pattern is a corrupted/unknown site state
-            // (see `layout::OCCUPANCY_MASK`'s doc comment) -- not counted
-            // toward any template's live count, so it simply can never be
-            // selected as a reactant; the engine never writes such a state.
+            // Any bit pattern other than VACANT or a single known species
+            // is a corrupted/unknown site state (see
+            // `layout::OCCUPANCY_MASK`'s doc comment) -- `update_membership`
+            // simply doesn't add it to any set, so it can never be selected
+            // as a reactant; the engine never writes such a state.
+            counters.update_membership(site_idx, state, seed, true);
 
             for neighbor_idx in crate::topology::forward_neighbors(site_idx, width, rows)
                 .into_iter()
@@ -323,6 +316,33 @@ impl OccupancyCounters {
         }
 
         counters
+    }
+
+    /// Add (`insert = true`) or remove (`insert = false`) `site_idx` --
+    /// currently holding `state` -- from whichever `vacant_sets`/
+    /// `occupied_sets` bucket that state belongs to. The one place this
+    /// branch (VACANT -> every species' vacant set, a known species ->
+    /// just that species' occupied set, anything else -> no set at all)
+    /// is written, shared by `new`'s seeding pass and
+    /// `on_occupancy_change`'s old-state removal and new-state insertion.
+    fn update_membership(&mut self, site_idx: usize, state: u8, seed: u64, insert: bool) {
+        if state == layout::VACANT {
+            for (species, &bit) in SPECIES_BITS.iter().enumerate() {
+                let bucket = site_bucket(site_idx, bit, seed);
+                if insert {
+                    self.vacant_sets[species].insert(site_idx, bucket);
+                } else {
+                    self.vacant_sets[species].remove(site_idx, bucket);
+                }
+            }
+        } else if let Some(species) = species_index(state) {
+            let bucket = site_bucket(site_idx, state, seed);
+            if insert {
+                self.occupied_sets[species].insert(site_idx, bucket);
+            } else {
+                self.occupied_sets[species].remove(site_idx, bucket);
+            }
+        }
     }
 
     fn add_pair(&mut self, a: u8, b: u8) {
@@ -378,25 +398,8 @@ impl OccupancyCounters {
             return;
         }
 
-        if old_state == layout::VACANT {
-            for (species, &bit) in SPECIES_BITS.iter().enumerate() {
-                let bucket = site_bucket(site_idx, bit, seed);
-                self.vacant_sets[species].remove(site_idx, bucket);
-            }
-        } else if let Some(species) = species_index(old_state) {
-            let bucket = site_bucket(site_idx, old_state, seed);
-            self.occupied_sets[species].remove(site_idx, bucket);
-        }
-
-        if new_state == layout::VACANT {
-            for (species, &bit) in SPECIES_BITS.iter().enumerate() {
-                let bucket = site_bucket(site_idx, bit, seed);
-                self.vacant_sets[species].insert(site_idx, bucket);
-            }
-        } else if let Some(species) = species_index(new_state) {
-            let bucket = site_bucket(site_idx, new_state, seed);
-            self.occupied_sets[species].insert(site_idx, bucket);
-        }
+        self.update_membership(site_idx, old_state, seed, false);
+        self.update_membership(site_idx, new_state, seed, true);
 
         // Re-evaluate every pair touching this site (up to all of its
         // neighbors this time -- unlike `new`'s full-scan pass, this only
@@ -462,16 +465,28 @@ impl OccupancyCounters {
         }
     }
 
-    /// Sum of every template's live weight (`rate_q16 * live_count *
-    /// pressure_factor`) -- the total propensity the exponential
-    /// waiting-time draw needs. Zero means the domain has gone fully
-    /// quiescent: no template has a site currently matching its reactant
-    /// pattern (or every matching template's gas-phase pressure is zero).
-    pub fn total_propensity(&self, templates: &[ReactionRecord], pressures: &Pressures) -> f64 {
+    /// Per-template live weight (`rate_q16 * live_count * pressure_factor`)
+    /// -- the one place this formula is computed. `total_propensity` and
+    /// `select_event` both need it every step (the former for the
+    /// exponential waiting-time draw, the latter for the weighted
+    /// reaction-selection draw); a caller doing both in the same step
+    /// (like `engine.rs`'s Gillespie loop) should call this once and pass
+    /// the result to both, rather than let each recompute it -- see
+    /// `select_event`'s doc comment.
+    pub(crate) fn weights(&self, templates: &[ReactionRecord], pressures: &Pressures) -> Vec<f64> {
         templates
             .iter()
             .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64 * pressure_factor(t, pressures))
-            .sum()
+            .collect()
+    }
+
+    /// Sum of every template's live weight -- the total propensity the
+    /// exponential waiting-time draw needs. Zero means the domain has gone
+    /// fully quiescent: no template has a site currently matching its
+    /// reactant pattern (or every matching template's gas-phase pressure
+    /// is zero).
+    pub fn total_propensity(&self, templates: &[ReactionRecord], pressures: &Pressures) -> f64 {
+        self.weights(templates, pressures).iter().sum()
     }
 
     /// Select which reaction fires next (weighted by `rate_q16 *
@@ -482,20 +497,24 @@ impl OccupancyCounters {
     /// `on_occupancy_change` per touched site. Returns `None` when every
     /// template's live weight is zero (domain quiescent, same semantics
     /// as `gillespie::GillespieDomain::step`).
+    ///
+    /// Takes the already-computed per-template `weights` (see `weights`)
+    /// and their `total` rather than recomputing them from scratch --
+    /// `engine.rs`'s Gillespie loop already needs `total` for the
+    /// waiting-time draw before it gets here, so passing both through
+    /// avoids a second O(template count) pass (and a second heap
+    /// allocation) over the same formula every single fired event.
+    #[allow(clippy::too_many_arguments)]
     pub fn select_event(
         &self,
         templates: &[ReactionRecord],
+        weights: &[f64],
+        total: f64,
         patch_data: &[u8],
         width: usize,
         rows_in_band: usize,
         rng: &mut Rng,
-        pressures: &Pressures,
     ) -> Option<(u32, usize, Option<usize>)> {
-        let weights: Vec<f64> = templates
-            .iter()
-            .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64 * pressure_factor(t, pressures))
-            .collect();
-        let total: f64 = weights.iter().sum();
         if total <= 0.0 {
             return None;
         }
@@ -611,6 +630,26 @@ mod tests {
 
     fn rng() -> Rng {
         Rng::seeded(42)
+    }
+
+    /// Test convenience wrapper matching `select_event`'s pre-refactor
+    /// signature: computes `weights`/`total` itself rather than making
+    /// every test call site do it. Production code (`engine.rs`) computes
+    /// them once per step and passes both through instead -- see
+    /// `select_event`'s doc comment for why that matters there but not here.
+    #[allow(clippy::too_many_arguments)]
+    fn select(
+        counters: &OccupancyCounters,
+        templates: &[ReactionRecord],
+        patch_data: &[u8],
+        width: usize,
+        rows_in_band: usize,
+        rng: &mut Rng,
+        pressures: &Pressures,
+    ) -> Option<(u32, usize, Option<usize>)> {
+        let weights = counters.weights(templates, pressures);
+        let total: f64 = weights.iter().sum();
+        counters.select_event(templates, &weights, total, patch_data, width, rows_in_band, rng)
     }
 
     #[test]
@@ -872,7 +911,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
+                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 assert_eq!(site, o_site);
                 assert_eq!(site_b, None);
@@ -897,7 +936,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
+                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 assert_eq!(site, vacant_site);
                 assert_eq!(site_b, None);
@@ -932,7 +971,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
+                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);
@@ -965,7 +1004,7 @@ mod tests {
         ];
         let mut rng = rng();
         assert_eq!(
-            counters.select_event(&templates, &data, width, 4, &mut rng, &Pressures::ones()),
+            select(&counters, &templates, &data, width, 4, &mut rng, &Pressures::ones()),
             None
         );
     }
@@ -1006,7 +1045,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
+                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 let site_b = site_b.expect("dissociative adsorption must return a second site");
                 assert_eq!(data[site_a], VACANT);
@@ -1200,7 +1239,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
+                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);

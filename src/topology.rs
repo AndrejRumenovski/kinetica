@@ -74,16 +74,14 @@ const ODD_ROW_DELTAS: [(isize, isize); MAX_NEIGHBORS] = [
     (1, 1), // SW, SE
 ];
 
-/// Every grid-adjacent neighbor of `idx` that exists within `width` x
-/// `rows`, in the fixed `[W, E, NW, NE, SW, SE]` order (existing
-/// neighbors packed at the front of the array; the rest `None`). Used
-/// wherever *all* adjacent sites of one site need visiting (bimolecular
-/// partner search, incremental counter updates after a single site
-/// changes).
+/// Shared walk: bounds-check each of `deltas` against `idx`'s `(row, col)`
+/// and pack the surviving neighbors at the front of a fixed-size array --
+/// the common tail of both `all_neighbors` (given all six deltas) and
+/// `forward_neighbors` (given the canonical half). `deltas.len()` is at
+/// most `MAX_NEIGHBORS`, so `out` never overflows.
 #[inline]
-pub fn all_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; MAX_NEIGHBORS] {
+fn gather(idx: usize, width: usize, rows: usize, deltas: &[(isize, isize)]) -> [Option<usize>; MAX_NEIGHBORS] {
     let (row, col) = row_col(idx, width);
-    let deltas = if row % 2 == 0 { &EVEN_ROW_DELTAS } else { &ODD_ROW_DELTAS };
 
     let mut out = [None; MAX_NEIGHBORS];
     let mut n = 0;
@@ -96,6 +94,19 @@ pub fn all_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; M
     out
 }
 
+/// Every grid-adjacent neighbor of `idx` that exists within `width` x
+/// `rows`, in the fixed `[W, E, NW, NE, SW, SE]` order (existing
+/// neighbors packed at the front of the array; the rest `None`). Used
+/// wherever *all* adjacent sites of one site need visiting (bimolecular
+/// partner search, incremental counter updates after a single site
+/// changes).
+#[inline]
+pub fn all_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; MAX_NEIGHBORS] {
+    let row = idx / width;
+    let deltas = if row.is_multiple_of(2) { &EVEN_ROW_DELTAS } else { &ODD_ROW_DELTAS };
+    gather(idx, width, rows, deltas)
+}
+
 /// The canonical *half* of `all_neighbors` -- E, SW, SE -- for a
 /// full-grid scan that must visit every unordered adjacent pair exactly
 /// once (not twice, once from each side). Checking all six from every
@@ -105,22 +116,13 @@ pub fn all_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; M
 /// the reciprocity/edge-count invariant this relies on.
 #[inline]
 pub fn forward_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; MAX_NEIGHBORS] {
-    let (row, col) = row_col(idx, width);
-    let deltas: [(isize, isize); 3] = if row % 2 == 0 {
+    let row = idx / width;
+    let deltas: [(isize, isize); 3] = if row.is_multiple_of(2) {
         [(0, 1), (1, -1), (1, 0)] // E, SW, SE
     } else {
         [(0, 1), (1, 0), (1, 1)] // E, SW, SE
     };
-
-    let mut out = [None; MAX_NEIGHBORS];
-    let mut n = 0;
-    for &(dr, dc) in &deltas {
-        if let Some(neighbor) = try_idx(row as isize + dr, col as isize + dc, width, rows) {
-            out[n] = Some(neighbor);
-            n += 1;
-        }
-    }
-    out
+    gather(idx, width, rows, &deltas)
 }
 
 #[cfg(test)]

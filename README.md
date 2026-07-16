@@ -106,14 +106,20 @@ template scales with), plus a live count of adjacent pairs for each
 bimolecular reaction type (O\*/CO\*, H\*/H\*, H\*/OH\*, and a shared
 adjacent-vacant-pair count every dissociative-adsorption reaction draws
 from) — all updated in O(1) amortized time per fired event, never
-rescanned. Site selection uses
-bounded rejection sampling (try a random candidate, verify it actually
-matches, retry on a miss, fall back to a guaranteed deterministic scan
-after enough misses): simpler than an exact O(1) free-list per bucket, and
-still never fires on the wrong site, at a known, honest cost — a bucket
-that's extremely sparse relative to the whole patch can need many
-attempts. The natural next optimization, if that ever matters in practice,
-is an explicit per-bucket free-list; not built yet.
+rescanned. Site selection for bucketed (monomolecular) reactions is an
+exact, guaranteed-O(1) live free-list (`BucketedSet`: a dense array of
+matching site indices plus an O(1) position lookup for removal), not
+rejection sampling — insert/remove/random-pick are all O(1) with no
+retry loop, trading a small amount of extra memory (the position lookup,
+sized to the patch, once per species/vacant-or-occupied) for a
+worst-case time guarantee. Bimolecular pair search still uses bounded
+rejection sampling (try a random candidate, verify it actually matches,
+retry on a miss, fall back to a guaranteed deterministic scan after
+enough misses) — real bimolecular records are kept un-bucketed (there
+are only a handful), so there's no per-bucket structure for a pair
+free-list to key off without inventing a separate edge-indexed
+structure, left as a future item of its own if it ever shows up as a
+bottleneck in practice.
 
 **Both engines share the on-disk `ReactionLutBlock` format** but interpret
 it differently, so `reactions.lut` now starts with an 8-byte magic header
