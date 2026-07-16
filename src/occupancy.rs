@@ -24,16 +24,32 @@
 //! index -- never stored, so there is no per-site memory cost beyond the
 //! base occupancy byte `layout::SiteLattice` already carries.
 //!
-//! Site/pair selection uses bounded rejection sampling (pick a uniformly
-//! random candidate, retry on a miss) rather than an exact O(1) live
-//! free-list per bucket. This is simpler and correct -- a fired reaction
-//! never touches the wrong site, because every candidate is verified
-//! against the live lattice state before being accepted -- at a known,
-//! honest cost: if a bucket's live count is extremely sparse relative to
-//! the whole patch, rejection can need many attempts before (or a full
-//! deterministic scan after) finding a match. The natural next
-//! optimization, if that ever matters in practice, is explicit per-bucket
-//! free-lists (a "sparse set" with O(1) removal) -- not built this pass.
+//! **Site selection for bucketed (monomolecular) reactions is an exact,
+//! guaranteed-O(1) live free-list**, not rejection sampling: `BucketedSet`
+//! is a "sparse set" per `(species, bucket)` -- a dense `Vec<u32>` of the
+//! matching site indices plus a `site_idx -> position`-in-dense lookup --
+//! so insert/remove/random-pick are all O(1), with no retry loop and no
+//! pathological case when a bucket is sparse. This replaced an earlier
+//! bounded-rejection design (pick a uniformly random candidate, retry on a
+//! miss, fall back to a deterministic scan after enough misses): correct,
+//! but its cost wasn't bounded -- a bucket with a tiny live fraction of the
+//! patch could burn many wasted draws before landing a hit. The free-list
+//! trades that uncertainty for O(site count) extra memory (the `position`
+//! lookup, sized to the patch once per species/vacant-or-occupied) -- a
+//! deliberate space-for-a-worst-case-time-guarantee trade, not free.
+//!
+//! **Bimolecular pair selection still uses bounded rejection** (see
+//! `find_bimolecular_pair`, `MAX_REJECTION_ATTEMPTS`). `oc20_ingest` keeps
+//! real bimolecular barriers as a handful of un-bucketed records (no
+//! `bin_id`), so there is no per-bucket structure for a pair free-list to
+//! key off in the first place -- building one would mean inventing a
+//! separate edge-indexed sparse set (keyed by, say, `site_idx * 3 +
+//! forward-neighbor-direction`), a materially different data structure
+//! from the one this pass adds. Left as a future item of its own if
+//! bimolecular pair search ever actually shows up as a bottleneck -- it
+//! hasn't (real bimolecular record counts are small, and pairs are rarely
+//! anywhere near as sparse as the worst-case single-bucket scenario the
+//! free-list above was built for).
 
 use crate::gillespie::Rng;
 use crate::layout::{self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, NUM_SPECIES, SPECIES_BITS};
@@ -47,13 +63,78 @@ use crate::layout::{self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, NUM_SPEC
 pub const BUCKETS_PER_SPECIES: usize = 4;
 
 /// Cap on rejection-sampling attempts before falling back to a
-/// deterministic full scan. Large enough that the common case (a bucket
-/// with a non-trivial fraction of the patch matching) essentially never
-/// hits it, small enough that the fallback -- guaranteed to succeed, since
-/// callers only search when the corresponding live count is already known
-/// to be positive -- kicks in quickly for genuinely sparse cases rather
-/// than burning many wasted draws first.
+/// deterministic full scan, for **bimolecular pair search only**
+/// (`find_bimolecular_pair`) -- monomolecular site selection no longer
+/// rejection-samples at all, see `BucketedSet`. Large enough that the
+/// common case (a pair pool with a non-trivial fraction of the patch
+/// matching) essentially never hits it, small enough that the fallback --
+/// guaranteed to succeed, since callers only search when the corresponding
+/// live count is already known to be positive -- kicks in quickly for
+/// genuinely sparse cases rather than burning many wasted draws first.
 const MAX_REJECTION_ATTEMPTS: u32 = 256;
+
+/// A "sparse set" of lattice site indices, giving O(1) insert, O(1)
+/// swap-remove, and O(1) uniform-random pick over whichever sites are
+/// currently members -- the free-list `OccupancyCounters` uses in place of
+/// rejection sampling for bucketed (monomolecular) reactant lookups.
+/// `BUCKETS_PER_SPECIES` independent dense lists, one per quantile bucket,
+/// sharing a single `position` lookup since a site is a member of at most
+/// one bucket's list at a time for a given species+vacant-or-occupied
+/// category (which bucket that is doesn't need to be stored -- it's always
+/// recoverable from `site_bucket`, so callers pass it in rather than this
+/// type tracking it redundantly).
+#[derive(Debug)]
+struct BucketedSet {
+    dense: [Vec<u32>; BUCKETS_PER_SPECIES],
+    /// `position[site_idx]`: that site's index within whichever bucket's
+    /// `dense` list currently holds it. Only meaningful while the site is
+    /// actually a member of *some* bucket in this set -- callers never
+    /// consult it otherwise.
+    position: Vec<u32>,
+}
+
+impl BucketedSet {
+    fn new(site_count: usize) -> Self {
+        BucketedSet {
+            dense: std::array::from_fn(|_| Vec::new()),
+            position: vec![u32::MAX; site_count],
+        }
+    }
+
+    fn insert(&mut self, site_idx: usize, bucket: usize) {
+        let pos = self.dense[bucket].len() as u32;
+        self.dense[bucket].push(site_idx as u32);
+        self.position[site_idx] = pos;
+    }
+
+    /// Swap-remove `site_idx` from `bucket`'s dense list: move the last
+    /// element into the removed slot (O(1), no shifting) and fix up that
+    /// moved element's recorded position.
+    fn remove(&mut self, site_idx: usize, bucket: usize) {
+        let pos = self.position[site_idx] as usize;
+        let last = self.dense[bucket].len() - 1;
+        if pos != last {
+            let moved = self.dense[bucket][last];
+            self.dense[bucket][pos] = moved;
+            self.position[moved as usize] = pos as u32;
+        }
+        self.dense[bucket].pop();
+    }
+
+    fn len(&self, bucket: usize) -> usize {
+        self.dense[bucket].len()
+    }
+
+    /// Uniformly random member of `bucket`'s live set, or `None` if empty.
+    /// The whole point of this type: O(1), no retry loop, ever.
+    fn pick(&self, bucket: usize, rng: &mut Rng) -> Option<usize> {
+        let d = &self.dense[bucket];
+        if d.is_empty() {
+            return None;
+        }
+        Some(d[rng.next_u32_below(d.len() as u32) as usize] as usize)
+    }
+}
 
 fn species_index(species_bit: u8) -> Option<usize> {
     SPECIES_BITS.iter().position(|&b| b == species_bit)
@@ -157,14 +238,18 @@ fn pair_matches(a: u8, b: u8, x: u8, y: u8) -> bool {
 /// a patch starts (`new`), then kept in sync in O(1) amortized time per
 /// event (`on_occupancy_change`) rather than ever rescanned.
 pub struct OccupancyCounters {
-    /// `vacant_count[species][bucket]`: how many sites assigned to
-    /// `(species, bucket)` are currently vacant -- the live count an
-    /// adsorption template for that species/bucket fires against.
-    vacant_count: [[u32; BUCKETS_PER_SPECIES]; NUM_SPECIES],
-    /// `occupied_count[species][bucket]`: how many sites assigned to
-    /// `(species, bucket)` are currently occupied *by that species* --
-    /// the live count a desorption template fires against.
-    occupied_count: [[u32; BUCKETS_PER_SPECIES]; NUM_SPECIES],
+    /// `vacant_sets[species]`: free-list of currently-vacant sites,
+    /// bucketed by that species' `site_bucket` hash -- the live pool an
+    /// adsorption template for that species/bucket fires against. A single
+    /// vacant site is a member of all `NUM_SPECIES` of these simultaneously
+    /// (once per species, generally in a different bucket per species,
+    /// since any species could in principle adsorb there).
+    vacant_sets: [BucketedSet; NUM_SPECIES],
+    /// `occupied_sets[species]`: free-list of sites currently occupied *by
+    /// that species*, bucketed the same way -- the live pool a desorption
+    /// template fires against. A site is a member of at most one of these
+    /// at a time (whichever species currently occupies it, if any).
+    occupied_sets: [BucketedSet; NUM_SPECIES],
     /// Live count of adjacent (O*, CO*) site pairs -- CO-oxidation's
     /// propensity. Not bucketed: `oc20_ingest` keeps bimolecular real
     /// barriers as individually-real, un-averaged records (there are only
@@ -199,9 +284,10 @@ impl OccupancyCounters {
     /// checking every neighbor from every site would double-count each
     /// pair, once from each side.
     pub fn new(patch_data: &[u8], width: usize, seed: u64) -> Self {
+        let site_count = patch_data.len();
         let mut counters = OccupancyCounters {
-            vacant_count: [[0; BUCKETS_PER_SPECIES]; NUM_SPECIES],
-            occupied_count: [[0; BUCKETS_PER_SPECIES]; NUM_SPECIES],
+            vacant_sets: std::array::from_fn(|_| BucketedSet::new(site_count)),
+            occupied_sets: std::array::from_fn(|_| BucketedSet::new(site_count)),
             co_ox_pairs: 0,
             h2_pairs: 0,
             h_oh_pairs: 0,
@@ -217,11 +303,11 @@ impl OccupancyCounters {
             if state == layout::VACANT {
                 for (species, &bit) in SPECIES_BITS.iter().enumerate() {
                     let bucket = site_bucket(site_idx, bit, seed);
-                    counters.vacant_count[species][bucket] += 1;
+                    counters.vacant_sets[species].insert(site_idx, bucket);
                 }
             } else if let Some(species) = species_index(state) {
                 let bucket = site_bucket(site_idx, state, seed);
-                counters.occupied_count[species][bucket] += 1;
+                counters.occupied_sets[species].insert(site_idx, bucket);
             }
             // Any other bit pattern is a corrupted/unknown site state
             // (see `layout::OCCUPANCY_MASK`'s doc comment) -- not counted
@@ -295,23 +381,21 @@ impl OccupancyCounters {
         if old_state == layout::VACANT {
             for (species, &bit) in SPECIES_BITS.iter().enumerate() {
                 let bucket = site_bucket(site_idx, bit, seed);
-                self.vacant_count[species][bucket] =
-                    self.vacant_count[species][bucket].saturating_sub(1);
+                self.vacant_sets[species].remove(site_idx, bucket);
             }
         } else if let Some(species) = species_index(old_state) {
             let bucket = site_bucket(site_idx, old_state, seed);
-            self.occupied_count[species][bucket] =
-                self.occupied_count[species][bucket].saturating_sub(1);
+            self.occupied_sets[species].remove(site_idx, bucket);
         }
 
         if new_state == layout::VACANT {
             for (species, &bit) in SPECIES_BITS.iter().enumerate() {
                 let bucket = site_bucket(site_idx, bit, seed);
-                self.vacant_count[species][bucket] += 1;
+                self.vacant_sets[species].insert(site_idx, bucket);
             }
         } else if let Some(species) = species_index(new_state) {
             let bucket = site_bucket(site_idx, new_state, seed);
-            self.occupied_count[species][bucket] += 1;
+            self.occupied_sets[species].insert(site_idx, bucket);
         }
 
         // Re-evaluate every pair touching this site (up to all of its
@@ -368,11 +452,11 @@ impl OccupancyCounters {
                 // Adsorption: reactant is VACANT, species comes from the
                 // product side.
                 species_index(product_mask)
-                    .map(|s| self.vacant_count[s][bucket] as u64)
+                    .map(|s| self.vacant_sets[s].len(bucket) as u64)
                     .unwrap_or(0)
             } else {
                 species_index(reactant_mask)
-                    .map(|s| self.occupied_count[s][bucket] as u64)
+                    .map(|s| self.occupied_sets[s].len(bucket) as u64)
                     .unwrap_or(0)
             }
         }
@@ -398,7 +482,6 @@ impl OccupancyCounters {
     /// `on_occupancy_change` per touched site. Returns `None` when every
     /// template's live weight is zero (domain quiescent, same semantics
     /// as `gillespie::GillespieDomain::step`).
-    #[allow(clippy::too_many_arguments)]
     pub fn select_event(
         &self,
         templates: &[ReactionRecord],
@@ -406,7 +489,6 @@ impl OccupancyCounters {
         width: usize,
         rows_in_band: usize,
         rng: &mut Rng,
-        seed: u64,
         pressures: &Pressures,
     ) -> Option<(u32, usize, Option<usize>)> {
         let weights: Vec<f64> = templates
@@ -435,45 +517,31 @@ impl OccupancyCounters {
                 self.find_bimolecular_pair(template, patch_data, width, rows_in_band, rng)?;
             Some((chosen as u32, site_a, Some(site_b)))
         } else {
-            let site = self.find_monomolecular_site(template, patch_data, seed, rng)?;
+            let site = self.find_monomolecular_site(template, rng)?;
             Some((chosen as u32, site, None))
         }
     }
 
-    fn find_monomolecular_site(
-        &self,
-        template: &ReactionRecord,
-        patch_data: &[u8],
-        seed: u64,
-        rng: &mut Rng,
-    ) -> Option<usize> {
+    /// O(1): looks up the exact free-list `live_count` already used to
+    /// weight this template (see `BucketedSet`) and picks a uniformly
+    /// random member. No verification pass against `patch_data` needed --
+    /// unlike the rejection-sampling design this replaced, set membership
+    /// *is* the ground truth (kept exactly in sync by `new`/
+    /// `on_occupancy_change`), not a guess to be checked.
+    fn find_monomolecular_site(&self, template: &ReactionRecord, rng: &mut Rng) -> Option<usize> {
         let reactant_mask = template.transition_a >> 4;
         let product_mask = template.transition_a & 0x0F;
-        let (expected_state, species_bit) = if reactant_mask == 0 {
-            (layout::VACANT, product_mask)
-        } else {
-            (reactant_mask, reactant_mask)
-        };
         let bucket = template.bin_id as usize;
-        let n = patch_data.len();
-        if n == 0 {
+        if bucket >= BUCKETS_PER_SPECIES {
             return None;
         }
-
-        for _ in 0..MAX_REJECTION_ATTEMPTS {
-            let candidate = rng.next_u32_below(n as u32) as usize;
-            if patch_data[candidate] == expected_state
-                && site_bucket(candidate, species_bit, seed) == bucket
-            {
-                return Some(candidate);
-            }
+        if reactant_mask == 0 {
+            let species = species_index(product_mask)?;
+            self.vacant_sets[species].pick(bucket, rng)
+        } else {
+            let species = species_index(reactant_mask)?;
+            self.occupied_sets[species].pick(bucket, rng)
         }
-        // Deterministic fallback: guaranteed to find a match, since
-        // `select_event` only searches for a template whose `live_count`
-        // (computed from these exact same counters) was already positive.
-        (0..n).find(|&site| {
-            patch_data[site] == expected_state && site_bucket(site, species_bit, seed) == bucket
-        })
     }
 
     fn find_bimolecular_pair(
@@ -502,10 +570,12 @@ impl OccupancyCounters {
                 return Some((candidate, partner));
             }
         }
-        // Deterministic fallback, same guarantee as the monomolecular
-        // case: `co_ox_pairs`/`h2_pairs`/`vacant_pairs` (whichever backs
-        // this template's `live_count`) being positive means a matching
-        // pair genuinely exists somewhere in the patch.
+        // Deterministic fallback: `co_ox_pairs`/`h2_pairs`/`vacant_pairs`
+        // (whichever backs this template's `live_count`) being positive
+        // means a matching pair genuinely exists somewhere in the patch --
+        // guaranteed to succeed, same as `find_monomolecular_site`'s
+        // free-list lookup, just via a scan rather than an O(1) pick since
+        // pairs aren't bucketed (see the module-level doc comment).
         (0..n).find_map(|candidate| {
             if patch_data[candidate] != species_a_bit {
                 return None;
@@ -587,22 +657,30 @@ mod tests {
         OccupancyCounters::new(patch_data, width, seed)
     }
 
+    fn vacant_total(counters: &OccupancyCounters, species: usize) -> u32 {
+        (0..BUCKETS_PER_SPECIES).map(|b| counters.vacant_sets[species].len(b) as u32).sum()
+    }
+
+    fn occupied_total(counters: &OccupancyCounters, species: usize) -> u32 {
+        (0..BUCKETS_PER_SPECIES).map(|b| counters.occupied_sets[species].len(b) as u32).sum()
+    }
+
     #[test]
     fn new_counts_vacant_and_occupied_sites_correctly() {
         let width = 4;
         let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
         let counters = OccupancyCounters::new(&data, width, 99);
 
-        let total_vacant: u32 = (0..3).map(|s| counters.vacant_count[s][0..].iter().sum::<u32>()).sum();
+        let total_vacant: u32 = (0..3).map(|s| vacant_total(&counters, s)).sum();
         // Every vacant site contributes to all 3 species' vacant counts.
         let vacant_sites = data.iter().filter(|&&s| s == VACANT).count() as u32;
         assert_eq!(total_vacant, vacant_sites * 3);
 
-        let o_occupied: u32 = counters.occupied_count[0].iter().sum();
+        let o_occupied = occupied_total(&counters, 0);
         assert_eq!(o_occupied, data.iter().filter(|&&s| s == ADS_O).count() as u32);
-        let h_occupied: u32 = counters.occupied_count[1].iter().sum();
+        let h_occupied = occupied_total(&counters, 1);
         assert_eq!(h_occupied, data.iter().filter(|&&s| s == ADS_H).count() as u32);
-        let co_occupied: u32 = counters.occupied_count[2].iter().sum();
+        let co_occupied = occupied_total(&counters, 2);
         assert_eq!(co_occupied, data.iter().filter(|&&s| s == ADS_CO).count() as u32);
     }
 
@@ -641,10 +719,56 @@ mod tests {
         }
 
         let brute = brute_force_counters(&data, width, seed);
-        assert_eq!(counters.vacant_count, brute.vacant_count);
-        assert_eq!(counters.occupied_count, brute.occupied_count);
+        // Compare exact set *membership*, not raw dense-array order --
+        // swap-remove reorders a bucket's dense list, so two `BucketedSet`s
+        // holding the same sites can differ in element order depending on
+        // insert/remove history. Sorting is a stronger check than the old
+        // count-only comparison this replaced: it now also catches a bug
+        // that miscounted the same total but selected the wrong sites.
+        fn sorted_members(set: &BucketedSet, bucket: usize) -> Vec<u32> {
+            let mut v = set.dense[bucket].clone();
+            v.sort_unstable();
+            v
+        }
+        for species in 0..NUM_SPECIES {
+            for bucket in 0..BUCKETS_PER_SPECIES {
+                assert_eq!(
+                    sorted_members(&counters.vacant_sets[species], bucket),
+                    sorted_members(&brute.vacant_sets[species], bucket),
+                    "vacant_sets[{species}][{bucket}] diverged from brute force"
+                );
+                assert_eq!(
+                    sorted_members(&counters.occupied_sets[species], bucket),
+                    sorted_members(&brute.occupied_sets[species], bucket),
+                    "occupied_sets[{species}][{bucket}] diverged from brute force"
+                );
+            }
+        }
         assert_eq!(counters.co_ox_pairs, brute.co_ox_pairs);
         assert_eq!(counters.h2_pairs, brute.h2_pairs);
+    }
+
+    #[test]
+    fn bucketed_set_pick_and_len_reflect_swap_remove_reordering() {
+        let mut set = BucketedSet::new(10);
+        for site in [1usize, 4, 7] {
+            set.insert(site, 2);
+        }
+        assert_eq!(set.len(2), 3);
+
+        // Remove the middle element by insertion order -- exercises the
+        // swap-with-last path, not just the simple "remove the last" case.
+        set.remove(4, 2);
+        assert_eq!(set.len(2), 2);
+        let mut remaining = set.dense[2].clone();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec![1, 7]);
+
+        set.remove(1, 2);
+        set.remove(7, 2);
+        assert_eq!(set.len(2), 0);
+        let mut rng = Rng::seeded(3);
+        assert_eq!(set.pick(2, &mut rng), None);
     }
 
     fn ads_template(species_bit: u8, bucket: u8, rate: u32) -> ReactionRecord {
@@ -748,7 +872,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 assert_eq!(site, o_site);
                 assert_eq!(site_b, None);
@@ -773,7 +897,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 assert_eq!(site, vacant_site);
                 assert_eq!(site_b, None);
@@ -808,7 +932,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);
@@ -841,7 +965,7 @@ mod tests {
         ];
         let mut rng = rng();
         assert_eq!(
-            counters.select_event(&templates, &data, width, 4, &mut rng, 1, &Pressures::ones()),
+            counters.select_event(&templates, &data, width, 4, &mut rng, &Pressures::ones()),
             None
         );
     }
@@ -882,7 +1006,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 let site_b = site_b.expect("dissociative adsorption must return a second site");
                 assert_eq!(data[site_a], VACANT);
@@ -1076,7 +1200,7 @@ mod tests {
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) =
-                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+                counters.select_event(&templates, &data, width, height, &mut rng, &Pressures::ones())
             {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);

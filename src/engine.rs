@@ -286,7 +286,7 @@ fn run_patch_occupancy_gated(
         sim_time += tau;
 
         let Some((reaction_id, site_a, site_b)) =
-            counters.select_event(&templates, data, width, rows_in_band, &mut rng, seed, pressures)
+            counters.select_event(&templates, data, width, rows_in_band, &mut rng, pressures)
         else {
             break; // structurally unreachable given total > 0 above, but handled defensively
         };
