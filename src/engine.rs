@@ -739,6 +739,47 @@ mod tests {
         let _ = std::fs::remove_file(&trajectory_path);
     }
 
+    /// KNOWN BUG, DOCUMENTED NOT FIXED YET: this test currently asserts the
+    /// *buggy* behavior, not the correct one -- it exists to pin down a
+    /// confirmed correctness gap found in a code audit, not to guard
+    /// correct behavior. `apply_migration_occupancy_gated` mirrors a
+    /// boundary reaction into the *neighboring* patch, but there is no
+    /// separate ghost/halo row for that mirror to land in
+    /// (`SiteLattice::split_row_bands_mut` produces strictly
+    /// non-overlapping bands) -- so it overwrites the neighbor's own real,
+    /// physically distinct edge-row site instead. Row N (one patch's last
+    /// row) and row N+1 (the next patch's first row) are two different
+    /// lattice sites; this mechanism currently forces them to hold
+    /// identical state after any boundary reaction, silently corrupting
+    /// the receiving patch's genuine occupancy. Invisible to every other
+    /// test in this file, since none of them check anything about
+    /// boundary-adjacent-but-distinct sites -- they only assert "no site
+    /// holds more than one species bit," which this bug never violates.
+    /// TODO once fixed (a real per-boundary ghost buffer, decoupled from
+    /// each patch's own real `data` slice): invert this assertion to
+    /// `assert_eq!(data[0], ADS_H)` -- the real site must NOT change.
+    #[test]
+    fn known_bug_boundary_migration_currently_overwrites_neighbors_real_site() {
+        use crate::layout::{ADS_H, VACANT};
+
+        let width = 4;
+        let rows_in_band = 2;
+        let mut data = vec![ADS_H, ADS_H, ADS_H, ADS_H, VACANT, VACANT, VACANT, VACANT];
+        let seed = 1u64;
+        let mut counters = OccupancyCounters::new(&data, width, seed);
+
+        // Simulates patch 0's row 1 (a different, merely-adjacent physical
+        // site) sending "I just became VACANT" after an O* desorbed there.
+        let ev = MigrationEvent { col: 0, state: VACANT };
+        apply_migration_occupancy_gated(&mut data, width, rows_in_band, 0, ev, &mut counters, seed);
+
+        assert_eq!(
+            data[0], VACANT,
+            "documents the bug: data[0] was ADS_H (this patch's own real site), now silently \
+             overwritten by a different site's mirrored state"
+        );
+    }
+
     /// Propensity must genuinely track coverage, not just avoid corrupting
     /// occupancy: a lattice with exactly one O*-occupied site and only a
     /// desorption template (no adsorption to replenish it) must desorb
