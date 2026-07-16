@@ -30,16 +30,20 @@ Three passes:
    new record (this happens for the O2/H2 entries, which use a
    stoichiometry the bulk sweep's strict filter rejects).
 
-   This same sweep also picks out a third, disjoint category: real
-   *bimolecular* (two-site) recombination barriers -- see
-   `BIMOLECULAR_PATTERNS` for the exact reactions matched, currently
-   `O* + CO* -> CO2 + 2*` (e.g. `StreibelMicrokinetic2021`,
+   This same sweep also picks out two further, disjoint categories: real
+   *bimolecular* (two-site) barriers, in either direction --
+   `RECOMBINATION_PATTERNS` (both sites occupied -> gas + 2 vacant),
+   currently `O* + CO* -> CO2 + 2*` (e.g. `StreibelMicrokinetic2021`,
    ~0.98-1.21 eV on Pd) and `2 H* -> H2 + 2*` (e.g. "Dynamics and
-   Hysteresis of Hydrogen Interaction...", ~0.35 eV). These can't be
-   folded into the single-species `OC20E002` format (they consume two
-   adsorbed species from two different sites in one event), so they're
-   collected separately and written out via `write_bimolecular_records`
-   into the parallel `OC20BI01` format -- see `oc20e_format.py`.
+   Hysteresis of Hydrogen Interaction...", ~0.35 eV); and
+   `DISSOCIATIVE_PATTERNS` (both sites vacant -> gas dissociates onto
+   them), currently `2* + H2O(g) -> H* + OH*` (water splitting,
+   ~1.01 eV). Neither can be folded into the single-species `OC20E003`
+   format (they consume/produce two adsorbed species across two different
+   sites in one event), so they're collected separately and written out
+   via `write_bimolecular_records` into the parallel `OC20BI03` format,
+   tagged with which direction they were measured in -- see
+   `oc20e_format.py`.
 """
 
 import argparse
@@ -59,7 +63,9 @@ from oc20e_format import (
 API_URL = "https://api.catalysis-hub.org/graphql"
 
 # (species index, gas reactant key, gas stoichiometry, adsorbed product key)
-# Species indices match extract_energies.py / oc20_ingest.rs: 0=O, 1=H, 2=CO.
+# Species indices match extract_energies.py / oc20_ingest.rs: 0=O, 1=H,
+# 2=CO. (3=OH exists in the shared index space but is never sourced via
+# this single-site pattern -- see DISSOCIATIVE_PATTERNS below.)
 SPECIES_PATTERNS = [
     (0, "O2gas", 0.5, "Ostar"),
     (1, "H2gas", 0.5, "Hstar"),
@@ -77,18 +83,19 @@ REAL_BARRIER_PATTERNS = [
     (2, {"star", "COgas"}, "COstar"),
 ]
 
-# Bimolecular (two-site) recombination reactions: every reactant species
+# Bimolecular (two-site) *recombination* reactions: every reactant species
 # clears to vacant, and the products are (a gas molecule) + (freed
-# sites). Each entry is `(species_a, species_b, reactant_stoich,
-# product_key)`; species indices match SPECIES_PATTERNS above (0 = O,
-# 1 = H, 2 = CO). Reactant matching allows an extra zero-stoichiometry
-# "star" key alongside the named species -- this database's records for
-# these exact reactions list it explicitly (e.g.
-# `{"star": 0, "Ostar": 1, "COstar": 1}`) rather than omitting it.
-# Product matching only requires the named gas product be present at
-# ~1.0 stoichiometry; the freed-site count on the product side isn't
-# checked, since some publications omit it.
-BIMOLECULAR_PATTERNS = [
+# sites) -- i.e. the direction `oc20_ingest.rs` builds forward-only, no
+# thermodynamic reverse (see `OC20BI03`'s `is_dissociative = 0`). Each
+# entry is `(species_a, species_b, reactant_stoich, product_key)`; species
+# indices match SPECIES_PATTERNS above. Reactant matching allows an extra
+# zero-stoichiometry "star" key alongside the named species -- this
+# database's records for these exact reactions list it explicitly (e.g.
+# `{"star": 0, "Ostar": 1, "COstar": 1}`) rather than omitting it. Product
+# matching only requires the named gas product be present at ~1.0
+# stoichiometry; the freed-site count on the product side isn't checked,
+# since some publications omit it.
+RECOMBINATION_PATTERNS = [
     # O* + CO* -> CO2 + 2* -- e.g. `StreibelMicrokinetic2021`,
     # "Microkinetic Modeling of Propene Combustion", ~0.98-1.21 eV on Pd.
     (0, 2, {"Ostar": 1.0, "COstar": 1.0}, "CO2gas"),
@@ -101,16 +108,53 @@ BIMOLECULAR_PATTERNS = [
     (1, 1, {"Hstar": 2.0}, "H2gas"),
 ]
 
+# Bimolecular (two-site) *dissociative-adsorption* reactions: two vacant
+# sites plus a gas reactant become two occupied sites -- the reverse
+# shape of RECOMBINATION_PATTERNS, and the one direction where building a
+# real thermodynamic reverse (associative desorption) makes sense, since
+# it's genuinely the same elementary step run backward (see
+# `OC20BI03`'s `is_dissociative = 1`). Each entry is `(species_a,
+# species_b, gas_stoich, product_stoich)`. Homoatomic dissociative
+# adsorption (O2, H2) is *not* listed here -- it's built from the
+# existing single-species SPECIES_PATTERNS energies via
+# `oc20_ingest.rs`'s `DISSOCIATIVE_SPECIES` mechanism instead, since that
+# data already exists; this list is only for reactions with their own
+# standalone real barrier that mechanism can't reach.
+DISSOCIATIVE_PATTERNS = [
+    # 2* + H2O(g) -> H* + OH* -- water splitting/dissociative adsorption,
+    # ~1.01 eV on Pd(111). The textbook first step of surface water
+    # formation/decomposition chemistry.
+    (1, 3, {"H2Ogas": 1.0}, {"Hstar": 1.0, "OHstar": 1.0}),
+]
 
-def match_bimolecular_pattern(reactants, products):
-    """Return `(species_a, species_b)` for the first `BIMOLECULAR_PATTERNS`
-    entry `reactants`/`products` matches, or `None`."""
-    for species_a, species_b, reactant_stoich, product_key in BIMOLECULAR_PATTERNS:
+
+def match_recombination_pattern(reactants, products):
+    """Return `(species_a, species_b)` for the first
+    `RECOMBINATION_PATTERNS` entry `reactants`/`products` matches, or
+    `None`."""
+    for species_a, species_b, reactant_stoich, product_key in RECOMBINATION_PATTERNS:
         if not set(reactants.keys()) <= (set(reactant_stoich.keys()) | {"star"}):
             continue
         if any(abs(reactants.get(k, 0) - v) > 1e-6 for k, v in reactant_stoich.items()):
             continue
         if abs(products.get(product_key, 0) - 1.0) > 1e-6:
+            continue
+        return species_a, species_b
+    return None
+
+
+def match_dissociative_pattern(reactants, products):
+    """Return `(species_a, species_b)` for the first
+    `DISSOCIATIVE_PATTERNS` entry `reactants`/`products` matches, or
+    `None`."""
+    for species_a, species_b, gas_stoich, product_stoich in DISSOCIATIVE_PATTERNS:
+        if not set(reactants.keys()) <= (set(gas_stoich.keys()) | {"star"}):
+            continue
+        if any(abs(reactants.get(k, 0) - v) > 1e-6 for k, v in gas_stoich.items()):
+            continue
+        if set(products.keys()) != set(product_stoich.keys()):
+            continue
+        if any(abs(products.get(k, 0) - v) > 1e-6 for k, v in product_stoich.items()):
             continue
         return species_a, species_b
     return None
@@ -223,10 +267,12 @@ def fetch_real_barrier_records(metal=None, facet=None):
     one of `REAL_BARRIER_PATTERNS`.
 
     `bimolecular_records`: {sid: (species_a, species_b, energy_mev, sid,
-    ea_mev, metal, facet)} for every reaction matching one of
-    `BIMOLECULAR_PATTERNS`. Disjoint from `mono_records` -- a node only
-    ever matches one of the two categories, since the reactant-key sets
-    involved don't overlap.
+    ea_mev, metal, facet, is_dissociative)} for every reaction matching
+    one of `RECOMBINATION_PATTERNS` (is_dissociative=False) or
+    `DISSOCIATIVE_PATTERNS` (is_dissociative=True). Disjoint from
+    `mono_records` and from each other -- a node only ever matches one of
+    the three categories, since the reactant-key sets involved don't
+    overlap.
 
     `metal`/`facet`, when given, are pushed down as server-side filter
     args, same as `fetch_species_records` -- this sweep already scans a
@@ -289,9 +335,9 @@ def fetch_real_barrier_records(metal=None, facet=None):
             if matched:
                 continue
 
-            bimolecular_match = match_bimolecular_pattern(reactants, products)
-            if bimolecular_match is not None:
-                species_a, species_b = bimolecular_match
+            recombination_match = match_recombination_pattern(reactants, products)
+            if recombination_match is not None:
+                species_a, species_b = recombination_match
                 sid = sid_from_id(node["id"])
                 bimolecular_records[sid] = (
                     species_a,
@@ -301,6 +347,23 @@ def fetch_real_barrier_records(metal=None, facet=None):
                     int(round(node["activationEnergy"] * 1000.0)),
                     rec_metal,
                     rec_facet,
+                    False,
+                )
+                continue
+
+            dissociative_match = match_dissociative_pattern(reactants, products)
+            if dissociative_match is not None:
+                species_a, species_b = dissociative_match
+                sid = sid_from_id(node["id"])
+                bimolecular_records[sid] = (
+                    species_a,
+                    species_b,
+                    int(round(energy_ev * 1000.0)),
+                    sid,
+                    int(round(node["activationEnergy"] * 1000.0)),
+                    rec_metal,
+                    rec_facet,
+                    True,
                 )
 
         if not data["pageInfo"]["hasNextPage"]:
@@ -322,8 +385,9 @@ def main():
     parser.add_argument(
         "--bimolecular-out",
         default=None,
-        help="output path for real bimolecular (two-site) recombination "
-        "records [default: <out> with a _bimolecular suffix]",
+        help="output path for real bimolecular (two-site) records, both "
+        "recombination and dissociative-adsorption direction "
+        "[default: <out> with a _bimolecular suffix]",
     )
     parser.add_argument(
         "--limit-per-species",
@@ -335,7 +399,7 @@ def main():
         "--skip-real-barriers",
         action="store_true",
         help="skip the (fast) real-activation-energy sweep (also skips the "
-        "bimolecular recombination sweep, since it rides along the same pass)",
+        "bimolecular sweep, since it rides along the same pass)",
     )
     parser.add_argument(
         "--metal",
@@ -381,9 +445,11 @@ def main():
             f"({upgraded_count} upgraded existing, {new_count} newly added)",
             file=sys.stderr,
         )
+        dissociative_count = sum(1 for rec in bimolecular_records.values() if rec[7])
         print(
-            f"  -> {len(bimolecular_records)} real bimolecular recombination records "
-            "(CO oxidation, H2 recombination)",
+            f"  -> {len(bimolecular_records)} real bimolecular records "
+            f"({len(bimolecular_records) - dissociative_count} recombination: CO oxidation, "
+            f"H2 recombination; {dissociative_count} dissociative adsorption: water splitting)",
             file=sys.stderr,
         )
 

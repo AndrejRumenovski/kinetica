@@ -6,7 +6,10 @@ Format (little-endian):
     magic:        8 bytes  b"OC20E003"
     record_count: u32
     records[count]:
-        species:      u8   (0 = O, 1 = H, 2 = CO)
+        species:      u8   (0 = O, 1 = H, 2 = CO, 3 = OH -- OH is sourced
+                            entirely from the bimolecular water-splitting
+                            reaction below, never from a record in this
+                            format, but shares the same index space)
         energy_mev:   i32  (reaction/adsorption energy, milli-eV)
         sid:          u32  (source system/reaction id, for traceability only)
         has_real_ea:  u8   (1 if `real_ea_mev` is a real DFT-computed
@@ -27,35 +30,51 @@ to a real fcc(111) hex geometry, which this data now targets. v2 added
 `has_real_ea`/`real_ea_mev` on top of v1 (OC20E001), which was just
 (species, energy_mev, sid).
 
-A second, parallel format (`OC20BI02`) carries two-species *bimolecular*
+A second, parallel format (`OC20BI03`) carries two-species *bimolecular*
 records (e.g. Langmuir-Hinshelwood surface reactions like
-`O* + CO* -> CO2 + 2*`) -- structurally different from the single-species
-records above (two species indices instead of one, and no BEP fallback:
-a bimolecular record is only ever emitted when a real DFT-computed
-activation energy exists, since there is no bimolecular BEP relation in
-this tool). Kept as a separate file/format rather than folded into
-OC20E003 so the common single-species path never has to reason about an
-optional second species field it doesn't use.
+`O* + CO* -> CO2 + 2*`, or dissociative adsorption like
+`2* + H2O(g) -> H* + OH*`) -- structurally different from the
+single-species records above (two species indices instead of one, and no
+BEP fallback: a bimolecular record is only ever emitted when a real
+DFT-computed activation energy exists, since there is no bimolecular BEP
+relation in this tool). Kept as a separate file/format rather than folded
+into OC20E003 so the common single-species path never has to reason about
+an optional second species field it doesn't use.
 
 Format (little-endian):
-    magic:        8 bytes  b"OC20BI02"
-    record_count: u32
+    magic:            8 bytes  b"OC20BI03"
+    record_count:     u32
     records[count]:
-        species_a:    u8   (0 = O, 1 = H, 2 = CO -- same indices as above)
-        species_b:    u8
-        energy_mev:   i32  (reaction energy, milli-eV; kept for
-                            diagnostics/thermodynamic bookkeeping, not
-                            currently used to derive a reverse reaction)
-        sid:          u32  (source system/reaction id, for traceability only)
-        ea_mev:       i32  (real DFT-computed forward activation energy,
-                            milli-eV -- always meaningful; there is no
-                            has_real_ea flag because this format only ever
-                            carries real barriers)
-        metal:        u8   (same METALS index convention as above)
-        facet:        u16  (same Miller-index convention as above)
+        species_a:        u8   (same species indices as above)
+        species_b:        u8
+        energy_mev:       i32  (forward reaction energy, milli-eV --
+                                meaningful, and used, when
+                                is_dissociative == 1: it derives the
+                                reverse rate the same
+                                thermodynamic-consistency way the
+                                single-species adsorption/desorption pair
+                                does)
+        sid:              u32  (source system/reaction id, traceability only)
+        ea_mev:           i32  (real DFT-computed forward activation
+                                energy, milli-eV -- always meaningful;
+                                there is no has_real_ea flag because this
+                                format only ever carries real barriers)
+        metal:            u8   (same METALS index convention as above)
+        facet:            u16  (same Miller-index convention as above)
+        is_dissociative:  u8   (0 = recombination direction: both sites
+                                start occupied, clear to vacant, release a
+                                gas product -- forward-only, e.g. CO
+                                oxidation, H2 recombination. 1 =
+                                dissociative-adsorption direction: both
+                                sites start vacant, fill from a gas
+                                reactant -- built both directions, e.g.
+                                water splitting)
 
-v2 (OC20BI02) adds `metal`/`facet` on top of v1 (OC20BI01), matching the
-single-species format's v2->v3 bump above.
+v3 (OC20BI03) adds `is_dissociative` on top of v2 (OC20BI02), so the same
+format can carry a real barrier measured in *either* direction rather than
+always assuming recombination -- see `oc20_ingest.rs`'s `BiEnergyRecord`
+doc comment for why the two directions need different treatment. v2 added
+`metal`/`facet` on top of v1 (OC20BI01).
 """
 
 import re
@@ -134,8 +153,9 @@ MAGIC = b"OC20E003"
 RECORD_STRUCT = "<BiIBiBH"  # species, energy_mev, sid, has_real_ea, real_ea_mev, metal, facet
 RECORD_SIZE = struct.calcsize(RECORD_STRUCT)
 
-MAGIC_BIMOLECULAR = b"OC20BI02"
-RECORD_STRUCT_BIMOLECULAR = "<BBiIiBH"  # species_a, species_b, energy_mev, sid, ea_mev, metal, facet
+MAGIC_BIMOLECULAR = b"OC20BI03"
+# species_a, species_b, energy_mev, sid, ea_mev, metal, facet, is_dissociative
+RECORD_STRUCT_BIMOLECULAR = "<BBiIiBHB"
 RECORD_SIZE_BIMOLECULAR = struct.calcsize(RECORD_STRUCT_BIMOLECULAR)
 
 
@@ -176,11 +196,11 @@ def read_records(path):
 
 def write_bimolecular_records(records, out_path):
     """`records`: iterable of (species_a, species_b, energy_mev, sid,
-    ea_mev, metal, facet)."""
+    ea_mev, metal, facet, is_dissociative)."""
     with open(out_path, "wb") as f:
         f.write(MAGIC_BIMOLECULAR)
         f.write(struct.pack("<I", len(records)))
-        for species_a, species_b, energy_mev, sid, ea_mev, metal, facet in records:
+        for species_a, species_b, energy_mev, sid, ea_mev, metal, facet, is_dissociative in records:
             f.write(
                 struct.pack(
                     RECORD_STRUCT_BIMOLECULAR,
@@ -191,6 +211,7 @@ def write_bimolecular_records(records, out_path):
                     ea_mev,
                     metal,
                     facet,
+                    1 if is_dissociative else 0,
                 )
             )
 

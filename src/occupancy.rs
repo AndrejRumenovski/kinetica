@@ -36,7 +36,7 @@
 //! free-lists (a "sparse set" with O(1) removal) -- not built this pass.
 
 use crate::gillespie::Rng;
-use crate::layout::{self, ReactionRecord, ADS_CO, ADS_H, ADS_O, SPECIES_BITS};
+use crate::layout::{self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, NUM_SPECIES, SPECIES_BITS};
 
 /// Quantile buckets `oc20_ingest`'s `bucket_by_quantile` splits each
 /// species' real DFT samples into. Must agree with the ingest tool: the
@@ -59,14 +59,19 @@ fn species_index(species_bit: u8) -> Option<usize> {
     SPECIES_BITS.iter().position(|&b| b == species_bit)
 }
 
-/// Relative gas-phase partial-pressure multipliers for the three tracked
-/// species' *adsorption* channels only, in `SPECIES_BITS` index order (O,
-/// H, CO) -- a runtime simulator parameter (`kinetica --pressure-o2
+/// Relative gas-phase partial-pressure multipliers for the *original*
+/// three tracked gas species (O2, H2, CO), in `SPECIES_BITS`' first three
+/// index slots -- a runtime simulator parameter (`kinetica --pressure-o2
 /// --pressure-h2 --pressure-co`), not baked into `reactions.lut`, so
 /// changing the feed-gas composition never requires rebuilding it. Without
 /// this, two runs meant to represent different partial pressures produced
 /// identical adsorption kinetics -- the same rate-constant table applied
 /// regardless of how much of each gas was actually being fed in.
+///
+/// Deliberately still sized `[f64; 3]`, not `NUM_SPECIES` -- see
+/// `pressure_factor`'s doc comment for why a 4th (or heteroatomic
+/// bimolecular) species doesn't get a pressure knob for free just by
+/// existing.
 ///
 /// Desorption and bimolecular *recombination* templates (CO-oxidation,
 /// H2-recombination) are untouched -- pressure only gates a reaction that
@@ -88,21 +93,36 @@ impl Pressures {
 }
 
 /// `1.0` for every template except one that consumes a gas-phase
-/// molecule -- monomolecular adsorption, or genuine two-site dissociative
-/// adsorption (`2* + O2(g)/H2(g) -> 2 species*`) -- where it's that
-/// species' relative partial pressure. Kept separate from `live_count`
-/// since a pressure multiplier isn't a physical site count. A bimolecular
-/// *recombination* template (CO-oxidation, H2-recombination) consumes an
-/// occupied pair, not a gas-phase reactant, so it's untouched, same as
-/// monomolecular desorption.
+/// molecule -- monomolecular adsorption, or genuine *homoatomic* two-site
+/// dissociative adsorption (`2* + O2(g)/H2(g) -> 2 species*`) -- where
+/// it's that species' relative partial pressure. Kept separate from
+/// `live_count` since a pressure multiplier isn't a physical site count.
+///
+/// A bimolecular *recombination* template (CO-oxidation, H2-recombination,
+/// or the reverse/associative-desorption half of water splitting) consumes
+/// an occupied pair, not a gas-phase reactant, so it's untouched, same as
+/// monomolecular desorption. A *heteroatomic* dissociative-adsorption
+/// template -- currently only water splitting, `2* + H2O(g) -> H* +
+/// OH*` -- genuinely does consume a gas-phase molecule, but `Pressures`
+/// only tracks O2/H2/CO: neither site's product species alone identifies
+/// "this reaction's gas is H2O" (site A produces H*, which *does* have a
+/// pressure slot, but gating on it would incorrectly tie water-splitting
+/// propensity to H2 pressure instead of H2O pressure). Rather than get
+/// that wrong silently, heteroatomic dissociative adsorption is treated
+/// as pressure-neutral until a real 4th pressure slot is added -- a
+/// documented simplification, not a bug (see README).
 fn pressure_factor(template: &ReactionRecord, pressures: &Pressures) -> f64 {
     let reactant_mask = template.transition_a >> 4;
     if reactant_mask != 0 {
         return 1.0; // desorption or recombination: no gas-phase reactant
     }
     let product_mask = template.transition_a & 0x0F;
+    if template.is_bimolecular && product_mask != (template.transition_b & 0x0F) {
+        return 1.0; // heteroatomic dissociative adsorption -- see doc comment
+    }
     species_index(product_mask)
-        .map(|s| pressures.values[s])
+        .and_then(|s| pressures.values.get(s))
+        .copied()
         .unwrap_or(1.0)
 }
 
@@ -140,11 +160,11 @@ pub struct OccupancyCounters {
     /// `vacant_count[species][bucket]`: how many sites assigned to
     /// `(species, bucket)` are currently vacant -- the live count an
     /// adsorption template for that species/bucket fires against.
-    vacant_count: [[u32; BUCKETS_PER_SPECIES]; 3],
+    vacant_count: [[u32; BUCKETS_PER_SPECIES]; NUM_SPECIES],
     /// `occupied_count[species][bucket]`: how many sites assigned to
     /// `(species, bucket)` are currently occupied *by that species* --
     /// the live count a desorption template fires against.
-    occupied_count: [[u32; BUCKETS_PER_SPECIES]; 3],
+    occupied_count: [[u32; BUCKETS_PER_SPECIES]; NUM_SPECIES],
     /// Live count of adjacent (O*, CO*) site pairs -- CO-oxidation's
     /// propensity. Not bucketed: `oc20_ingest` keeps bimolecular real
     /// barriers as individually-real, un-averaged records (there are only
@@ -154,16 +174,20 @@ pub struct OccupancyCounters {
     /// Live count of adjacent (H*, H*) site pairs -- H2-recombination's
     /// propensity.
     h2_pairs: u32,
+    /// Live count of adjacent (H*, OH*) site pairs -- the associative-
+    /// desorption (reverse) half of water splitting's propensity
+    /// (`H* + OH* -> H2O(g) + 2*`). Mirrors `co_ox_pairs`/`h2_pairs`.
+    h_oh_pairs: u32,
     /// Live count of adjacent (VACANT, VACANT) site pairs -- the shared
     /// pool every genuine two-site dissociative-adsorption template
-    /// (`2* + O2(g) -> 2 O*`, `2* + H2(g) -> 2 H*`) draws its propensity
-    /// from. Deliberately one shared counter, not per-species: any
-    /// adjacent vacant pair is a real landing site for *either* gas, so
-    /// O2's and H2's dissociative-adsorption templates compete for the
-    /// same physical pool, same as monomolecular adsorption templates
+    /// (`2* + O2(g) -> 2 O*`, `2* + H2(g) -> 2 H*`, `2* + H2O(g) -> H* +
+    /// OH*`) draws its propensity from. Deliberately one shared counter,
+    /// not per-species/per-reaction: any adjacent vacant pair is a real
+    /// landing site for *any* of these, so their templates compete for
+    /// the same physical pool, same as monomolecular adsorption templates
     /// already compete for `vacant_count`'s single-site pool -- only each
     /// template's own `rate_q16` (and, via `pressure_factor`, its own
-    /// species' relative pressure) differentiates them.
+    /// species' relative pressure where applicable) differentiates them.
     vacant_pairs: u32,
 }
 
@@ -176,10 +200,11 @@ impl OccupancyCounters {
     /// pair, once from each side.
     pub fn new(patch_data: &[u8], width: usize, seed: u64) -> Self {
         let mut counters = OccupancyCounters {
-            vacant_count: [[0; BUCKETS_PER_SPECIES]; 3],
-            occupied_count: [[0; BUCKETS_PER_SPECIES]; 3],
+            vacant_count: [[0; BUCKETS_PER_SPECIES]; NUM_SPECIES],
+            occupied_count: [[0; BUCKETS_PER_SPECIES]; NUM_SPECIES],
             co_ox_pairs: 0,
             h2_pairs: 0,
+            h_oh_pairs: 0,
             vacant_pairs: 0,
         };
         if width == 0 {
@@ -221,6 +246,9 @@ impl OccupancyCounters {
         if a == ADS_H && b == ADS_H {
             self.h2_pairs += 1;
         }
+        if pair_matches(a, b, ADS_H, ADS_OH) {
+            self.h_oh_pairs += 1;
+        }
         if a == layout::VACANT && b == layout::VACANT {
             self.vacant_pairs += 1;
         }
@@ -232,6 +260,9 @@ impl OccupancyCounters {
         }
         if a == ADS_H && b == ADS_H {
             self.h2_pairs = self.h2_pairs.saturating_sub(1);
+        }
+        if pair_matches(a, b, ADS_H, ADS_OH) {
+            self.h_oh_pairs = self.h_oh_pairs.saturating_sub(1);
         }
         if a == layout::VACANT && b == layout::VACANT {
             self.vacant_pairs = self.vacant_pairs.saturating_sub(1);
@@ -302,16 +333,29 @@ impl OccupancyCounters {
     fn live_count(&self, template: &ReactionRecord) -> u64 {
         if template.is_bimolecular {
             let reactant_a = template.transition_a >> 4;
-            if reactant_a == layout::VACANT {
-                // Dissociative adsorption (2* + gas -> 2 species*): both
-                // sites start VACANT -- draws from the shared adjacent-
-                // vacant-pair pool, same one every dissociating species'
-                // template competes for (see `vacant_pairs`'s doc comment).
+            let reactant_b = template.transition_b >> 4;
+            // Exhaustive match on which live pair-count pool this
+            // template's reactant *pair* draws from, keyed off the
+            // reactant species on both sides (not just site A) -- an
+            // explicit match rather than an if/else chain so adding a new
+            // bimolecular reaction kind that doesn't fit any existing
+            // pool fails safe (0, never selected) instead of silently
+            // being miscounted against an unrelated pool.
+            if reactant_a == layout::VACANT && reactant_b == layout::VACANT {
+                // Any dissociative adsorption (2* + gas -> 2 species*,
+                // homoatomic like O2/H2 or heteroatomic like water
+                // splitting): both sites start VACANT -- draws from the
+                // shared adjacent-vacant-pair pool every such template
+                // competes for (see `vacant_pairs`'s doc comment).
                 self.vacant_pairs as u64
-            } else if reactant_a == ADS_O || reactant_a == ADS_CO {
+            } else if pair_matches(reactant_a, reactant_b, ADS_O, ADS_CO) {
                 self.co_ox_pairs as u64
-            } else {
+            } else if reactant_a == ADS_H && reactant_b == ADS_H {
                 self.h2_pairs as u64
+            } else if pair_matches(reactant_a, reactant_b, ADS_H, ADS_OH) {
+                self.h_oh_pairs as u64
+            } else {
+                0
             }
         } else {
             let reactant_mask = template.transition_a >> 4;
@@ -899,5 +943,153 @@ mod tests {
         // reactant) must stay untouched by the same pressure vector.
         let recombination = bimolecular_template(ADS_H, ADS_H, 1);
         assert_eq!(pressure_factor(&recombination, &pressures), 1.0);
+    }
+
+    fn heteroatomic_dissociative_ads_template(species_a_bit: u8, species_b_bit: u8, rate: u32) -> ReactionRecord {
+        ReactionRecord {
+            rate_q16: rate,
+            bin_id: 0,
+            transition_a: species_a_bit, // reactant=VACANT(0), product=species_a
+            transition_b: species_b_bit, // reactant=VACANT(0), product=species_b
+            is_bimolecular: true,
+        }
+    }
+
+    fn heteroatomic_recombination_template(species_a_bit: u8, species_b_bit: u8, rate: u32) -> ReactionRecord {
+        ReactionRecord {
+            rate_q16: rate,
+            bin_id: 0,
+            transition_a: species_a_bit << 4, // reactant=species_a, product=VACANT
+            transition_b: species_b_bit << 4, // reactant=species_b, product=VACANT
+            is_bimolecular: true,
+        }
+    }
+
+    /// Phase 4 (water splitting, `2* + H2O(g) <-> H* + OH*`) is the first
+    /// *heteroatomic* dissociative-adsorption reaction -- the two sites
+    /// produce/consume *different* species, unlike O2/H2's homoatomic
+    /// case (Phase 3). The forward direction must still draw from the
+    /// same shared `vacant_pairs` pool (any adjacent vacant pair is a
+    /// valid landing site, regardless of which two species end up there).
+    #[test]
+    fn live_count_heteroatomic_dissociative_adsorption_uses_vacant_pairs() {
+        let width = 6;
+        let height = 6;
+        let seed = 5u64;
+        let mut data = vec![ADS_O; width * height];
+        data[10] = VACANT;
+        data[11] = VACANT;
+        let counters = OccupancyCounters::new(&data, width, seed);
+        assert_eq!(counters.vacant_pairs, 1);
+
+        let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1000);
+        assert_eq!(
+            counters.total_propensity(&[forward], &Pressures::ones()),
+            1000.0 * counters.vacant_pairs as f64
+        );
+    }
+
+    /// The reverse (associative desorption, `H* + OH* -> 2*`) must draw
+    /// from its own dedicated live pair-count (`h_oh_pairs`), not get
+    /// mixed up with `co_ox_pairs`/`h2_pairs`/`vacant_pairs` -- this is
+    /// exactly the kind of mistake the old if/else-chain `live_count`
+    /// (fixed this phase into an exhaustive match) could have made for a
+    /// pair type it didn't explicitly know about.
+    #[test]
+    fn live_count_h_oh_recombination_uses_its_own_pair_pool() {
+        let width = 6;
+        let height = 6;
+        let seed = 6u64;
+        let mut data = vec![VACANT; width * height];
+        data[10] = ADS_H;
+        data[11] = ADS_OH;
+        let counters = OccupancyCounters::new(&data, width, seed);
+        assert_eq!(counters.h_oh_pairs, 1);
+        assert_eq!(counters.co_ox_pairs, 0);
+        assert_eq!(counters.h2_pairs, 0);
+
+        let reverse = heteroatomic_recombination_template(ADS_H, ADS_OH, 1000);
+        assert_eq!(
+            counters.total_propensity(&[reverse], &Pressures::ones()),
+            1000.0 * counters.h_oh_pairs as f64
+        );
+    }
+
+    /// A bimolecular reactant pair this build genuinely doesn't recognize
+    /// (neither vacant-pair, O/CO, H/H, nor H/OH) must contribute zero
+    /// live weight -- selectable-but-never-selected is the safe failure
+    /// mode, not silently miscounted against an unrelated pool.
+    #[test]
+    fn live_count_unknown_bimolecular_pair_is_zero() {
+        let width = 4;
+        let data = vec![ADS_O; 16]; // no H/OH/CO anywhere
+        let counters = OccupancyCounters::new(&data, width, 1);
+        let bogus = heteroatomic_recombination_template(ADS_CO, ADS_OH, 1000);
+        assert_eq!(counters.total_propensity(&[bogus], &Pressures::ones()), 0.0);
+    }
+
+    /// Heteroatomic dissociative adsorption (water splitting) genuinely
+    /// consumes a gas-phase molecule (H2O) that `Pressures` doesn't track
+    /// -- it must be treated as pressure-neutral (1.0) rather than
+    /// incorrectly gated on H2's pressure just because site A's product
+    /// happens to be H* (which does have a pressure slot). See
+    /// `pressure_factor`'s doc comment.
+    #[test]
+    fn pressure_factor_is_neutral_for_heteroatomic_dissociative_adsorption() {
+        let pressures = Pressures { values: [1.0, 99.0, 1.0] }; // H2 pressure cranked up
+        let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1);
+        assert_eq!(
+            pressure_factor(&forward, &pressures),
+            1.0,
+            "must not accidentally gate on H2 pressure just because site A produces H*"
+        );
+
+        // Homoatomic dissociative adsorption (both sites the same
+        // species) is unaffected by this guard -- still genuinely
+        // pressure-coupled, matching Phase 3's existing behavior.
+        let homoatomic = dissociative_ads_template(ADS_H, 1);
+        assert_eq!(pressure_factor(&homoatomic, &pressures), 99.0);
+
+        // The reverse (associative desorption) direction is untouched
+        // regardless -- no gas-phase reactant.
+        let reverse = heteroatomic_recombination_template(ADS_H, ADS_OH, 1);
+        assert_eq!(pressure_factor(&reverse, &pressures), 1.0);
+    }
+
+    /// End-to-end: the reverse (associative desorption) direction must
+    /// only ever fire on a genuinely adjacent H*/OH* pair.
+    #[test]
+    fn select_event_h_oh_recombination_only_fires_on_a_genuinely_adjacent_pair() {
+        let width = 6;
+        let height = 6;
+        let seed = 9u64;
+        let mut data = vec![VACANT; width * height];
+        // One real adjacent H*/OH* pair; a lone, non-adjacent H* that
+        // must never be chosen as a partner site.
+        data[10] = ADS_H;
+        data[11] = ADS_OH;
+        data[30] = ADS_H;
+        let counters = OccupancyCounters::new(&data, width, seed);
+        assert_eq!(counters.h_oh_pairs, 1);
+
+        let templates = vec![heteroatomic_recombination_template(ADS_H, ADS_OH, u32::MAX)];
+        let mut rng = rng();
+        for _ in 0..200 {
+            if let Some((_, site_a, site_b)) =
+                counters.select_event(&templates, &data, width, height, &mut rng, seed, &Pressures::ones())
+            {
+                let site_b = site_b.expect("bimolecular event must return a second site");
+                let pair = (data[site_a], data[site_b]);
+                assert!(
+                    pair == (ADS_H, ADS_OH) || pair == (ADS_OH, ADS_H),
+                    "fired on non-matching pair {pair:?}"
+                );
+                let neighbors: Vec<usize> = crate::topology::all_neighbors(site_a, width, height)
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                assert!(neighbors.contains(&site_b), "must be topology-adjacent");
+            }
+        }
     }
 }

@@ -28,6 +28,10 @@ pub const ADS_O: u8 = 0x01;
 pub const ADS_CO: u8 = 0x02;
 /// Site occupied by an adsorbed hydrogen atom (H*).
 pub const ADS_H: u8 = 0x04;
+/// Site occupied by an adsorbed hydroxyl (OH*) -- see `oc20_ingest`'s
+/// water-dissociation reaction (`2* + H2O(g) <-> H* + OH*`) for the one
+/// real reaction that currently forms/consumes it.
+pub const ADS_OH: u8 = 0x08;
 
 /// Union of every currently defined occupancy bit.
 ///
@@ -35,15 +39,33 @@ pub const ADS_H: u8 = 0x04;
 /// OCCUPANCY_MASK`) to read known state; a set bit outside this mask means
 /// either a newer site type this build doesn't know about or a corrupted
 /// lattice file, and callers that care should treat it as the latter.
-pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H;
+pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H | ADS_OH;
 
-/// The three adsorbates this lattice tracks, in the species-index order
-/// (`0=O, 1=H, 2=CO`) every real-data producer/consumer agrees on:
-/// `oc20_ingest`'s `EnergyRecord::species`, the `OC20E002`/`OC20BI01`
-/// binary formats, and `occupancy.rs`'s per-species counters all index
-/// into this same array. Defined once here rather than duplicated in each
-/// of those places.
-pub const SPECIES_BITS: [u8; 3] = [ADS_O, ADS_H, ADS_CO];
+/// The adsorbates this lattice tracks, in the species-index order every
+/// real-data producer/consumer agrees on: `oc20_ingest`'s
+/// `EnergyRecord::species`, the `OC20E003`/`OC20BI03` binary formats, and
+/// `occupancy.rs`'s per-species counters all index into this same array.
+/// Defined once here rather than duplicated in each of those places.
+///
+/// **Four is the practical ceiling for this array, not an arbitrary
+/// round number.** `apply_transition` below packs a reaction's reactant
+/// and product species into a single byte as two 4-bit nibbles
+/// (`(reactant_mask << 4) | product_mask`); a one-hot species bit has to
+/// fit inside one nibble to be representable there, which caps this list
+/// at `{0x01, 0x02, 0x04, 0x08}` -- a 5th one-hot species (`0x10`) would
+/// silently corrupt the packed encoding (it'd bleed into the *other*
+/// nibble). Going past four species for real would mean widening
+/// `ReactionLutBlock`'s `transition_a`/`transition_b` fields past a
+/// single byte each, which changes the cache-line-block size math (see
+/// `ReactionLutBlock`'s own doc comment) -- a real architectural change,
+/// not something to do implicitly by adding one more species bit.
+pub const SPECIES_BITS: [u8; 4] = [ADS_O, ADS_H, ADS_CO, ADS_OH];
+
+/// `SPECIES_BITS.len()`, named for readability at call sites that size a
+/// per-species array/counter (`occupancy::OccupancyCounters`,
+/// `oc20_ingest`'s per-species loops) rather than repeating the array
+/// itself just to measure it.
+pub const NUM_SPECIES: usize = SPECIES_BITS.len();
 
 /// Apply a packed `(reactant_mask << 4) | product_mask` transition to a
 /// site's current occupancy byte: clear the reactant's bits and OR in the

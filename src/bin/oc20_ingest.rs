@@ -74,11 +74,14 @@ use std::path::PathBuf;
 use kinetica::layout::{self, ReactionLutBlock, SPECIES_BITS};
 use kinetica::occupancy::BUCKETS_PER_SPECIES;
 
-/// `SPECIES_BITS`'s index order, named -- matches OC20's global
-/// adsorbate-index table (`mapping_adsorbates_2020may12.txt`: 0 = *O,
-/// 1 = *H, 5 = *CO) as remapped to a dense 0..3 range by the extraction
-/// scripts.
-const SPECIES_NAMES: [&str; 3] = ["O", "H", "CO"];
+/// `SPECIES_BITS`'s index order, named. Indices 0-2 (O, H, CO) match
+/// OC20's global adsorbate-index table (`mapping_adsorbates_2020may12.txt`:
+/// 0 = *O, 1 = *H, 5 = *CO) as remapped to a dense range by the extraction
+/// scripts. Index 3 (OH) has no OC20 equivalent -- it's sourced entirely
+/// from the water-splitting bimolecular reaction below, never from a
+/// monomolecular `--input` energy record (see `DISSOCIATIVE_SPECIES` and
+/// the bimolecular-records loop in `run`).
+const SPECIES_NAMES: [&str; 4] = ["O", "H", "CO", "OH"];
 
 /// Species indices whose adsorption is genuinely a two-site dissociative
 /// step (`2* + X2(g) -> 2 X*`) rather than a single-site one: O (from
@@ -93,13 +96,13 @@ const MAGIC: &[u8; 8] = b"OC20E003";
 /// + metal(1) + facet(2).
 const RECORD_SIZE: usize = 17;
 
-/// `OC20BI02`: the parallel bimolecular format `extract_catalysis_hub.py`'s
+/// `OC20BI03`: the parallel bimolecular format `extract_catalysis_hub.py`'s
 /// `write_bimolecular_records` writes -- see `scripts/oc20e_format.py` for
 /// the authoritative byte layout this must match.
-const MAGIC_BI: &[u8; 8] = b"OC20BI02";
+const MAGIC_BI: &[u8; 8] = b"OC20BI03";
 /// species_a(1) + species_b(1) + energy_mev(4) + sid(4) + ea_mev(4)
-/// + metal(1) + facet(2).
-const RECORD_SIZE_BI: usize = 17;
+/// + metal(1) + facet(2) + is_dissociative(1).
+const RECORD_SIZE_BI: usize = 18;
 
 /// Metal index table, in lockstep with `scripts/oc20e_format.py`'s own
 /// `METALS` list -- the numeric index is what's on disk in both
@@ -285,20 +288,39 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
     Ok(records)
 }
 
-/// One parsed bimolecular record: two adsorbed species consumed by the
-/// same event (indices into `SPECIES_BITS`, same convention as
-/// `EnergyRecord::species`), plus a real DFT-computed forward activation
-/// energy -- this format never carries a BEP-derived one, since there is
-/// no bimolecular BEP relation here (see `oc20e_format.py`).
+/// One parsed bimolecular record: two adsorbed species consumed/produced by
+/// the same event (indices into `SPECIES_BITS`, same convention as
+/// `EnergyRecord::species`), a real DFT-computed forward activation energy
+/// (this format never carries a BEP-derived one, since there is no
+/// bimolecular BEP relation here), and the forward reaction energy --
+/// meaningful (and used, for the first time) when `is_dissociative` is
+/// set, to derive a real thermodynamic-consistency reverse rate the same
+/// way monomolecular adsorption/desorption pairs already do.
+///
+/// `is_dissociative` distinguishes which *direction* this real barrier
+/// was measured in, since the two site transitions this drives are
+/// direction-dependent, not just a magnitude:
+/// - `false` (recombination, e.g. CO-oxidation, H2-recombination): both
+///   sites start occupied and clear to vacant, releasing a gas product.
+///   Forward-only, same as before this field existed -- there's no
+///   thermodynamically meaningful reverse for a gas product that doesn't
+///   dissociatively re-adsorb the same way it left.
+/// - `true` (dissociative adsorption, e.g. water splitting): both sites
+///   start vacant and fill from a gas reactant. Built *both* directions --
+///   forward from the real `ea_ev` directly, reverse (associative
+///   desorption) via `Ea_rev = ea_ev - energy_ev`, since this direction's
+///   reverse genuinely is the same elementary step run backward.
 #[derive(Clone, Copy)]
 struct BiEnergyRecord {
     species_a: u8,
     species_b: u8,
     #[allow(dead_code)]
     sid: u32,
+    energy_ev: f64,
     ea_ev: f64,
     metal: u8,
     facet: u16,
+    is_dissociative: bool,
 }
 
 fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRecord>> {
@@ -308,7 +330,7 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
     if bytes.len() < 12 || &bytes[0..8] != MAGIC_BI {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "not an OC20BI02 bimolecular-energy file (bad magic/too short)",
+            "not an OC20BI03 bimolecular-energy file (bad magic/too short)",
         ));
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
@@ -318,13 +340,12 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
     for _ in 0..count {
         let species_a = bytes[offset];
         let species_b = bytes[offset + 1];
-        // energy_mev (reaction energy) at offset+2..offset+6 is read from
-        // the file but not currently used -- kept for future thermodynamic
-        // bookkeeping (see oc20e_format.py's field docs).
+        let energy_mev = i32::from_le_bytes(bytes[offset + 2..offset + 6].try_into().unwrap());
         let sid = u32::from_le_bytes(bytes[offset + 6..offset + 10].try_into().unwrap());
         let ea_mev = i32::from_le_bytes(bytes[offset + 10..offset + 14].try_into().unwrap());
         let metal = bytes[offset + 14];
         let facet = u16::from_le_bytes(bytes[offset + 15..offset + 17].try_into().unwrap());
+        let is_dissociative = bytes[offset + 17] != 0;
         offset += RECORD_SIZE_BI;
 
         if (species_a as usize) >= SPECIES_BITS.len() || (species_b as usize) >= SPECIES_BITS.len()
@@ -335,9 +356,11 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
             species_a,
             species_b,
             sid,
+            energy_ev: energy_mev as f64 / 1000.0,
             ea_ev: ea_mev as f64 / 1000.0,
             metal,
             facet,
+            is_dissociative,
         });
     }
 
@@ -420,8 +443,8 @@ fn rate_from_activation(activation_ev: f64, config: &Config) -> f64 {
 /// deliberate, honest broadening from a silent pooling regression. A
 /// species left with zero samples even after falling back stays empty,
 /// same as today's "absent from --input" case.
-fn filter_with_fallback(records: &[EnergyRecord], config: &Config) -> [Vec<EnergyRecord>; 3] {
-    let mut by_species: [Vec<EnergyRecord>; 3] = Default::default();
+fn filter_with_fallback(records: &[EnergyRecord], config: &Config) -> [Vec<EnergyRecord>; SPECIES_BITS.len()] {
+    let mut by_species: [Vec<EnergyRecord>; SPECIES_BITS.len()] = Default::default();
 
     let Some(metal) = config.metal else {
         for &rec in records {
@@ -553,7 +576,7 @@ fn run(config: &Config) -> io::Result<()> {
     // therefore always show 0 CO records; that is expected, not a bug.
     let by_species = filter_with_fallback(&energy_records, config);
 
-    let mut bucketed_by_species: [Vec<BucketSummary>; 3] = Default::default();
+    let mut bucketed_by_species: [Vec<BucketSummary>; SPECIES_BITS.len()] = Default::default();
     for species in 0..SPECIES_BITS.len() {
         let count = by_species[species].len();
         let real_ea_count = by_species[species]
@@ -613,7 +636,7 @@ fn run(config: &Config) -> io::Result<()> {
     // the adsorption direction.
     let mut replaces_desorption = [false; SPECIES_BITS.len()];
     for rec in &bimolecular_records {
-        if rec.species_a == rec.species_b {
+        if !rec.is_dissociative && rec.species_a == rec.species_b {
             replaces_desorption[rec.species_a as usize] = true;
         }
     }
@@ -680,23 +703,47 @@ fn run(config: &Config) -> io::Result<()> {
         }
     }
 
-    // Bimolecular records (e.g. CO oxidation, O* + CO* -> CO2 + 2*; H2
-    // recombination, 2 H* -> H2 + 2*) carry a real DFT-computed forward
-    // barrier only -- no BEP fallback exists for a two-species step, and
-    // no reverse reaction is built: the gas product leaving the surface
-    // isn't a single elementary step back onto two sites, so there's no
-    // thermodynamically meaningful Ea_rev to derive here (unlike the
-    // monomolecular adsorption/desorption pair above). Kept un-bucketed
-    // (bucket_id = 0, unused by the engine for bimolecular templates --
-    // see `occupancy::OccupancyCounters::live_count`): there are only a
-    // handful of these real barriers, not enough to meaningfully quantile-
-    // split.
+    // Bimolecular records carry a real DFT-computed forward barrier only --
+    // no BEP fallback exists for a two-species step. What gets built from
+    // each one depends on `is_dissociative` (see `BiEnergyRecord`'s doc
+    // comment):
+    //
+    // - Recombination (e.g. CO oxidation, O* + CO* -> CO2 + 2*; H2
+    //   recombination, 2 H* -> H2 + 2*): forward-only, no reverse -- the
+    //   gas product leaving the surface isn't a single elementary step
+    //   back onto two sites, so there's no thermodynamically meaningful
+    //   Ea_rev to derive here (unlike the monomolecular adsorption/
+    //   desorption pair above).
+    // - Dissociative adsorption (currently just water splitting,
+    //   2* + H2O(g) -> H* + OH*): built *both* directions, same
+    //   Ea_rev = Ea_fwd - dE_rxn thermodynamic-consistency relation the
+    //   monomolecular pair above uses -- this direction's reverse
+    //   (associative desorption) genuinely is the same elementary step
+    //   run backward, unlike recombination's gas product.
+    //
+    // Kept un-bucketed (bucket_id = 0, unused by the engine for
+    // bimolecular templates -- see `occupancy::OccupancyCounters::
+    // live_count`): there are only a handful of these real barriers, not
+    // enough to meaningfully quantile-split.
+    let mut dissociative_bimolecular_count = 0usize;
     for rec in &bimolecular_records {
         let bit_a = SPECIES_BITS[rec.species_a as usize];
         let bit_b = SPECIES_BITS[rec.species_b as usize];
-        let k = rate_from_activation(rec.ea_ev, config);
-        // transition_a/b = species_0x0 (each site: occupied -> vacant).
-        raw_rates.push((k, bit_a << 4, bit_b << 4, true, 0));
+        let k_fwd = rate_from_activation(rec.ea_ev, config);
+        if rec.is_dissociative {
+            // Forward: 2* -> species_a* + species_b* (both sites: vacant
+            // -> species).
+            raw_rates.push((k_fwd, bit_a, bit_b, true, 0));
+            // Reverse: species_a* + species_b* -> 2* (both sites: species
+            // -> vacant), associative desorption.
+            let ea_rev = (rec.ea_ev - rec.energy_ev).max(0.0);
+            let k_rev = rate_from_activation(ea_rev, config);
+            raw_rates.push((k_rev, bit_a << 4, bit_b << 4, true, 0));
+            dissociative_bimolecular_count += 1;
+        } else {
+            // transition_a/b = species_0x0 (each site: occupied -> vacant).
+            raw_rates.push((k_fwd, bit_a << 4, bit_b << 4, true, 0));
+        }
     }
 
     // Rescale into the Q16.16 fixed-point domain `ReactionLutBlock` uses:
@@ -738,15 +785,18 @@ fn run(config: &Config) -> io::Result<()> {
         })
         .collect();
 
+    let recombination_bimolecular_count = bimolecular_records.len() - dissociative_bimolecular_count;
     println!(
         "oc20_ingest: built {} reactions ({} monomolecular adsorption + {} desorption + \
-         {} dissociative-adsorption bimolecular + {} recombination bimolecular), \
+         {} homoatomic dissociative-adsorption bimolecular + {} heteroatomic dissociative \
+         bimolecular pair(s) (forward+reverse) + {} recombination bimolecular), \
          rate scale factor {:.3e}",
         records.len(),
         ads_count,
         des_count,
         dissociative_ads_count,
-        bimolecular_records.len(),
+        dissociative_bimolecular_count,
+        recombination_bimolecular_count,
         scale
     );
 
@@ -946,9 +996,11 @@ mod tests {
             species_a,
             species_b,
             sid: 0,
+            energy_ev: -0.5,
             ea_ev: 1.0,
             metal,
             facet,
+            is_dissociative: false,
         }
     }
 
@@ -1114,7 +1166,7 @@ mod tests {
         sid: u32,
         ea_mev: i32,
     ) {
-        push_bimolecular_record_with_metal(bytes, species_a, species_b, energy_mev, sid, ea_mev, 0, 0);
+        push_bimolecular_record_with_metal(bytes, species_a, species_b, energy_mev, sid, ea_mev, 0, 0, false);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1127,6 +1179,7 @@ mod tests {
         ea_mev: i32,
         metal: u8,
         facet: u16,
+        is_dissociative: bool,
     ) {
         bytes.push(species_a);
         bytes.push(species_b);
@@ -1135,6 +1188,7 @@ mod tests {
         bytes.extend_from_slice(&ea_mev.to_le_bytes());
         bytes.push(metal);
         bytes.extend_from_slice(&facet.to_le_bytes());
+        bytes.push(is_dissociative as u8);
     }
 
     #[test]
@@ -1455,6 +1509,98 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    /// The falsifying test Phase 4 (broader reaction coverage: OH* via
+    /// water splitting) exists to pass: a real `is_dissociative` barrier
+    /// must build *both* a forward (dissociative-adsorption) record using
+    /// the real Ea directly and a reverse (associative-desorption) record
+    /// via thermodynamic consistency (`Ea_rev = Ea_fwd - dE_rxn`) --
+    /// unlike a recombination-direction record (`is_dissociative = 0`,
+    /// covered by `run_builds_a_single_bimolecular_reaction_with_no_reverse`
+    /// above), which stays forward-only.
+    #[test]
+    fn run_builds_both_directions_for_a_dissociative_bimolecular_record() {
+        let input_path = temp_path("run_dissociative_bi_input");
+        let bi_path = temp_path("run_dissociative_bi_bimolecular_input");
+        let out_path = temp_path("run_dissociative_bi_out.lut");
+
+        // One CO record, energy_mev = 0, so `energy_records` isn't empty
+        // (CO isn't one of DISSOCIATIVE_SPECIES, so it doesn't interact
+        // with the water-splitting record below).
+        let mut mono_bytes = Vec::new();
+        mono_bytes.extend_from_slice(MAGIC);
+        mono_bytes.extend_from_slice(&1u32.to_le_bytes());
+        push_record(&mut mono_bytes, 2, 0, 1, None);
+        std::fs::write(&input_path, &mono_bytes).unwrap();
+
+        // One real water-splitting barrier: 2* + H2O(g) -> H* + OH*,
+        // dE_rxn = 0.220 eV, Ea_fwd = 1.011 eV (species 1 = H, species 3 = OH).
+        let mut bi_bytes = Vec::new();
+        bi_bytes.extend_from_slice(MAGIC_BI);
+        bi_bytes.extend_from_slice(&1u32.to_le_bytes());
+        push_bimolecular_record_with_metal(&mut bi_bytes, 1, 3, 220, 42, 1011, 0, 0, true);
+        std::fs::write(&bi_path, &bi_bytes).unwrap();
+
+        // beta_ev = 0.5 (not the usual default 0.0): with energy_mev = 0
+        // above, BEP's `Ea = max(0, alpha*dE + beta)` gives CO the *same*
+        // non-zero barrier (0.5 eV) in both directions -- avoiding the
+        // BEP relation's structural property that any nonzero dE clamps
+        // *one* direction to a barrierless Ea = 0 (since alpha != 1), a
+        // near-barrierless competing channel would dominate the Q16.16
+        // rescaling and round *both* water-splitting directions down to
+        // the same rate_q16 floor, defeating this test's point (checking
+        // their *relative* ordering survives rescaling).
+        let config = Config {
+            input: input_path.clone(),
+            bimolecular_input: Some(bi_path.clone()),
+            out: out_path.clone(),
+            alpha: 0.87,
+            beta_ev: 0.5,
+            nu: 1.0e13,
+            temperature_k: 298.15,
+            metal: None,
+            facet: None,
+        };
+        run(&config).unwrap();
+
+        let lut = layout::ReactionLut::open(&out_path).unwrap();
+        let reaction_count = lut.len() * ReactionLutBlock::LANES;
+        let real_records: Vec<_> = (0..reaction_count)
+            .map(|id| lut.rate_of(id))
+            .filter(|r| r.rate_q16 > 0)
+            .collect();
+
+        let forward: Vec<_> = real_records
+            .iter()
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H && r.transition_b == layout::ADS_OH)
+            .collect();
+        assert_eq!(forward.len(), 1, "forward dissociative-adsorption record must be built");
+
+        let reverse: Vec<_> = real_records
+            .iter()
+            .filter(|r| {
+                r.is_bimolecular && r.transition_a == layout::ADS_H << 4 && r.transition_b == layout::ADS_OH << 4
+            })
+            .collect();
+        assert_eq!(reverse.len(), 1, "reverse associative-desorption record must be built too");
+
+        // Forward uses the real Ea directly; reverse uses Ea_rev = Ea_fwd
+        // - dE_rxn = 1.011 - 0.220 = 0.791, a smaller barrier, so its rate
+        // constant (before Q16.16 rescaling) is larger -- confirm the
+        // *ordering* survives rescaling: reverse's rate_q16 must be
+        // greater than forward's.
+        assert!(
+            reverse[0].rate_q16 > forward[0].rate_q16,
+            "reverse (smaller barrier) should have a larger rate_q16 than forward: \
+             forward={} reverse={}",
+            forward[0].rate_q16,
+            reverse[0].rate_q16
+        );
+
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&bi_path);
         let _ = std::fs::remove_file(&out_path);
     }
 }

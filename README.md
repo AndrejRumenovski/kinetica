@@ -102,9 +102,11 @@ deterministic hash of its own index (`occupancy::site_bucket`) — no
 per-site storage. Each patch keeps a live count, per (species, bucket), of
 how many sites are currently vacant (what an adsorption template's
 propensity scales with) or occupied by that species (what a desorption
-template scales with), plus a live count of adjacent (O\*, CO\*) and
-(H\*, H\*) site pairs for the two bimolecular reactions — all updated in
-O(1) amortized time per fired event, never rescanned. Site selection uses
+template scales with), plus a live count of adjacent pairs for each
+bimolecular reaction type (O\*/CO\*, H\*/H\*, H\*/OH\*, and a shared
+adjacent-vacant-pair count every dissociative-adsorption reaction draws
+from) — all updated in O(1) amortized time per fired event, never
+rescanned. Site selection uses
 bounded rejection sampling (try a random candidate, verify it actually
 matches, retry on a miss, fall back to a guaranteed deterministic scan
 after enough misses): simpler than an exact O(1) free-list per bucket, and
@@ -195,12 +197,89 @@ the two previously-cited real barriers turned up:
 
 Neither survives a filter that means what it says ("real Pd(111) metal").
 So this build's `reactions.lut` has real, Pd(111)-specific monomolecular
-O/H/CO adsorption/desorption chemistry and **zero bimolecular reactions**
-— rather than quietly keeping the old cross-facet/cross-composition
-bimolecular records under a "Pd" label that would itself be exactly the
-kind of pooling this change exists to eliminate. Restoring bimolecular
-chemistry on a real, single, chemically-clean surface is future work (see
-"Next step" in the project handoff), not something this pass papers over.
+O/H/CO adsorption/desorption chemistry and **zero *recombination*
+bimolecular reactions** (CO-oxidation, H2-recombination) — rather than
+quietly keeping the old cross-facet/cross-composition bimolecular records
+under a "Pd" label that would itself be exactly the kind of pooling this
+change exists to eliminate. Restoring recombination chemistry on a real,
+single, chemically-clean surface is future work (see "Next step" in the
+project handoff). A different real bimolecular reaction — water splitting
+— *does* survive strict Pd(111) filtering; see "Broader reaction coverage:
+OH\* and water splitting" below.
+
+## Broader reaction coverage: OH* and water splitting
+
+A fourth adsorbate, **OH\*** (`layout::ADS_OH`), joins O\*/H\*/CO\* —
+formed and consumed by a real, genuinely two-site reaction found on
+Pd(111): dissociative water adsorption/associative desorption,
+`2* + H2O(g) <-> H* + OH*` (Ea forward ≈ 1.01–1.18 eV across two real DFT
+samples). This is the textbook first step of surface water
+formation/decomposition chemistry, and — unlike CO-oxidation/H2-
+recombination — its reverse (associative desorption) genuinely is the
+same elementary step run backward, so `oc20_ingest` builds *both*
+directions from the one real forward barrier, using the same
+`Ea_rev = Ea_fwd - dE_rxn` thermodynamic-consistency relation the
+monomolecular adsorption/desorption pairs already use.
+
+**Four species is a hard ceiling for this architecture, not a round
+number.** `layout::apply_transition` packs a reaction's reactant and
+product species into a single byte as two 4-bit nibbles
+(`(reactant_mask << 4) | product_mask`); a one-hot species bit has to fit
+inside one nibble, capping `SPECIES_BITS` at `{0x01, 0x02, 0x04, 0x08}`.
+Going further for real would mean widening `ReactionLutBlock`'s
+`transition_a`/`transition_b` fields past one byte each, which breaks the
+cache-line-block size math the whole engine is built around (see
+`ReactionLutBlock`'s own doc comment) — a genuine architectural change,
+not something to do by adding one more species bit. OH\* was chosen to
+fill this last slot over two lower-priority candidates (CHO\*, H2O\* as a
+standalone molecular adsorbate) specifically because it's the one with a
+*real, measured* two-site barrier and the most direct connection to the
+O\*/H\* chemistry already modeled — see the project handoff for the
+data-landscape survey behind that call.
+
+**Engine-side, this needed remarkably little new code.** Site
+selection (`find_bimolecular_pair`) already handled an arbitrary reactant
+species generically, VACANT included — zero changes there. What did need
+updating: `occupancy::OccupancyCounters::live_count`'s old bimolecular
+branch was an unconditional `if O-or-CO { co_ox_pairs } else { h2_pairs }`
+two-way split, which would have silently miscounted this reaction's
+reverse (an H\*/OH\* pair, neither O/CO nor H/H) against the wrong pool.
+It's now an exhaustive match over every known pair type, with a safe
+`0` fallback for anything unrecognized — a reaction this build doesn't
+know about is simply never selected, not miscounted. `pressure_factor`
+also needed a new case: water splitting's forward direction genuinely
+consumes a gas-phase molecule (H2O), but `occupancy::Pressures` only
+tracks O2/H2/CO, and naively keying off site A's product species (H\*,
+which *does* have a pressure slot) would incorrectly gate this reaction
+on H2 pressure instead. It's treated as pressure-neutral instead — a
+documented simplification, not a silent bug — until a real 4th pressure
+slot is added.
+
+**A real-scale finding worth stating plainly: water splitting is
+correctly wired into the real Pd(111) `reactions.lut`, but at these
+species' relative rates it's effectively unobservable in a normal run.**
+The Bronsted-Evans-Polanyi relation this pipeline uses clamps one
+direction of *every* monomolecular adsorption/desorption pair to a
+barrierless `Ea = 0` whenever `alpha != 1` (a structural property of the
+relation with `beta = 0`, not specific to any one species) — in practice,
+real Pd(111) O/H/CO adsorption energies are all exothermic, so every
+adsorption channel ends up essentially barrierless (`rate_q16` at or near
+the Q16.16 ceiling), while water splitting's *real* ~1.0–1.2 eV barrier
+gives it a `rate_q16` at the floor (clamped to `1`) once rescaled against
+that ceiling — roughly a two-billion-fold propensity disadvantage. Layer
+on that a saturated surface (near-barrierless adsorption fills the
+lattice almost immediately) leaves very few adjacent *vacant pairs* for
+water splitting to find in the first place, and the reaction essentially
+never fires within a normal step budget. This isn't a bug: it's an honest
+reflection of water splitting genuinely being the rate-limiting step
+relative to simple adsorption at these DFT-derived rates — the same
+qualitative story as real Pd/Pt surface science. It was verified working
+correctly, using the real DFT numbers, in isolation (a throwaway LUT
+containing *only* the two water-splitting records, no competing
+channels): starting from an empty lattice, forward and reverse each fired
+~100k times over 200k total events, settling into a small,
+detailed-balance-consistent equilibrium population of adjacent H\*/OH\*
+pairs, zero invalid occupancy states.
 
 ## Building `reactions.lut` from real data
 
@@ -443,21 +522,15 @@ adsorption (see "Gas-phase pressure coupling" above) — verified against
 the real Pd(111) `reactions.lut`: `--pressure-h2 15.0` raises H coverage
 from 10.8% to 29.2%, zero invalid occupancy states.
 
-**`oc20_ingest` can also build real bimolecular reactions from
-Catalysis-Hub data — though not, currently, for the Pd(111)-filtered build
-this repo ships (see "Lattice geometry and target surface: Pd(111)" above
-for why: the real barriers below turned out to live on Pd(211)/oxide/
-hydride surfaces once their exact facet/composition was checked, not on
-clean Pd(111)).** The mechanism itself is real and tested — it's the
-*intersection* with a strict single-surface filter that's currently empty,
-not a gap in the engine or the ingest pipeline.
+**`oc20_ingest` can build real standalone bimolecular reactions from
+Catalysis-Hub data, in either of two directions.**
 `scripts/extract_catalysis_hub.py`'s real-barrier sweep picks out genuine
-two-site recombination barriers (`BIMOLECULAR_PATTERNS`) and writes them
-to a second, parallel binary file (`OC20BI02` format — see
-`scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that file to
-`oc20_ingest --bimolecular-input` (using an unfiltered or differently-
-filtered extraction — e.g. no `--metal`/`--facet`, or `--metal Pd --facet
-211` for the real CO-oxidation barrier specifically):
+two-site barriers in either shape — `RECOMBINATION_PATTERNS` (both sites
+occupied -> gas + 2 vacant) or `DISSOCIATIVE_PATTERNS` (both sites vacant
+-> gas dissociates onto them, e.g. water splitting) — and writes them,
+tagged with which direction, to a second, parallel binary file (`OC20BI03`
+format — see `scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that
+file to `oc20_ingest --bimolecular-input`:
 
 ```sh
 python3 scripts/extract_catalysis_hub.py \
@@ -469,56 +542,80 @@ cargo run --release --bin oc20_ingest -- \
     --out reactions.lut
 ```
 
-Unlike the monomolecular adsorption/desorption pair, a bimolecular record
-only ever builds a *single* forward `ReactionRecord` — there's no BEP
-fallback for a two-species step (a bimolecular record is only emitted
-when Catalysis-Hub reports a real activation energy), and no reverse
-reaction is derived: the gas product leaving the surface isn't the
+No BEP fallback exists for a two-species step either way (a bimolecular
+record is only ever emitted when Catalysis-Hub reports a real activation
+energy). What differs by direction is the reverse reaction:
+**recombination** (CO-oxidation, H2-recombination) builds only a single
+forward `ReactionRecord` — the gas product leaving the surface isn't the
 reverse of a single elementary step back onto two sites, so there's no
-thermodynamically meaningful `Ea_rev` the way there is for
-adsorption/desorption. These real barriers are rare and vary run to run
-just like the rest of this live, growing database (see above) — a
-record you know exists (e.g. by sid) may not show up on a given run's
-cursor pagination, so if you're chasing a specific one, try again —
-currently two patterns are matched:
+thermodynamically meaningful `Ea_rev` to derive. **Dissociative
+adsorption** (water splitting) builds *both* directions — its reverse
+(associative desorption) genuinely is the same elementary step run
+backward, so `Ea_rev = Ea_fwd - dE_rxn` applies exactly like the
+monomolecular adsorption/desorption pair. **Real Pd(111) currently
+supports one of each real reaction category being non-empty, not
+both:** recombination is empty (see "Lattice geometry and target surface:
+Pd(111)" for why — those specific barriers live on Pd(211)/oxide/hydride
+surfaces once checked), while water splitting is real and Pd(111)-native
+(see "Broader reaction coverage: OH\* and water splitting"). This repo's
+own `reactions.lut` therefore ships with real dissociative-adsorption
+bimolecular chemistry but zero recombination bimolecular chemistry — not
+a gap in the mechanism, just where the real single-surface data currently
+lands. For CO-oxidation specifically, an unfiltered extraction or
+`--metal Pd --facet 211` still finds the real barrier.
 
-- **`O* + CO* -> CO2 + 2*`** (e.g. `StreibelMicrokinetic2021`,
-  "Microkinetic Modeling of Propene Combustion" — real NEB barriers of
-  ~0.98-1.21 eV on Pd).
-- **`2 H* -> H2 + 2*`** (e.g. "Dynamics and Hysteresis of Hydrogen
-  Interaction..." — ~0.35 eV). This one is *homoatomic* (both sites are
-  the same species), and `oc20_ingest` treats that specially: it
-  **replaces** H's monomolecular desorption reaction rather than adding
-  a third rate channel alongside it. The existing monomolecular H
-  adsorption/desorption pair already approximates H2 dissociative
-  adsorption/associative desorption as a single-site event (using half
-  the H2 dissociation energy per H atom — see `SPECIES_PATTERNS`); a
-  real two-site measurement of the same physical recombination event
-  isn't a *second* reaction, it's a more accurate model of the same one.
-  Building both would just split one real process's propensity across
-  two channels at different levels of approximation. H's monomolecular
-  *adsorption* is untouched — these barriers say nothing about the
-  adsorption direction, only the (already-known-to-be-two-site)
-  recombinative desorption.
+These real barriers are rare and vary run to run just like the rest of
+this live, growing database (see above) — a record you know exists (e.g.
+by sid) may not show up on a given run's cursor pagination, so if you're
+chasing a specific one, try again — currently three patterns are matched:
+
+- **`O* + CO* -> CO2 + 2*`** (recombination; e.g.
+  `StreibelMicrokinetic2021`, "Microkinetic Modeling of Propene
+  Combustion" — real NEB barriers of ~0.98-1.21 eV on Pd, specifically
+  Pd(211) once checked — see "Lattice geometry and target surface:
+  Pd(111)").
+- **`2 H* -> H2 + 2*`** (recombination; ~0.35 eV, on `PdH`-hydride
+  surfaces once checked). This one is *homoatomic* (both sites are the
+  same species), and `oc20_ingest` treats that specially: it **replaces**
+  H's monomolecular desorption reaction rather than adding a third rate
+  channel alongside it. The existing monomolecular H adsorption/
+  desorption pair already approximates H2 dissociative adsorption/
+  associative desorption as a single-site event (using half the H2
+  dissociation energy per H atom — see `SPECIES_PATTERNS`); a real
+  two-site measurement of the same physical recombination event isn't a
+  *second* reaction, it's a more accurate model of the same one. Building
+  both would just split one real process's propensity across two channels
+  at different levels of approximation. H's monomolecular *adsorption* is
+  untouched — these barriers say nothing about the adsorption direction,
+  only the (already-known-to-be-two-site) recombinative desorption.
+- **`2* + H2O(g) -> H* + OH*`** (dissociative adsorption; ~1.01-1.18 eV,
+  real and Pd(111)-native — see "Broader reaction coverage: OH\* and
+  water splitting" above for the full story, including why this is the
+  one bimolecular reaction that *does* make it into this repo's own
+  single-surface build).
 
 `oc20_ingest` logs which species had their desorption replaced this way,
-and folds every rate (mono- and bimolecular alike) into the same Q16.16
-rescaling pass, so the single fastest reaction overall still anchors the
-scale factor.
+and folds every rate (mono-, dissociative-bimolecular, and recombination-
+bimolecular alike) into the same Q16.16 rescaling pass, so the single
+fastest reaction overall still anchors the scale factor.
 
 **What was checked and doesn't apply here:** a full scan of every real
-DFT-barrier reaction in the database (1000+ records) involving two of
-our three tracked species turned up one more candidate, `H* + CO* ->
-CHO*` (~0.97 eV) — but its product is an adsorbed formyl species
-(`CHOstar`), not a gas + two vacant sites, so it can't be represented
-without a fourth adsorbate bit in `layout.rs`'s occupancy mask. No
-genuine two-site O2 recombination record with a real barrier exists in
-the data either (only the same single-site 0.5-stoichiometry pattern
-already covered by the monomolecular path). So within the current
-three-species (O/H/CO) model, CO oxidation and H2 recombination are the
-only two real bimolecular reactions the live data actually supports (on
-*some* metal/facet — see the Pd(111)-specific finding above for why
-neither currently makes it into this repo's own single-surface build).
+DFT-barrier reaction in the database (1000+ records) involving two of our
+tracked species turned up one more candidate, `H* + CO* -> CHO*`
+(~0.97 eV) — checked and found to be on **Cu(100)**, not any Pd facet
+(same "verify the exact facet/composition before trusting a headline
+number" lesson as the CO-oxidation/H2-recombination finding above). A
+*different*, genuinely Pd(111) real reaction does form `CHOstar` —
+`star + COgas + 0.5*H2gas -> CHOstar`, a single-site formyl formation
+from two gases at once — but modeling it faithfully would mean either a
+lumped/effective pressure knob for a reaction that physically depends on
+two independent gas pressures at once, or extending `Pressures` past
+three slots for a single edge case; left as future work rather than
+forced in for this pass (`OH*` already used the one remaining species
+slot on a reaction with a real *two-site* barrier, the more structurally
+interesting addition). No genuine two-site O2 recombination record with a
+real barrier exists in the data either (only the same single-site
+0.5-stoichiometry pattern already covered by the monomolecular path).
 
 `data/` (dataset downloads/extractions) and `PROMPT.md` are intentionally
 untracked — see `.gitignore`. `scripts/extract_energies.py`,
