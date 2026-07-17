@@ -993,6 +993,51 @@ mod tests {
         assert_eq!(buckets[0].real_ea_ev, None);
     }
 
+    proptest::proptest! {
+        /// `bucket_by_quantile`'s doc comment makes three claims the
+        /// example tests above only check on small hand-picked inputs
+        /// (2, 3, or 8 records): every record ends up in exactly one
+        /// bucket (none lost or double-counted), the bucket count is
+        /// never more than requested and never more than there are
+        /// records, and the split is "roughly equal-sized" -- meaning no
+        /// two buckets can differ in size by more than one record, not
+        /// just "each bucket gets some records." Checked here for
+        /// arbitrary record counts and bucket counts, including sizes
+        /// that don't divide evenly (the case most likely to expose an
+        /// off-by-one in the `b * n / buckets` boundary arithmetic).
+        #[test]
+        fn bucket_by_quantile_splits_every_record_into_a_roughly_equal_bucket(
+            energies in proptest::collection::vec(-1000.0f64..1000.0, 0..50),
+            num_buckets in 1usize..8,
+        ) {
+            let n = energies.len();
+            let records: Vec<EnergyRecord> =
+                energies.iter().map(|&e| energy_record(e, None)).collect();
+            let buckets = bucket_by_quantile(&records, num_buckets);
+
+            if n == 0 {
+                proptest::prop_assert!(buckets.is_empty());
+                return Ok(());
+            }
+
+            proptest::prop_assert_eq!(
+                buckets.len(), num_buckets.min(n),
+                "bucket count must be min(requested, record count)"
+            );
+
+            let total: usize = buckets.iter().map(|b| b.sample_count).sum();
+            proptest::prop_assert_eq!(total, n, "every record must land in exactly one bucket");
+
+            let min_size = buckets.iter().map(|b| b.sample_count).min().unwrap();
+            let max_size = buckets.iter().map(|b| b.sample_count).max().unwrap();
+            proptest::prop_assert!(
+                max_size - min_size <= 1,
+                "bucket sizes {:?} are not roughly equal (min={}, max={})",
+                buckets.iter().map(|b| b.sample_count).collect::<Vec<_>>(), min_size, max_size
+            );
+        }
+    }
+
     fn push_record(
         bytes: &mut Vec<u8>,
         species: u8,

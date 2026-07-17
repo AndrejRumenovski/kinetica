@@ -768,4 +768,55 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    proptest::proptest! {
+        /// `apply_transition`'s doc comment states its contract in prose
+        /// ("clear the reactant's bits and OR in the product's") but no
+        /// existing test checks that contract independently of the
+        /// one-line formula that implements it -- every example test that
+        /// exercises this function does so indirectly, through a handful
+        /// of hand-picked reaction records elsewhere. Checked here as
+        /// three properties any bit of `current`/`reactant_mask`/
+        /// `product_mask` must satisfy for *every* representable byte
+        /// triple, independent of the implementation:
+        /// - every product bit ends up set (a reaction's product always
+        ///   lands, regardless of prior occupancy);
+        /// - every reactant bit *not* also a product bit ends up cleared
+        ///   (the reactant is consumed, unless the same species is also
+        ///   produced);
+        /// - every bit outside both masks is left exactly as it was
+        ///   (a transition never touches a site's other species bits --
+        ///   the property `engine.rs`'s "no site holds >1 species bit"
+        ///   corruption check ultimately depends on).
+        #[test]
+        fn apply_transition_only_touches_reactant_and_product_bits(
+            current: u8, reactant_mask: u8, product_mask: u8,
+        ) {
+            let transition = ((reactant_mask as u16) << 8) | (product_mask as u16);
+            let result = apply_transition(current, transition);
+
+            proptest::prop_assert_eq!(
+                result & product_mask, product_mask,
+                "product bit(s) not set: current={:#010b} reactant={:#010b} \
+                 product={:#010b} result={:#010b}",
+                current, reactant_mask, product_mask, result
+            );
+
+            let consumed_only = reactant_mask & !product_mask;
+            proptest::prop_assert_eq!(
+                result & consumed_only, 0,
+                "reactant-only bit(s) not cleared: current={:#010b} \
+                 reactant={:#010b} product={:#010b} result={:#010b}",
+                current, reactant_mask, product_mask, result
+            );
+
+            let untouched_mask = !(reactant_mask | product_mask);
+            proptest::prop_assert_eq!(
+                result & untouched_mask, current & untouched_mask,
+                "bit(s) outside both masks changed: current={:#010b} \
+                 reactant={:#010b} product={:#010b} result={:#010b}",
+                current, reactant_mask, product_mask, result
+            );
+        }
+    }
 }

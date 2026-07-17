@@ -138,6 +138,53 @@ pub fn forward_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize
 mod tests {
     use super::*;
 
+    proptest::proptest! {
+        /// `all_neighbors_reciprocal_across_full_grid` and
+        /// `forward_neighbors_full_scan_visits_every_edge_exactly_once`
+        /// below check the reciprocity/edge-count invariant `forward_
+        /// neighbors`'s own doc comment cites, but only on one hardcoded
+        /// 6x6 grid -- this checks the same two properties across
+        /// generated grid dimensions (including degenerate 1-wide/
+        /// 1-row cases neither example test happens to construct), the
+        /// same "not just the hand-picked cases" gap class entry 21's
+        /// proptest additions closed elsewhere in this codebase.
+        #[test]
+        fn neighbor_topology_is_reciprocal_and_forward_covers_every_edge_once(
+            width in 1usize..12, rows in 1usize..12,
+        ) {
+            let mut forward_edges = std::collections::HashSet::new();
+            let mut full_count = 0usize;
+
+            for idx in 0..width * rows {
+                for neighbor in all_neighbors(idx, width, rows).into_iter().flatten() {
+                    full_count += 1;
+                    let back: Vec<usize> = all_neighbors(neighbor, width, rows)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    proptest::prop_assert!(
+                        back.contains(&idx),
+                        "{}x{}: {} -> {} not reciprocal", width, rows, idx, neighbor
+                    );
+                }
+                for neighbor in forward_neighbors(idx, width, rows).into_iter().flatten() {
+                    let edge = (idx.min(neighbor), idx.max(neighbor));
+                    proptest::prop_assert!(
+                        forward_edges.insert(edge),
+                        "{}x{}: edge {:?} visited more than once by forward_neighbors",
+                        width, rows, edge
+                    );
+                }
+            }
+
+            // Every edge forward_neighbors found must also be exactly half
+            // of what the full (both-direction) adjacency count finds --
+            // the actual "visits every edge exactly once" specification,
+            // not just "never repeats an edge" on its own.
+            proptest::prop_assert_eq!(full_count, forward_edges.len() * 2);
+        }
+    }
+
     #[test]
     fn all_neighbors_interior_even_row_site_matches_expected_hex_set() {
         // width=6, rows=6, site (row=2, col=2) -- interior, even row.
