@@ -10,18 +10,19 @@ license = "MIT OR Apache-2.0"
 # BUILD NOTES
 # ------------------------------------------------------------------------------
 # This crate is written to run entirely inside L1/L2 cache during the hot
-# Gillespie loop and to vectorize the neighborhood-scan kernels in layout.rs.
-# The default `rustc` target does not enable AVX2 or FMA, so LLVM cannot emit
-# the packed-SIMD instructions the cache-line-aligned reaction LUT is shaped
-# for. To get the intended codegen, always build with:
+# Gillespie loop, via the cache-line-aligned AoSOA `ReactionLutBlock` layout
+# in layout.rs. A plain `cargo build --release` is sufficient -- there is no
+# explicit SIMD (no std::arch/std::simd/intrinsics) anywhere in this crate.
 #
-#   RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" cargo build --release
-#
-# `target-cpu=native` lets LLVM pick the widest vector width the host CPU
-# actually supports (AVX2/AVX-512/FMA), and the explicit `+avx2` is a floor
-# for machines where `native` detection under-reports. Because this bakes in
-# host-specific instructions, binaries built this way are not portable across
-# heterogeneous CPU fleets -- rebuild per target machine.
+# An earlier revision of this comment recommended building with
+# `RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2"`, on the
+# assumption that this would unlock LLVM auto-vectorization of the AoSOA
+# layout. That assumption was never benchmarked against a plain release
+# build. Once it was (see README's "Benchmarks" section), the flag measured
+# ~11% *slower* on the Static/SSA-CR engine and a wash on the occupancy-gated
+# engine, on real hardware -- so the recommendation was removed rather than
+# kept as unverified advice that also cost binary portability
+# (target-cpu=native bakes in host-specific instructions).
 [profile.release]
 opt-level = 3
 panic = "abort"

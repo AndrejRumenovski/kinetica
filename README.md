@@ -73,16 +73,25 @@ second one exists and how it works.
 
 ## Building
 
-The hot Gillespie loop and the neighborhood-scan kernels in `layout.rs`
-are written to vectorize under AVX2/FMA, which the default `rustc` target
-does not enable. Always build with:
-
 ```sh
-RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" cargo build --release
+cargo build --release
 ```
 
-Because this bakes in host-specific instructions, resulting binaries are
-not portable across heterogeneous CPU fleets — rebuild per target machine.
+An earlier version of this section recommended building with
+`RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2"`, on the
+reasoning that the cache-line-aligned AoSOA `ReactionLutBlock` layout in
+`layout.rs` was written to vectorize well under AVX2/FMA. That claim was
+never actually measured against a plain `cargo build --release` — and
+once it was (see "Benchmarks" below), the flag turned out to make the
+`Static` engine measurably **slower** (~11%) and the occupancy-gated
+engine a wash, on the same machine the benchmark table below was
+measured on. There is no explicit SIMD in this codebase (no
+`std::arch`/`std::simd`/intrinsics) for the flag to target — the
+alignment and layout choices are real and pay for themselves through
+cache behavior, not through auto-vectorized codegen that was never
+confirmed to exist. The recommendation is retired rather than kept as
+unverified advice; a plain release build is also what CI has always
+tested, so the documented build and the tested build now agree.
 
 ## Layout
 
@@ -191,29 +200,47 @@ catch a regression in this parsing path before it reaches `main`.
 ## Benchmarks
 
 Real wall-clock numbers, not a marketing table — from the exact commands
-below, on a 12-thread (6-core) AMD Ryzen 5 5600G, release build with the
-recommended `RUSTFLAGS` (see "Building" above), a 1024×1024 lattice, and
-this repo's own real Pd(111) `reactions.lut` (34 reactions) for the
-occupancy-gated numbers:
+below, on a 12-thread (6-core) AMD Ryzen 5 5600G, plain `cargo build
+--release` (no special `RUSTFLAGS`; see "Building" above for why), a
+1024×1024 lattice, and this repo's own real Pd(111) `reactions.lut` (34
+reactions) for the occupancy-gated numbers. Each cell is the **median of
+5 runs at 5,000,000 steps/patch** — an earlier pass at 2,000,000
+steps/patch showed enough run-to-run timing noise (particularly on the
+`Static` engine, whose runs are sub-second and so more sensitive to
+scheduler/mmap page-fault jitter) that a single-run table would have
+been misleading either direction:
 
 ```sh
-RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" cargo build --release
+cargo build --release
 ./target/release/kinetica --lattice-width 1024 --lattice-height 1024 \
-    --patches <N> --steps 2000000
+    --patches <N> --steps 5000000
 ```
 
 | Patches | Occupancy-gated (real data) | Static (`--generate-lut`) |
 |---|---|---|
-| 1  | 1.08M reactions/sec | 5.35M reactions/sec |
-| 2  | 3.22M reactions/sec | 5.41M reactions/sec |
-| 4  | 5.86M reactions/sec | 6.14M reactions/sec |
-| 6  | 6.02M reactions/sec | 5.46M reactions/sec |
-| 8  | 5.03M reactions/sec | 5.50M reactions/sec |
-| 12 | 4.18M reactions/sec | 4.26M reactions/sec |
+| 1  | 1.44M reactions/sec | 13.6M reactions/sec |
+| 2  | 3.95M reactions/sec | 13.7M reactions/sec |
+| 4  | 7.39M reactions/sec | 12.9M reactions/sec |
+| 6  | 8.10M reactions/sec | 15.0M reactions/sec |
+| 8  | 8.44M reactions/sec | 15.3M reactions/sec |
+| 12 | 7.82M reactions/sec | 10.9M reactions/sec |
 
-Two honest things this table shows, rather than hides:
+Three honest things this table shows, rather than hides:
 
-**Throughput peaks around 4-6 patches and *degrades* beyond that**, on
+**The `RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2"` build
+this table used to recommend was retired after actually being measured
+against a plain release build** (see "Building" above). Same machine,
+same workload, 3 runs each: the `Static` engine ran **~11% slower**
+under the "recommended" flags (~14.3M vs. ~16.1M reactions/sec on that
+smaller test), and the occupancy-gated engine was a wash. There is no
+explicit SIMD anywhere in this codebase for AVX2 codegen to accelerate —
+the flag was carried forward on an assumption about LLVM
+auto-vectorization of the AoSOA layout that had never been isolated with
+an A/B measurement. This table's numbers are all plain-build; the
+absolute values are consequently not directly comparable to numbers from
+any older revision of this section that cited the flag.
+
+**Throughput peaks around 6-8 patches and degrades beyond that**, on
 this 6-physical-core/12-thread machine. `--patches` defaults to
 `rayon::current_num_threads()` (all logical CPUs), which this data says
 is actually past this workload's sweet spot here — every patch's fired
@@ -225,30 +252,36 @@ parallelism. Reported as measured rather than only benchmarking at the
 patch count that looks best — if you're tuning `--patches` for your own
 hardware, sweep it; don't assume "more" or "the default" is optimal.
 
-**The static and occupancy-gated engines are now comparably fast**,
-which is itself worth stating because it *wasn't* true when this table
-was first being assembled: an early pass measured the static engine at
-roughly **1000x slower** (thousands, not millions, of reactions/sec).
-Chasing that discrepancy down (rather than writing benchmark numbers that
-would have quietly enshrined it) found a genuine bug in
-`gillespie::CompositionTable::bin_ceiling` — it used `FixedPoint::FRAC_BITS`
-(32, the fixed-point *type's* own width) as a shift base instead of 16
-(the number of bits `FixedPoint::from_q16` actually shifts a Q16.16 rate
-by to get there), making every rejection-sampling bin's acceptance
-envelope `2^16` (65536x) too large. The module's own doc comment claims
-"expected <= 2 rejection trials"; the bug silently turned that into
-*expected ~65536 trials per event*. Two existing unit tests had encoded
-the bug as correct behavior (they asserted `bin_ceiling`'s own output
-rather than a value derived independently from the invariant it's
-supposed to satisfy) and so never caught it — a reminder that a green
-test suite proves the tests you wrote pass, not that every documented
-property actually holds; this one only surfaced by measuring real
-wall-clock throughput and asking why a number looked wrong. Fixed in
-`gillespie.rs` (see its own doc comment on `bin_ceiling` for the exact
-derivation); both misleading tests were rewritten to derive their
-expected values from `FixedPoint::from_q16`'s actual shift instead of
-mirroring the implementation. A new property-based test closes the gap
-that let it hide in the first place — see "Property-based testing" below.
+**The static and occupancy-gated engines are both fast, and both
+noisy in different ways**, which is itself worth stating because it
+*wasn't* true when this table was first being assembled: an early pass
+measured the static engine at roughly **1000x slower** (thousands, not
+millions, of reactions/sec). Chasing that discrepancy down (rather than
+writing benchmark numbers that would have quietly enshrined it) found a
+genuine bug in `gillespie::CompositionTable::bin_ceiling` — it used
+`FixedPoint::FRAC_BITS` (32, the fixed-point *type's* own width) as a
+shift base instead of 16 (the number of bits `FixedPoint::from_q16`
+actually shifts a Q16.16 rate by to get there), making every
+rejection-sampling bin's acceptance envelope `2^16` (65536x) too large.
+The module's own doc comment claims "expected <= 2 rejection trials";
+the bug silently turned that into *expected ~65536 trials per event*.
+Two existing unit tests had encoded the bug as correct behavior (they
+asserted `bin_ceiling`'s own output rather than a value derived
+independently from the invariant it's supposed to satisfy) and so never
+caught it — a reminder that a green test suite proves the tests you
+wrote pass, not that every documented property actually holds; this one
+only surfaced by measuring real wall-clock throughput and asking why a
+number looked wrong. Fixed in `gillespie.rs` (see its own doc comment on
+`bin_ceiling` for the exact derivation); both misleading tests were
+rewritten to derive their expected values from `FixedPoint::from_q16`'s
+actual shift instead of mirroring the implementation. A new
+property-based test closes the gap that let it hide in the first place —
+see "Property-based testing" below. The `Static` engine's own numbers
+in the table above still carry more run-to-run spread than the
+occupancy-gated column even at the median-of-5 methodology used here
+(sub-second total runtime makes it more exposed to scheduling/mmap
+jitter than the occupancy-gated engine's longer runs) — real machine
+noise, not a hidden defect, and reported rather than smoothed over.
 
 ## Property-based testing
 
