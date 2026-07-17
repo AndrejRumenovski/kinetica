@@ -307,7 +307,9 @@ pairs, zero invalid occupancy states.
 ## Building `reactions.lut` from real data
 
 Two independent real-data sources feed the same `oc20_ingest` pipeline;
-see the CO-gap note below for why you likely want both.
+see the CO-gap note below for why you likely want both. A third candidate,
+OC22, was investigated and found not to apply to this project — see "OC22:
+investigated, not integrated" below.
 
 ### OC20
 
@@ -489,6 +491,46 @@ averaged number.
 **There's also real barrier data for actual bimolecular surface reactions
 like CO oxidation itself, `O* + CO* -> CO2 + 2*`** — see "Bimolecular
 reactions" below for how this is now wired all the way through.
+
+### OC22: investigated, not integrated
+
+The obvious next candidate for a third data source was
+[OC22](https://arxiv.org/abs/2206.08917) (Open Catalyst 2022), the
+sibling dataset to OC20. It was investigated against this project's two
+open questions — does it have in-domain `*CO` data, and does it have real
+recombination barriers (CO-oxidation, H2-recombination) on a clean facet
+that Catalysis-Hub doesn't — and closed as **not applicable**, for two
+independent reasons found directly in the dataset's own methodology
+section rather than by downloading and probing it empirically:
+
+- **OC22 is oxide-only, by construction, not by filtering.** Its bulk
+  structures are sampled from "4,728 unary (AₓOᵧ) and binary (AₓBᵧOᵤ)
+  metal-oxides" — every entry contains oxygen. This project's target
+  surface is elemental Pd(111), a clean single-crystal metal facet with
+  zero oxide content (see "Lattice geometry and target surface: Pd(111)"
+  above, and the deliberate exclusion of oxide-modified `Pd+1:3O` there).
+  There is no elemental-metal slab to filter down to — `--metal Pd
+  --facet 111` would have nothing to match against, the same
+  "verify domain before trusting a headline number" lesson learned twice
+  already with Catalysis-Hub records (Pd(211) and `PdH`-hydride, not
+  Pd(111) — see above and "Broader reaction coverage" below).
+- **OC22 has no transition-state or barrier data at all — it's a
+  relaxation-only dataset, structurally identical in this respect to
+  OC20.** It reports DFT total energies/forces for relaxed adsorbate+slab
+  structures, not NEB/dimer-method activation energies. That's exactly
+  the gap OC20 had and Catalysis-Hub's `activationEnergy` field filled;
+  OC22 would reopen the same gap it doesn't close, so it can't supply the
+  recombination barriers the "real recombination records are only 5 in
+  the entire [Catalysis-Hub] database" finding above is asking a third
+  source to provide.
+
+Both findings come straight from the dataset's own methodology
+description (bulk selection: oxides only; data product: relaxation
+energies/forces only), so no download or extraction run was needed to
+reach a checked answer — the domain mismatch is definitional, not a
+sparse-sample gap that a bigger pull might fix. If a future oxide-focused
+extension of this project's scope existed, OC22 would be the source; for
+strict Pd(111) metal-facet chemistry, it isn't.
 
 ### Bimolecular reactions
 
