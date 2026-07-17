@@ -16,6 +16,12 @@ Pd(111) (see "Building `reactions.lut` from real data" below). Regenerate
 it yourself with `coverage_report` + `scripts/plot_coverage.py` — see
 "Visualizing a run".*
 
+![Spatial snapshot of the final Pd(111) surface occupancy state on the real hexagonal fcc(111) lattice, showing visible clustering of O*/H*/CO*/H2O* domains](docs/lattice_snapshot.png)
+
+*The same real run's **spatial** structure, which the aggregate plot above
+can't show — real clustering on the real hex tiling, not a generic square
+grid. Regenerate with `scripts/plot_lattice.py`; see "Visualizing a run".*
+
 The lattice lives as a memory-mapped file rather than in heap-resident
 `Vec`s, is a real hexagonal fcc(111) close-packed surface geometry (see
 "Lattice geometry and target surface: Pd(111)" below) rather than a
@@ -111,6 +117,7 @@ tested, so the documented build and the tested build now agree.
 | `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API, plus real transition-state barriers where they exist |
 | `scripts/oc20e_format.py`     | Shared binary format both extraction scripts write |
 | `scripts/plot_coverage.py`    | Turns `coverage_report`'s CSV into the coverage-vs-time PNG at the top of this README |
+| `scripts/plot_lattice.py`     | Reads `surface.lattice` directly (no Rust tool needed) and renders a spatial hex-tiling snapshot of the final surface state (see "Visualizing a run") |
 
 ## Running the simulator
 
@@ -172,6 +179,34 @@ whatever order each patch/writer happened to be scheduled, not global
 chronological order — `coverage_report` sorts every record by its own
 logged `sim_time` before replaying, which is what makes "coverage at time
 T" well-defined at all across independently-running patches.
+
+### Spatial snapshot: what the coverage plot can't show
+
+The plot above is an aggregate — one number per species per timestep. It
+can never show *where* things are: whether adsorbates cluster into
+domains, or the real hexagonal fcc(111) tiling `topology.rs` implements.
+`surface.lattice` (the mmap'd lattice file a run leaves behind) already
+holds exactly that spatial information — a flat, headerless
+`width * height` array of occupancy bytes, one per site, row-major — so
+`scripts/plot_lattice.py` reads it directly, no Rust-side tool needed:
+
+```sh
+./target/release/kinetica \
+    --lattice-width 64 --lattice-height 64 --patches 4 --steps 50000
+python3 scripts/plot_lattice.py surface.lattice 64 64 lattice_snapshot.png
+```
+
+![Spatial snapshot of the final Pd(111) surface occupancy state, showing visible clustering of O*/H*/CO*/H2O* domains on the real hexagonal fcc(111) lattice.](docs/lattice_snapshot.png)
+
+**This shows only the *final* state a run ends in, not an animated or
+intermediate one** — `surface.lattice` is overwritten in place as the
+simulation runs, so unlike `trajectory.bin` there's no cheap way to
+recover an earlier snapshot from the file alone; that would need its own
+replay tool, the same way `coverage_report` replays events to reconstruct
+aggregate coverage over time. A deliberately small lattice (64x64, not
+this repo's other examples' 256x256) — large enough to show real
+clustering, small enough that individual hexagons stay visually
+distinguishable rather than rendering as an indistinguishable blob.
 
 ## Fuzzing
 
