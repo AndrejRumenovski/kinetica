@@ -32,6 +32,12 @@ pub const ADS_H: u8 = 0x04;
 /// water-dissociation reaction (`2* + H2O(g) <-> H* + OH*`) for the one
 /// real reaction that currently forms/consumes it.
 pub const ADS_OH: u8 = 0x08;
+/// Site occupied by molecularly adsorbed water (H2O*) -- distinct from
+/// the dissociated H*/OH* pair above. Formed/consumed by real Pd(111)
+/// monomolecular adsorption/desorption chemistry (`star + H2O(g) <->
+/// H2Ostar`, 3 real Catalysis-Hub records, BEP-estimated barrier like
+/// O*/H*/CO*), gas-coupled via `occupancy::Pressures::h2o`.
+pub const ADS_H2O: u8 = 0x10;
 
 /// Union of every currently defined occupancy bit.
 ///
@@ -39,7 +45,7 @@ pub const ADS_OH: u8 = 0x08;
 /// OCCUPANCY_MASK`) to read known state; a set bit outside this mask means
 /// either a newer site type this build doesn't know about or a corrupted
 /// lattice file, and callers that care should treat it as the latter.
-pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H | ADS_OH;
+pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H | ADS_OH | ADS_H2O;
 
 /// The adsorbates this lattice tracks, in the species-index order every
 /// real-data producer/consumer agrees on: `oc20_ingest`'s
@@ -47,19 +53,23 @@ pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H | ADS_OH;
 /// `occupancy.rs`'s per-species counters all index into this same array.
 /// Defined once here rather than duplicated in each of those places.
 ///
-/// **Four is the practical ceiling for this array, not an arbitrary
+/// **Eight is the practical ceiling for this array, not an arbitrary
 /// round number.** `apply_transition` below packs a reaction's reactant
-/// and product species into a single byte as two 4-bit nibbles
-/// (`(reactant_mask << 4) | product_mask`); a one-hot species bit has to
-/// fit inside one nibble to be representable there, which caps this list
-/// at `{0x01, 0x02, 0x04, 0x08}` -- a 5th one-hot species (`0x10`) would
-/// silently corrupt the packed encoding (it'd bleed into the *other*
-/// nibble). Going past four species for real would mean widening
-/// `ReactionLutBlock`'s `transition_a`/`transition_b` fields past a
-/// single byte each, which changes the cache-line-block size math (see
-/// `ReactionLutBlock`'s own doc comment) -- a real architectural change,
-/// not something to do implicitly by adding one more species bit.
-pub const SPECIES_BITS: [u8; 4] = [ADS_O, ADS_H, ADS_CO, ADS_OH];
+/// and product species into a `u16` as two 8-bit byte-masks
+/// (`(reactant_mask << 8) | product_mask`); a one-hot species bit has to
+/// fit inside one byte to be representable there, which caps this list at
+/// `{0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80}`. This used to be a
+/// 4-bit nibble (4-species ceiling) until the OH*-to-H2O* extension
+/// needed a 5th slot; widening the *packing unit* (nibble -> byte) rather
+/// than switching occupancy representation entirely (bitmask -> compact
+/// index) was a deliberate choice: it preserves the exact "no site holds
+/// more than one adsorbate bit" corruption check
+/// (`engine.rs`'s end-to-end test, `OCCUPANCY_MASK`'s `count_ones()`
+/// invariant) byte-for-byte, rather than swapping it for a different
+/// verification strategy. The cost is `ReactionLutBlock`'s block size
+/// (see its own doc comment): `transition_a`/`transition_b` are now `u16`
+/// or per-reaction bytes roughly doubles.
+pub const SPECIES_BITS: [u8; 5] = [ADS_O, ADS_H, ADS_CO, ADS_OH, ADS_H2O];
 
 /// `SPECIES_BITS.len()`, named for readability at call sites that size a
 /// per-species array/counter (`occupancy::OccupancyCounters`,
@@ -67,16 +77,16 @@ pub const SPECIES_BITS: [u8; 4] = [ADS_O, ADS_H, ADS_CO, ADS_OH];
 /// itself just to measure it.
 pub const NUM_SPECIES: usize = SPECIES_BITS.len();
 
-/// Apply a packed `(reactant_mask << 4) | product_mask` transition to a
+/// Apply a packed `(reactant_mask << 8) | product_mask` transition to a
 /// site's current occupancy byte: clear the reactant's bits and OR in the
 /// product's. Shared by `engine.rs` (which also handles trajectory
 /// logging/migration around this) and `occupancy.rs` (which only needs
 /// the byte-level transition itself), so this one-line rule exists in
 /// exactly one place.
 #[inline(always)]
-pub fn apply_transition(current: u8, transition: u8) -> u8 {
-    let reactant_mask = transition >> 4;
-    let product_mask = transition & 0x0F;
+pub fn apply_transition(current: u8, transition: u16) -> u8 {
+    let reactant_mask = (transition >> 8) as u8;
+    let product_mask = (transition & 0xFF) as u8;
     (current & !reactant_mask) | product_mask
 }
 
@@ -213,21 +223,34 @@ impl SiteLattice {
 // Cache-line-aligned reaction-rate lookup table (AoSOA)
 // ------------------------------------------------------------------------
 
-/// One 64-byte, cache-line-resident block of `LANES` reaction records laid
-/// out Array-of-Structures-of-Arrays: each *field* is contiguous across the
-/// block's lanes, but blocks themselves are addressed and cached as single
-/// units.
+/// One 320-byte, five-cache-line-resident block of `LANES` reaction
+/// records laid out Array-of-Structures-of-Arrays: each *field* is
+/// contiguous across the block's lanes, but blocks themselves are
+/// addressed together as single units.
 ///
 /// `#[repr(C, align(64))]`: `align(64)` pins every block to a 64-byte
 /// hardware cache-line boundary on all mainstream x86_64/AArch64 parts, so
-/// a worker reading or updating one block's propensities touches exactly
-/// one cache line -- no split loads, and no false sharing with a
+/// a worker reading or updating one block's propensities never straddles
+/// a line at the block's own boundary, and never false-shares with a
 /// neighboring block a different worker is writing. `repr(C)` is required
 /// alongside it: without it the compiler is free to reorder these fields,
 /// which would silently desync this struct's in-memory layout from the
 /// byte-for-byte format `reactions.lut` is written in on disk. The five
-/// field arrays are sized so the struct is *exactly* 64 bytes with no
-/// trailing padding: `4*8 + 1*8 + 1*8 + 1*8 + 1*8 = 64`.
+/// field arrays are sized so the struct is *exactly* 320 bytes (5 cache
+/// lines) with no trailing padding: `4*32 + 1*32 + 2*32 + 2*32 + 1*32 =
+/// 320`.
+///
+/// **This block used to be exactly one 64-byte cache line with `LANES =
+/// 8`.** Widening `transition_a`/`transition_b` from `u8` to `u16` (to
+/// support more than 4 species -- see `SPECIES_BITS`'s doc comment) makes
+/// each lane 10 bytes instead of 8; `10 * LANES` only lands back on a
+/// clean multiple of 64 (needed so every block in the array stays
+/// 64-byte-aligned, and so no implicit tail padding sneaks in -- see the
+/// safety note on `write_lut`) at `LANES = 32`, giving a 320-byte, 5-line
+/// block instead of a 1-line one. A smaller `LANES` would need explicit
+/// reserved padding bytes to reach a 64-byte multiple; `LANES = 32` is
+/// the smallest lane count with zero waste, so that's what this uses
+/// instead of introducing an unused field.
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Debug)]
 pub struct ReactionLutBlock {
@@ -236,17 +259,18 @@ pub struct ReactionLutBlock {
     pub rate_q16: [u32; Self::LANES],
     /// Composition-rejection bin this lane's reaction currently belongs to.
     pub bin_id: [u8; Self::LANES],
-    /// Packed `(reactant_mask << 4) | product_mask` transition for the
+    /// Packed `(reactant_mask << 8) | product_mask` transition for the
     /// reaction's primary site -- the only site touched for a
-    /// monomolecular (adsorption/desorption) reaction.
-    pub transition_a: [u8; Self::LANES],
-    /// Packed `(reactant_mask << 4) | product_mask` transition for a
+    /// monomolecular (adsorption/desorption) reaction. Each mask is a
+    /// one-hot byte (see `SPECIES_BITS`), not a nibble.
+    pub transition_a: [u16; Self::LANES],
+    /// Packed `(reactant_mask << 8) | product_mask` transition for a
     /// *second*, spatially adjacent site. Meaningful only when
     /// `is_bimolecular` is set (e.g. a Langmuir-Hinshelwood surface
     /// reaction like `O* + CO* -> CO2 + 2*`, where site A's `O*` and site
     /// B's `CO*` both clear to `VACANT` in the same event); `0` and
     /// ignored otherwise.
-    pub transition_b: [u8; Self::LANES],
+    pub transition_b: [u16; Self::LANES],
     /// `1` if this lane is a two-site (bimolecular) reaction that touches
     /// both `transition_a`'s and `transition_b`'s sites atomically; `0`
     /// for an ordinary single-site (monomolecular) reaction that only
@@ -258,15 +282,17 @@ pub struct ReactionLutBlock {
 }
 
 impl ReactionLutBlock {
-    /// Reactions packed per 64-byte block. See the struct-level layout
-    /// comment for how this size was chosen to fill exactly one cache line.
-    pub const LANES: usize = 8;
+    /// Reactions packed per 320-byte block. See the struct-level layout
+    /// comment for how this lane count was chosen to divide evenly into
+    /// whole 64-byte cache lines with zero padding, given `u16`-wide
+    /// transition fields.
+    pub const LANES: usize = 32;
 }
 
 // Compile-time invariants the `unsafe` reinterpretation in `ReactionLut`
 // below depends on: if either ever drifts (e.g. a field is added), this
 // fails the build instead of silently corrupting reads.
-const _: () = assert!(std::mem::size_of::<ReactionLutBlock>() == 64);
+const _: () = assert!(std::mem::size_of::<ReactionLutBlock>() == 320);
 const _: () = assert!(std::mem::align_of::<ReactionLutBlock>() == 64);
 
 /// Split a flat global reaction id into its `(block_index, lane_index)`
@@ -469,8 +495,8 @@ impl ReactionLut {
 pub struct ReactionRecord {
     pub rate_q16: u32,
     pub bin_id: u8,
-    pub transition_a: u8,
-    pub transition_b: u8,
+    pub transition_a: u16,
+    pub transition_b: u16,
     pub is_bimolecular: bool,
 }
 
@@ -489,8 +515,8 @@ pub fn pack_records_into_blocks(mut records: Vec<ReactionRecord>) -> Vec<Reactio
     for chunk in records.chunks(ReactionLutBlock::LANES) {
         let mut rate_q16 = [0u32; ReactionLutBlock::LANES];
         let mut bin_id = [0u8; ReactionLutBlock::LANES];
-        let mut transition_a = [0u8; ReactionLutBlock::LANES];
-        let mut transition_b = [0u8; ReactionLutBlock::LANES];
+        let mut transition_a = [0u16; ReactionLutBlock::LANES];
+        let mut transition_b = [0u16; ReactionLutBlock::LANES];
         let mut is_bimolecular = [0u8; ReactionLutBlock::LANES];
 
         for (lane, r) in chunk.iter().enumerate() {
@@ -521,7 +547,7 @@ pub fn write_lut(path: impl AsRef<Path>, kind: LutKind, blocks: &[ReactionLutBlo
 
     // SAFETY: `ReactionLutBlock` is `repr(C, align(64))`, `Copy`, and every
     // field is a plain fixed-width integer array with no padding bytes
-    // (enforced by the `size_of::<ReactionLutBlock>() == 64` assertion
+    // (enforced by the `size_of::<ReactionLutBlock>() == 320` assertion
     // above), so reinterpreting `&[ReactionLutBlock]` as `&[u8]` for the
     // duration of this write is a sound, lossless byte-for-byte view --
     // there is no uninitialized padding to expose, and no lifetime hazard
@@ -546,12 +572,12 @@ mod tests {
     #[test]
     fn block_and_lane_computes_correct_coordinates() {
         assert_eq!(block_and_lane(0), (0, 0));
-        assert_eq!(block_and_lane(7), (0, 7));
-        assert_eq!(block_and_lane(8), (1, 0));
-        assert_eq!(block_and_lane(23), (2, 7));
+        assert_eq!(block_and_lane(31), (0, 31));
+        assert_eq!(block_and_lane(32), (1, 0));
+        assert_eq!(block_and_lane(95), (2, 31));
     }
 
-    fn rec(rate_q16: u32, bin_id: u8, transition_a: u8) -> ReactionRecord {
+    fn rec(rate_q16: u32, bin_id: u8, transition_a: u16) -> ReactionRecord {
         ReactionRecord {
             rate_q16,
             bin_id,
@@ -608,8 +634,8 @@ mod tests {
         let records = vec![ReactionRecord {
             rate_q16: 500,
             bin_id: 4,
-            transition_a: 0x10, // O* -> vacant
-            transition_b: 0x20, // CO* -> vacant
+            transition_a: (ADS_O as u16) << 8, // O* -> vacant
+            transition_b: (ADS_CO as u16) << 8, // CO* -> vacant
             is_bimolecular: true,
         }];
         let blocks = pack_records_into_blocks(records.clone());

@@ -140,19 +140,24 @@ fn species_index(species_bit: u8) -> Option<usize> {
     SPECIES_BITS.iter().position(|&b| b == species_bit)
 }
 
-/// Relative gas-phase partial-pressure multipliers for the *original*
-/// three tracked gas species (O2, H2, CO), in `SPECIES_BITS`' first three
-/// index slots -- a runtime simulator parameter (`kinetica --pressure-o2
-/// --pressure-h2 --pressure-co`), not baked into `reactions.lut`, so
-/// changing the feed-gas composition never requires rebuilding it. Without
-/// this, two runs meant to represent different partial pressures produced
-/// identical adsorption kinetics -- the same rate-constant table applied
-/// regardless of how much of each gas was actually being fed in.
+/// Relative gas-phase partial-pressure multipliers, indexed by species the
+/// same way `SPECIES_BITS`/`occupancy::OccupancyCounters` are -- a runtime
+/// simulator parameter (`kinetica --pressure-o2 --pressure-h2 --pressure-co
+/// --pressure-h2o`), not baked into `reactions.lut`, so changing the
+/// feed-gas composition never requires rebuilding it. Without this, two
+/// runs meant to represent different partial pressures produced identical
+/// adsorption kinetics -- the same rate-constant table applied regardless
+/// of how much of each gas was actually being fed in.
 ///
-/// Deliberately still sized `[f64; 3]`, not `NUM_SPECIES` -- see
-/// `pressure_factor`'s doc comment for why a 4th (or heteroatomic
-/// bimolecular) species doesn't get a pressure knob for free just by
-/// existing.
+/// Sized `NUM_SPECIES`, but index 3 (OH) is always ignored: OH only ever
+/// forms via the heteroatomic dissociative-adsorption path (water
+/// splitting), which `pressure_factor` short-circuits to `1.0` *before*
+/// ever indexing into this array -- see its doc comment for why a species
+/// that only ever appears as one side of a two-species gas reaction can't
+/// correctly be gated by looking up its own slot. H2O (index 4) *is* a
+/// real, used slot: `star + H2O(g) -> H2Ostar` is an ordinary single-gas
+/// monomolecular adsorption, same shape as O2/H2/CO, so it gates exactly
+/// like they do.
 ///
 /// Desorption and bimolecular *recombination* templates (CO-oxidation,
 /// H2-recombination) are untouched -- pressure only gates a reaction that
@@ -164,12 +169,12 @@ fn species_index(species_bit: u8) -> Option<usize> {
 /// propensities (every multiplier 1.0).
 #[derive(Clone, Copy, Debug)]
 pub struct Pressures {
-    pub values: [f64; 3],
+    pub values: [f64; NUM_SPECIES],
 }
 
 impl Pressures {
     pub const fn ones() -> Self {
-        Pressures { values: [1.0; 3] }
+        Pressures { values: [1.0; NUM_SPECIES] }
     }
 }
 
@@ -184,21 +189,24 @@ impl Pressures {
 /// an occupied pair, not a gas-phase reactant, so it's untouched, same as
 /// monomolecular desorption. A *heteroatomic* dissociative-adsorption
 /// template -- currently only water splitting, `2* + H2O(g) -> H* +
-/// OH*` -- genuinely does consume a gas-phase molecule, but `Pressures`
-/// only tracks O2/H2/CO: neither site's product species alone identifies
-/// "this reaction's gas is H2O" (site A produces H*, which *does* have a
-/// pressure slot, but gating on it would incorrectly tie water-splitting
-/// propensity to H2 pressure instead of H2O pressure). Rather than get
-/// that wrong silently, heteroatomic dissociative adsorption is treated
-/// as pressure-neutral until a real 4th pressure slot is added -- a
-/// documented simplification, not a bug (see README).
+/// OH*` -- genuinely does consume a gas-phase molecule (H2O), and
+/// `Pressures` *does* now carry a real H2O slot (index 4, gating H2O*'s
+/// own ordinary monomolecular adsorption below), but water splitting still
+/// can't use it: neither site's product species alone identifies "this
+/// reaction's gas is H2O" (site A produces H*, which has its own pressure
+/// slot, but gating on it would incorrectly tie water-splitting propensity
+/// to H2 pressure instead of H2O pressure; there's no single product
+/// species here that *means* "H2O consumed" the way H2O* itself would).
+/// Rather than get that wrong silently, heteroatomic dissociative
+/// adsorption stays pressure-neutral -- a documented simplification, not a
+/// bug (see README).
 fn pressure_factor(template: &ReactionRecord, pressures: &Pressures) -> f64 {
-    let reactant_mask = template.transition_a >> 4;
+    let reactant_mask = (template.transition_a >> 8) as u8;
     if reactant_mask != 0 {
         return 1.0; // desorption or recombination: no gas-phase reactant
     }
-    let product_mask = template.transition_a & 0x0F;
-    if template.is_bimolecular && product_mask != (template.transition_b & 0x0F) {
+    let product_mask = (template.transition_a & 0xFF) as u8;
+    if template.is_bimolecular && product_mask != (template.transition_b & 0xFF) as u8 {
         return 1.0; // heteroatomic dissociative adsorption -- see doc comment
     }
     species_index(product_mask)
@@ -419,8 +427,8 @@ impl OccupancyCounters {
     /// pattern -- the live weight its propensity is scaled by.
     fn live_count(&self, template: &ReactionRecord) -> u64 {
         if template.is_bimolecular {
-            let reactant_a = template.transition_a >> 4;
-            let reactant_b = template.transition_b >> 4;
+            let reactant_a = (template.transition_a >> 8) as u8;
+            let reactant_b = (template.transition_b >> 8) as u8;
             // Exhaustive match on which live pair-count pool this
             // template's reactant *pair* draws from, keyed off the
             // reactant species on both sides (not just site A) -- an
@@ -445,8 +453,8 @@ impl OccupancyCounters {
                 0
             }
         } else {
-            let reactant_mask = template.transition_a >> 4;
-            let product_mask = template.transition_a & 0x0F;
+            let reactant_mask = (template.transition_a >> 8) as u8;
+            let product_mask = (template.transition_a & 0xFF) as u8;
             let bucket = template.bin_id as usize;
             if bucket >= BUCKETS_PER_SPECIES {
                 return 0;
@@ -548,8 +556,8 @@ impl OccupancyCounters {
     /// *is* the ground truth (kept exactly in sync by `new`/
     /// `on_occupancy_change`), not a guess to be checked.
     fn find_monomolecular_site(&self, template: &ReactionRecord, rng: &mut Rng) -> Option<usize> {
-        let reactant_mask = template.transition_a >> 4;
-        let product_mask = template.transition_a & 0x0F;
+        let reactant_mask = (template.transition_a >> 8) as u8;
+        let product_mask = (template.transition_a & 0xFF) as u8;
         let bucket = template.bin_id as usize;
         if bucket >= BUCKETS_PER_SPECIES {
             return None;
@@ -571,8 +579,8 @@ impl OccupancyCounters {
         rows_in_band: usize,
         rng: &mut Rng,
     ) -> Option<(usize, usize)> {
-        let species_a_bit = template.transition_a >> 4;
-        let species_b_bit = template.transition_b >> 4;
+        let species_a_bit = (template.transition_a >> 8) as u8;
+        let species_b_bit = (template.transition_b >> 8) as u8;
         let n = patch_data.len();
         if n == 0 {
             return None;
@@ -626,7 +634,7 @@ fn neighbor_with_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{ADS_CO, ADS_H, ADS_O, VACANT};
+    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, VACANT};
 
     fn rng() -> Rng {
         Rng::seeded(42)
@@ -814,7 +822,7 @@ mod tests {
         ReactionRecord {
             rate_q16: rate,
             bin_id: bucket,
-            transition_a: species_bit, // reactant=VACANT(0), product=species
+            transition_a: species_bit as u16, // reactant=VACANT(0), product=species
             transition_b: 0,
             is_bimolecular: false,
         }
@@ -824,7 +832,7 @@ mod tests {
         ReactionRecord {
             rate_q16: rate,
             bin_id: bucket,
-            transition_a: species_bit << 4, // reactant=species, product=VACANT
+            transition_a: (species_bit as u16) << 8, // reactant=species, product=VACANT
             transition_b: 0,
             is_bimolecular: false,
         }
@@ -834,22 +842,28 @@ mod tests {
         ReactionRecord {
             rate_q16: rate,
             bin_id: 0,
-            transition_a: species_a_bit << 4,
-            transition_b: species_b_bit << 4,
+            transition_a: (species_a_bit as u16) << 8,
+            transition_b: (species_b_bit as u16) << 8,
             is_bimolecular: true,
         }
     }
 
     #[test]
     fn pressure_factor_only_scales_adsorption_templates() {
-        let pressures = Pressures { values: [2.0, 3.0, 5.0] };
+        let pressures = Pressures { values: [2.0, 3.0, 5.0, 1.0, 11.0] };
         // Adsorption: pressure_factor equals that species' own pressure.
         assert_eq!(pressure_factor(&ads_template(ADS_O, 0, 1), &pressures), 2.0);
         assert_eq!(pressure_factor(&ads_template(ADS_H, 0, 1), &pressures), 3.0);
         assert_eq!(pressure_factor(&ads_template(ADS_CO, 0, 1), &pressures), 5.0);
+        // H2O* adsorption is an ordinary single-gas monomolecular channel,
+        // same shape as O2/H2/CO -- gates on its own pressure slot exactly
+        // like they do (see `Pressures`' doc comment for why this differs
+        // from water-splitting's H* + OH* products, which stay neutral).
+        assert_eq!(pressure_factor(&ads_template(ADS_H2O, 0, 1), &pressures), 11.0);
         // Desorption and bimolecular: untouched by pressure, always 1.0.
         assert_eq!(pressure_factor(&des_template(ADS_O, 0, 1), &pressures), 1.0);
         assert_eq!(pressure_factor(&des_template(ADS_CO, 0, 1), &pressures), 1.0);
+        assert_eq!(pressure_factor(&des_template(ADS_H2O, 0, 1), &pressures), 1.0);
         assert_eq!(pressure_factor(&bimolecular_template(ADS_O, ADS_CO, 1), &pressures), 1.0);
     }
 
@@ -880,7 +894,7 @@ mod tests {
         let templates = vec![ads_template(ADS_CO, bucket, 1000)];
 
         let baseline = counters.total_propensity(&templates, &Pressures::ones());
-        let doubled = counters.total_propensity(&templates, &Pressures { values: [1.0, 1.0, 2.0] });
+        let doubled = counters.total_propensity(&templates, &Pressures { values: [1.0, 1.0, 2.0, 1.0, 1.0] });
         assert!(baseline > 0.0, "adsorption template should have nonzero live count");
         assert!((doubled - 2.0 * baseline).abs() < 1e-9);
 
@@ -888,7 +902,7 @@ mod tests {
         let des_templates = vec![des_template(ADS_CO, bucket, 1000)];
         let des_baseline = counters.total_propensity(&des_templates, &Pressures::ones());
         let des_under_pressure =
-            counters.total_propensity(&des_templates, &Pressures { values: [1.0, 1.0, 2.0] });
+            counters.total_propensity(&des_templates, &Pressures { values: [1.0, 1.0, 2.0, 1.0, 1.0] });
         assert_eq!(des_baseline, des_under_pressure);
     }
 
@@ -962,8 +976,8 @@ mod tests {
         let template = ReactionRecord {
             rate_q16: u32::MAX,
             bin_id: 0,
-            transition_a: ADS_O << 4,
-            transition_b: ADS_CO << 4,
+            transition_a: (ADS_O as u16) << 8,
+            transition_b: (ADS_CO as u16) << 8,
             is_bimolecular: true,
         };
         let templates = vec![template];
@@ -1013,8 +1027,8 @@ mod tests {
         ReactionRecord {
             rate_q16: rate,
             bin_id: 0,
-            transition_a: species_bit, // reactant=VACANT(0), product=species, both sites
-            transition_b: species_bit,
+            transition_a: species_bit as u16, // reactant=VACANT(0), product=species, both sites
+            transition_b: species_bit as u16,
             is_bimolecular: true,
         }
     }
@@ -1098,7 +1112,7 @@ mod tests {
 
     #[test]
     fn pressure_couples_dissociative_adsorption_same_as_monomolecular() {
-        let pressures = Pressures { values: [1.0, 7.0, 1.0] };
+        let pressures = Pressures { values: [1.0, 7.0, 1.0, 1.0, 1.0] };
         let template = dissociative_ads_template(ADS_H, 1);
         assert_eq!(pressure_factor(&template, &pressures), 7.0);
 
@@ -1112,8 +1126,8 @@ mod tests {
         ReactionRecord {
             rate_q16: rate,
             bin_id: 0,
-            transition_a: species_a_bit, // reactant=VACANT(0), product=species_a
-            transition_b: species_b_bit, // reactant=VACANT(0), product=species_b
+            transition_a: species_a_bit as u16, // reactant=VACANT(0), product=species_a
+            transition_b: species_b_bit as u16, // reactant=VACANT(0), product=species_b
             is_bimolecular: true,
         }
     }
@@ -1122,8 +1136,8 @@ mod tests {
         ReactionRecord {
             rate_q16: rate,
             bin_id: 0,
-            transition_a: species_a_bit << 4, // reactant=species_a, product=VACANT
-            transition_b: species_b_bit << 4, // reactant=species_b, product=VACANT
+            transition_a: (species_a_bit as u16) << 8, // reactant=species_a, product=VACANT
+            transition_b: (species_b_bit as u16) << 8, // reactant=species_b, product=VACANT
             is_bimolecular: true,
         }
     }
@@ -1199,7 +1213,7 @@ mod tests {
     /// `pressure_factor`'s doc comment.
     #[test]
     fn pressure_factor_is_neutral_for_heteroatomic_dissociative_adsorption() {
-        let pressures = Pressures { values: [1.0, 99.0, 1.0] }; // H2 pressure cranked up
+        let pressures = Pressures { values: [1.0, 99.0, 1.0, 1.0, 1.0] }; // H2 pressure cranked up
         let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1);
         assert_eq!(
             pressure_factor(&forward, &pressures),

@@ -33,13 +33,14 @@ struct Config {
     /// before running, for exercising the pipeline without a real OC20
     /// rate-constant export on hand.
     generate_lut: Option<usize>,
-    /// Relative partial pressures for the O2/H2/CO feed gas, applied only
-    /// to the occupancy-gated engine's adsorption channels (see
+    /// Relative partial pressures for the O2/H2/CO/H2O feed gas, applied
+    /// only to the occupancy-gated engine's adsorption channels (see
     /// `occupancy::Pressures`). Named after the gas-phase molecule fed in
-    /// (O2, H2, CO), not the surface species index it couples to.
+    /// (O2, H2, CO, H2O), not the surface species index it couples to.
     pressure_o2: f64,
     pressure_h2: f64,
     pressure_co: f64,
+    pressure_h2o: f64,
 }
 
 impl Config {
@@ -58,6 +59,7 @@ impl Config {
         let mut pressure_o2 = 1.0f64;
         let mut pressure_h2 = 1.0f64;
         let mut pressure_co = 1.0f64;
+        let mut pressure_h2o = 1.0f64;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -80,6 +82,7 @@ impl Config {
                 "--pressure-o2" => pressure_o2 = parse_value(&mut args, "--pressure-o2")?,
                 "--pressure-h2" => pressure_h2 = parse_value(&mut args, "--pressure-h2")?,
                 "--pressure-co" => pressure_co = parse_value(&mut args, "--pressure-co")?,
+                "--pressure-h2o" => pressure_h2o = parse_value(&mut args, "--pressure-h2o")?,
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unrecognized argument `{other}`\n\n{}", usage())),
             }
@@ -97,6 +100,7 @@ impl Config {
             pressure_o2,
             pressure_h2,
             pressure_co,
+            pressure_h2o,
         })
     }
 }
@@ -132,6 +136,9 @@ fn usage() -> String {
        --pressure-h2 <F>          Relative H2 partial pressure, gates H* adsorption\n                                    \
                                     [default: 1.0]\n    \
        --pressure-co <F>          Relative CO partial pressure, gates CO* adsorption\n                                    \
+                                    [default: 1.0]\n    \
+       --pressure-h2o <F>         Relative H2O partial pressure, gates H2O* adsorption\n                                    \
+                                    (does not affect water-splitting -- see README)\n                                    \
                                     [default: 1.0]\n    \
        -h, --help                 Print this message"
         .to_string()
@@ -193,12 +200,24 @@ fn run(config: &Config) -> std::io::Result<()> {
     );
     if lut.kind() == layout::LutKind::OccupancyGated {
         println!(
-            "kinetica: relative partial pressures: O2={} H2={} CO={}",
-            config.pressure_o2, config.pressure_h2, config.pressure_co
+            "kinetica: relative partial pressures: O2={} H2={} CO={} H2O={}",
+            config.pressure_o2, config.pressure_h2, config.pressure_co, config.pressure_h2o
         );
     }
+    // Index 3 (OH) has no independent gas-phase pressure knob -- OH only
+    // ever forms via the heteroatomic water-splitting reaction, which
+    // `occupancy::pressure_factor` always treats as pressure-neutral (see
+    // its doc comment), so this slot is never actually read. Kept at 1.0
+    // rather than omitted so the array stays indexed exactly like
+    // `layout::SPECIES_BITS`.
     let pressures = kinetica::occupancy::Pressures {
-        values: [config.pressure_o2, config.pressure_h2, config.pressure_co],
+        values: [
+            config.pressure_o2,
+            config.pressure_h2,
+            config.pressure_co,
+            1.0,
+            config.pressure_h2o,
+        ],
     };
 
     let start = Instant::now();
@@ -245,17 +264,17 @@ fn generate_demo_lut(path: &std::path::Path, count: usize) -> std::io::Result<()
             let raw = rng.next_u64();
             let rate_q16 = ((raw & 0x00FF_FFFF) as u32).max(1);
             let bin_id = (31 - rate_q16.leading_zeros()) as u8;
-            // Packed (reactant_mask << 4) | product_mask demo transitions,
+            // Packed (reactant_mask << 8) | product_mask demo transitions,
             // restricted to the bitflags defined in layout.rs.
-            let reactant_a = ((raw >> 24) & 0x7) as u8;
-            let product_a = ((raw >> 27) & 0x7) as u8;
-            let transition_a = (reactant_a << 4) | product_a;
+            let reactant_a = ((raw >> 24) & 0x7) as u16;
+            let product_a = ((raw >> 27) & 0x7) as u16;
+            let transition_a = (reactant_a << 8) | product_a;
 
             let is_bimolecular = (raw >> 30) & 0x7 == 0;
-            let reactant_b = ((raw >> 33) & 0x7) as u8;
-            let product_b = ((raw >> 36) & 0x7) as u8;
+            let reactant_b = ((raw >> 33) & 0x7) as u16;
+            let product_b = ((raw >> 36) & 0x7) as u16;
             let transition_b = if is_bimolecular {
-                (reactant_b << 4) | product_b
+                (reactant_b << 8) | product_b
             } else {
                 0
             };

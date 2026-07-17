@@ -69,7 +69,7 @@ fn same_patch_neighbor(rng: &mut Rng, site_idx: usize, width: usize, rows_in_ban
     Some(candidates[rng.next_u32_below(count as u32) as usize])
 }
 
-/// Apply one site's `(reactant_mask << 4) | product_mask` transition in
+/// Apply one site's `(reactant_mask << 8) | product_mask` transition in
 /// place and record it to the trajectory log. Shared by both the
 /// monomolecular path (called once) and the bimolecular path (called once
 /// per site) so the occupancy-update / logging logic exists in exactly
@@ -80,7 +80,7 @@ fn apply_and_record(
     width: usize,
     y0: usize,
     site_idx: usize,
-    transition: u8,
+    transition: u16,
     reaction_id: u32,
     sim_time_bits: u64,
     trajectory_tx: &Sender<TrajectoryRecord>,
@@ -555,14 +555,14 @@ mod tests {
                 records.push(ReactionRecord {
                     rate_q16: 1_000_000,
                     bin_id: bucket,
-                    transition_a: bit,
+                    transition_a: bit as u16,
                     transition_b: 0,
                     is_bimolecular: false,
                 });
                 records.push(ReactionRecord {
                     rate_q16: 1_000_000,
                     bin_id: bucket,
-                    transition_a: bit << 4,
+                    transition_a: (bit as u16) << 8,
                     transition_b: 0,
                     is_bimolecular: false,
                 });
@@ -632,7 +632,7 @@ mod tests {
             records.push(ReactionRecord {
                 rate_q16: u32::MAX,
                 bin_id: bucket,
-                transition_a: ADS_O << 4, // desorption: O* -> vacant
+                transition_a: (ADS_O as u16) << 8, // desorption: O* -> vacant
                 transition_b: 0,
                 is_bimolecular: false,
             });
@@ -696,7 +696,7 @@ mod tests {
             .map(|bucket| ReactionRecord {
                 rate_q16: u32::MAX,
                 bin_id: bucket,
-                transition_a: ADS_O << 4, // desorption only -- nothing replenishes O*
+                transition_a: (ADS_O as u16) << 8, // desorption only -- nothing replenishes O*
                 transition_b: 0,
                 is_bimolecular: false,
             })
@@ -745,14 +745,14 @@ mod tests {
             records.push(ReactionRecord {
                 rate_q16: 1_000_000,
                 bin_id: bucket,
-                transition_a: ADS_CO, // adsorption: VACANT -> CO*
+                transition_a: ADS_CO as u16, // adsorption: VACANT -> CO*
                 transition_b: 0,
                 is_bimolecular: false,
             });
             records.push(ReactionRecord {
                 rate_q16: 1_000_000,
                 bin_id: bucket,
-                transition_a: ADS_CO << 4, // desorption: CO* -> VACANT
+                transition_a: (ADS_CO as u16) << 8, // desorption: CO* -> VACANT
                 transition_b: 0,
                 is_bimolecular: false,
             });
@@ -782,7 +782,7 @@ mod tests {
         let baseline_co = run_with_pressure("baseline", Pressures::ones());
         let elevated_co = run_with_pressure(
             "elevated",
-            Pressures { values: [1.0, 1.0, 20.0] },
+            Pressures { values: [1.0, 1.0, 20.0, 1.0, 1.0] },
         );
 
         let total_sites = width * height;

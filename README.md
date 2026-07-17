@@ -42,8 +42,8 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind` |
 | `src/topology.rs`        | Neighbor topology (hexagonal, fcc(111) -- six neighbors per site) shared by the occupancy-gated engine and the bimolecular partner search |
 | `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
-| `src/occupancy.rs`       | Live per-patch occupancy counters + bounded-rejection site selection -- the `OccupancyGated`/real-data engine |
-| `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing patches, crossbeam boundary migration, double-buffered `io_uring` trajectory writer, dispatch between the two engines |
+| `src/occupancy.rs`       | Live per-patch occupancy counters + O(1) free-list site selection (bimolecular pair search still bounded-rejection) -- the `OccupancyGated`/real-data engine |
+| `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing, fully independent patches (no cross-patch communication), double-buffered `io_uring` trajectory writer, dispatch between the two engines |
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
 | `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
@@ -147,8 +147,9 @@ is actually present above the surface. Two runs meant to represent, say, a
 CO-rich feed versus an O2-rich one produced exactly the same coverage
 trajectory.
 
-`--pressure-o2`/`--pressure-h2`/`--pressure-co` (default `1.0` each) are
-runtime multipliers, not LUT-baked constants — `occupancy::Pressures`
+`--pressure-o2`/`--pressure-h2`/`--pressure-co`/`--pressure-h2o` (default
+`1.0` each) are runtime multipliers, not LUT-baked constants —
+`occupancy::Pressures`
 scales an adsorption template's propensity by the matching species'
 relative pressure at the point `total_propensity`/`select_event` compute
 live weights, alongside the existing `rate_q16 * live_count` factors. Nothing
@@ -244,21 +245,17 @@ directions from the one real forward barrier, using the same
 `Ea_rev = Ea_fwd - dE_rxn` thermodynamic-consistency relation the
 monomolecular adsorption/desorption pairs already use.
 
-**Four species is a hard ceiling for this architecture, not a round
-number.** `layout::apply_transition` packs a reaction's reactant and
-product species into a single byte as two 4-bit nibbles
-(`(reactant_mask << 4) | product_mask`); a one-hot species bit has to fit
+**Four species used to be a hard ceiling for this architecture — since
+widened to eight, see "Widening past four species: H2O\*" below.** At the
+time OH\* was added, `layout::apply_transition` packed a reaction's
+reactant and product species into a single byte as two 4-bit nibbles
+(`(reactant_mask << 4) | product_mask`); a one-hot species bit had to fit
 inside one nibble, capping `SPECIES_BITS` at `{0x01, 0x02, 0x04, 0x08}`.
-Going further for real would mean widening `ReactionLutBlock`'s
-`transition_a`/`transition_b` fields past one byte each, which breaks the
-cache-line-block size math the whole engine is built around (see
-`ReactionLutBlock`'s own doc comment) — a genuine architectural change,
-not something to do by adding one more species bit. OH\* was chosen to
-fill this last slot over two lower-priority candidates (CHO\*, H2O\* as a
-standalone molecular adsorbate) specifically because it's the one with a
-*real, measured* two-site barrier and the most direct connection to the
-O\*/H\* chemistry already modeled — see the project handoff for the
-data-landscape survey behind that call.
+OH\* was chosen to fill that last slot over two lower-priority candidates
+(CHO\*, H2O\* as a standalone molecular adsorbate) specifically because
+it's the one with a *real, measured* two-site barrier and the most direct
+connection to the O\*/H\* chemistry already modeled — see the project
+handoff for the data-landscape survey behind that call.
 
 **Engine-side, this needed remarkably little new code.** Site
 selection (`find_bimolecular_pair`) already handled an arbitrary reactant
@@ -271,12 +268,13 @@ It's now an exhaustive match over every known pair type, with a safe
 `0` fallback for anything unrecognized — a reaction this build doesn't
 know about is simply never selected, not miscounted. `pressure_factor`
 also needed a new case: water splitting's forward direction genuinely
-consumes a gas-phase molecule (H2O), but `occupancy::Pressures` only
-tracks O2/H2/CO, and naively keying off site A's product species (H\*,
-which *does* have a pressure slot) would incorrectly gate this reaction
-on H2 pressure instead. It's treated as pressure-neutral instead — a
-documented simplification, not a silent bug — until a real 4th pressure
-slot is added.
+consumes a gas-phase molecule (H2O), but at the time `occupancy::Pressures`
+only tracked O2/H2/CO, and naively keying off site A's product species
+(H\*, which *does* have a pressure slot) would incorrectly gate this
+reaction on H2 pressure instead. It's treated as pressure-neutral instead
+— a documented simplification, not a silent bug (this remains true even
+after `Pressures` gained a real H2O slot — see below for why water
+splitting still can't use it).
 
 **A real-scale finding worth stating plainly: water splitting is
 correctly wired into the real Pd(111) `reactions.lut`, but at these
@@ -303,6 +301,80 @@ channels): starting from an empty lattice, forward and reverse each fired
 ~100k times over 200k total events, settling into a small,
 detailed-balance-consistent equilibrium population of adjacent H\*/OH\*
 pairs, zero invalid occupancy states.
+
+## Widening past four species: H2O*
+
+A fifth adsorbate, **H2O\*** (`layout::ADS_H2O`), joins O\*/H\*/CO\*/OH\* —
+formed and consumed by an ordinary, real Pd(111) monomolecular reaction:
+molecular water adsorption/desorption, `star + H2O(g) <-> H2Ostar`. This is
+*not* the same reaction as water splitting above — H2O\* is water sitting
+intact on a single site, distinct from the H\*/OH\* dissociation products
+splitting produces on two sites. Real Catalysis-Hub Pd(111) samples exist
+for this pattern (3-4 records, count drifts slightly run to run — see
+"These real barriers are rare and vary run to run" below), BEP-estimated
+like O\*/H\*/CO\* since none carried a real activation energy at the time
+this was checked.
+
+**This required an actual architectural change, not just a new species
+constant.** `SPECIES_BITS` was hard-capped at four because
+`layout::apply_transition` packed a reaction's reactant and product
+species into a single byte as two 4-bit nibbles — a 5th one-hot bit
+(`0x10`) would have bled into the other nibble and silently corrupted the
+encoding (see the section above). The fix widens the packing unit from a
+nibble to a full byte: `transition_a`/`transition_b` are now `u16`
+(`(reactant_mask << 8) | product_mask`), each mask a one-hot byte, raising
+the ceiling from 4 species to 8. Deliberately *not* a switch from one-hot
+bitmask occupancy to a compact species-index encoding, even though that
+would have kept the nibble packing and needed no `ReactionLutBlock`
+resize at all — the bitmask's "more than one bit set is corruption" shape
+is exactly what `engine.rs`'s end-to-end test
+(`run_simulation_occupancy_gated_never_produces_an_invalid_multi_bit_site`)
+uses to catch a reaction firing on an unverified site, a real bug class
+this project hit once already (see "Occupancy-gated kMC" above). Keeping
+that verification technique intact, at the cost of `reactions.lut` size,
+was judged worth more than the byte savings.
+
+**Widening `transition_a`/`transition_b` moved `ReactionLutBlock` off a
+single 64-byte cache line.** Each lane grew from 8 bytes to 10
+(`rate_q16` 4 + `bin_id` 1 + `transition_a` 2 + `transition_b` 2 +
+`is_bimolecular` 1); `LANES` (reactions packed per block) had to change
+from 8 to a value where `10 * LANES` is itself a clean multiple of 64, so
+every block in the array stays cache-line-aligned with **no implicit tail
+padding** — padding would mean writing/reading uninitialized bytes when
+`write_lut`/`ReactionLut::open` reinterpret the struct as a raw byte
+slice, which the existing safety comments are explicit about avoiding.
+`LANES = 32` is the smallest lane count with zero waste, giving a
+320-byte, 5-cache-line block instead of a 1-line one — a real, deliberate
+cost (more bytes per reaction, more lines touched per block access) paid
+for real headroom (up to 8 species, only 5 used) rather than squeezing in
+exactly one more species and immediately hitting the ceiling again.
+
+**`occupancy::Pressures` also gained a real 5th slot.** Unlike water
+splitting, H2O\* adsorption is an *ordinary* single-gas monomolecular
+channel — same shape as O2/H2/CO — so it gates on its own partial pressure
+exactly like they do: `kinetica --pressure-h2o <F>`. This is a genuinely
+different situation from water splitting's own gas-phase dependency,
+which stays pressure-neutral even now that a real H2O slot exists: water
+splitting's forward direction produces *two different* species (H\* and
+OH\*) on two different sites, so there's still no single product species
+that identifies "this reaction's gas was H2O" the way H2O\* itself does.
+`Pressures`' 4th slot (index 3, OH) stays permanently unused for the same
+reason — OH\* only ever forms via that same short-circuited path.
+
+**Verified against the real Pd(111) `reactions.lut` through the actual
+release binary.** A rebuild with the current live data (O:6, H:9, CO:3,
+H2O:4 real monomolecular records, 2 real water-splitting bimolecular
+records, 0 recombination) produced 34 reactions (up from 26); a 128×128
+lattice run from a clean start reached zero invalid occupancy states with
+H2O\* genuinely present on the lattice (1,112 of 16,384 sites, ~6.8%, at
+default pressures). Pressure coupling was checked the same way the
+CO/H2/O2 knobs were originally verified: `--pressure-h2o 20.0` raised H2O\*
+coverage to 21.1% with O\*/CO\* correspondingly displaced (all species
+still compete for the same vacant-site pool), zero invalid occupancy
+states in either run. All 91 tests continue to pass, `cargo clippy
+--all-targets` stays clean, and no test needed a new verification
+strategy — every existing assertion (including the multi-bit-occupancy
+canary above) transferred over the widened encoding unchanged.
 
 ## Building `reactions.lut` from real data
 

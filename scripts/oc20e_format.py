@@ -6,10 +6,14 @@ Format (little-endian):
     magic:        8 bytes  b"OC20E003"
     record_count: u32
     records[count]:
-        species:      u8   (0 = O, 1 = H, 2 = CO, 3 = OH -- OH is sourced
-                            entirely from the bimolecular water-splitting
-                            reaction below, never from a record in this
-                            format, but shares the same index space)
+        species:      u8   (0 = O, 1 = H, 2 = CO, 3 = OH, 4 = H2O -- OH is
+                            sourced entirely from the bimolecular
+                            water-splitting reaction below, never from a
+                            record in this format, but shares the same
+                            index space. H2O *is* sourced from a record in
+                            this format, same as O/H/CO: molecularly
+                            adsorbed water, `star + H2O(g) -> H2Ostar`,
+                            distinct from the H*/OH* dissociation products)
         energy_mev:   i32  (reaction/adsorption energy, milli-eV)
         sid:          u32  (source system/reaction id, for traceability only)
         has_real_ea:  u8   (1 if `real_ea_mev` is a real DFT-computed

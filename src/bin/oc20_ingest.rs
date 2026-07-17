@@ -80,8 +80,13 @@ use kinetica::occupancy::BUCKETS_PER_SPECIES;
 /// scripts. Index 3 (OH) has no OC20 equivalent -- it's sourced entirely
 /// from the water-splitting bimolecular reaction below, never from a
 /// monomolecular `--input` energy record (see `DISSOCIATIVE_SPECIES` and
-/// the bimolecular-records loop in `run`).
-const SPECIES_NAMES: [&str; 4] = ["O", "H", "CO", "OH"];
+/// the bimolecular-records loop in `run`). Index 4 (H2O, molecularly
+/// adsorbed water, distinct from the H*/OH* dissociation products above)
+/// *is* sourced from a monomolecular `--input` record, same as O/H/CO --
+/// real Pd(111) `star + H2O(g) -> H2Ostar` samples exist in Catalysis-Hub
+/// (3 records as of this writing), BEP-estimated like the others since
+/// none carry a real activation energy.
+const SPECIES_NAMES: [&str; 5] = ["O", "H", "CO", "OH", "H2O"];
 
 /// Species indices whose adsorption is genuinely a two-site dissociative
 /// step (`2* + X2(g) -> 2 X*`) rather than a single-site one: O (from
@@ -665,7 +670,7 @@ fn run(config: &Config) -> io::Result<()> {
     // transition_b is only meaningful (and non-zero) for a bimolecular
     // record; bucket_id becomes each `ReactionRecord`'s `bin_id` (unused/0
     // for bimolecular templates -- see `occupancy.rs`).
-    let mut raw_rates: Vec<(f64, u8, u8, bool, u8)> = Vec::new();
+    let mut raw_rates: Vec<(f64, u16, u16, bool, u8)> = Vec::new();
     let mut ads_count = 0usize;
     let mut dissociative_ads_count = 0usize;
     let mut des_count = 0usize;
@@ -676,20 +681,20 @@ fn run(config: &Config) -> io::Result<()> {
             let ea_fwd = activation_energy_ev(bucket.mean_energy_ev, bucket.real_ea_ev, config);
             let k_ads = rate_from_activation(ea_fwd, config);
             if dissociative {
-                // transition_a = transition_b = 0x0_species (both sites:
+                // transition_a = transition_b = 0x00_species (both sites:
                 // vacant -> species), un-bucketed like other bimolecular
                 // records -- see `occupancy::OccupancyCounters::live_count`.
-                raw_rates.push((k_ads, species_bit, species_bit, true, 0));
+                raw_rates.push((k_ads, species_bit as u16, species_bit as u16, true, 0));
                 dissociative_ads_count += 1;
             } else {
-                raw_rates.push((k_ads, species_bit, 0, false, bucket_idx as u8)); // 0x0_species (adsorption)
+                raw_rates.push((k_ads, species_bit as u16, 0, false, bucket_idx as u8)); // 0x00_species (adsorption)
                 ads_count += 1;
             }
 
             if !replaces_desorption[species] {
                 let ea_rev = (ea_fwd - bucket.mean_energy_ev).max(0.0);
                 let k_des = rate_from_activation(ea_rev, config);
-                raw_rates.push((k_des, species_bit << 4, 0, false, bucket_idx as u8)); // species_0x0 (desorption)
+                raw_rates.push((k_des, (species_bit as u16) << 8, 0, false, bucket_idx as u8)); // species_0x00 (desorption)
                 des_count += 1;
             }
         }
@@ -733,16 +738,16 @@ fn run(config: &Config) -> io::Result<()> {
         if rec.is_dissociative {
             // Forward: 2* -> species_a* + species_b* (both sites: vacant
             // -> species).
-            raw_rates.push((k_fwd, bit_a, bit_b, true, 0));
+            raw_rates.push((k_fwd, bit_a as u16, bit_b as u16, true, 0));
             // Reverse: species_a* + species_b* -> 2* (both sites: species
             // -> vacant), associative desorption.
             let ea_rev = (rec.ea_ev - rec.energy_ev).max(0.0);
             let k_rev = rate_from_activation(ea_rev, config);
-            raw_rates.push((k_rev, bit_a << 4, bit_b << 4, true, 0));
+            raw_rates.push((k_rev, (bit_a as u16) << 8, (bit_b as u16) << 8, true, 0));
             dissociative_bimolecular_count += 1;
         } else {
-            // transition_a/b = species_0x0 (each site: occupied -> vacant).
-            raw_rates.push((k_fwd, bit_a << 4, bit_b << 4, true, 0));
+            // transition_a/b = species_0x00 (each site: occupied -> vacant).
+            raw_rates.push((k_fwd, (bit_a as u16) << 8, (bit_b as u16) << 8, true, 0));
         }
     }
 
@@ -1274,8 +1279,8 @@ mod tests {
             .collect();
         assert_eq!(bimolecular.len(), 1, "exactly one bimolecular reaction, no reverse built");
         let r = bimolecular[0];
-        assert_eq!(r.transition_a, layout::ADS_O << 4); // O* -> vacant
-        assert_eq!(r.transition_b, layout::ADS_CO << 4); // CO* -> vacant
+        assert_eq!(r.transition_a, (layout::ADS_O as u16) << 8); // O* -> vacant
+        assert_eq!(r.transition_b, (layout::ADS_CO as u16) << 8); // CO* -> vacant
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&bi_path);
@@ -1333,13 +1338,13 @@ mod tests {
 
         let o_desorption = real_records
             .iter()
-            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_O << 4)
+            .filter(|r| !r.is_bimolecular && r.transition_a == (layout::ADS_O as u16) << 8)
             .count();
         assert_eq!(o_desorption, 1, "O's monomolecular desorption must be untouched");
 
         let h_desorption = real_records
             .iter()
-            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_H << 4)
+            .filter(|r| !r.is_bimolecular && r.transition_a == (layout::ADS_H as u16) << 8)
             .count();
         assert_eq!(
             h_desorption, 0,
@@ -1348,13 +1353,13 @@ mod tests {
 
         let o_dissociative_adsorption = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_O && r.transition_b == layout::ADS_O)
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_O as u16 && r.transition_b == layout::ADS_O as u16)
             .count();
         assert_eq!(o_dissociative_adsorption, 1, "O's dissociative adsorption is built regardless of desorption replacement");
 
         let h_dissociative_adsorption = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H && r.transition_b == layout::ADS_H)
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H as u16 && r.transition_b == layout::ADS_H as u16)
             .count();
         assert_eq!(
             h_dissociative_adsorption, 1,
@@ -1363,11 +1368,11 @@ mod tests {
 
         let recombination_bimolecular: Vec<_> = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H << 4)
+            .filter(|r| r.is_bimolecular && r.transition_a == (layout::ADS_H as u16) << 8)
             .collect();
         assert_eq!(recombination_bimolecular.len(), 1);
-        assert_eq!(recombination_bimolecular[0].transition_a, layout::ADS_H << 4);
-        assert_eq!(recombination_bimolecular[0].transition_b, layout::ADS_H << 4);
+        assert_eq!(recombination_bimolecular[0].transition_a, (layout::ADS_H as u16) << 8);
+        assert_eq!(recombination_bimolecular[0].transition_b, (layout::ADS_H as u16) << 8);
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&bi_path);
@@ -1420,14 +1425,14 @@ mod tests {
 
         let ads_bin_ids: std::collections::BTreeSet<u8> = real_records
             .iter()
-            .filter(|r| r.transition_a == layout::ADS_CO)
+            .filter(|r| r.transition_a == layout::ADS_CO as u16)
             .map(|r| r.bin_id)
             .collect();
         assert_eq!(ads_bin_ids, [0u8, 1, 2, 3].into_iter().collect());
 
         let des_bin_ids: std::collections::BTreeSet<u8> = real_records
             .iter()
-            .filter(|r| r.transition_a == layout::ADS_CO << 4)
+            .filter(|r| r.transition_a == (layout::ADS_CO as u16) << 8)
             .map(|r| r.bin_id)
             .collect();
         assert_eq!(des_bin_ids, [0u8, 1, 2, 3].into_iter().collect());
@@ -1475,6 +1480,7 @@ mod tests {
             .collect();
 
         for (name, bit) in [("O", layout::ADS_O), ("H", layout::ADS_H)] {
+            let bit = bit as u16;
             let dissociative = real_records
                 .iter()
                 .filter(|r| r.is_bimolecular && r.transition_a == bit && r.transition_b == bit)
@@ -1489,12 +1495,12 @@ mod tests {
 
         let co_monomolecular_ads = real_records
             .iter()
-            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_CO)
+            .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_CO as u16)
             .count();
         assert_eq!(co_monomolecular_ads, 1, "CO adsorbs molecularly -- must stay monomolecular");
         let co_dissociative = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_CO)
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_CO as u16)
             .count();
         assert_eq!(co_dissociative, 0, "CO must not be built as a dissociative-adsorption record");
 
@@ -1503,7 +1509,7 @@ mod tests {
         for bit in [layout::ADS_O, layout::ADS_H, layout::ADS_CO] {
             let desorption = real_records
                 .iter()
-                .filter(|r| !r.is_bimolecular && r.transition_a == bit << 4)
+                .filter(|r| !r.is_bimolecular && r.transition_a == (bit as u16) << 8)
                 .count();
             assert_eq!(desorption, 1);
         }
@@ -1574,14 +1580,14 @@ mod tests {
 
         let forward: Vec<_> = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H && r.transition_b == layout::ADS_OH)
+            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H as u16 && r.transition_b == layout::ADS_OH as u16)
             .collect();
         assert_eq!(forward.len(), 1, "forward dissociative-adsorption record must be built");
 
         let reverse: Vec<_> = real_records
             .iter()
             .filter(|r| {
-                r.is_bimolecular && r.transition_a == layout::ADS_H << 4 && r.transition_b == layout::ADS_OH << 4
+                r.is_bimolecular && r.transition_a == (layout::ADS_H as u16) << 8 && r.transition_b == (layout::ADS_OH as u16) << 8
             })
             .collect();
         assert_eq!(reverse.len(), 1, "reverse associative-desorption record must be built too");

@@ -346,7 +346,7 @@ mod tests {
             .map(|(rate_q16, bin_id, transition_a)| layout::ReactionRecord {
                 rate_q16,
                 bin_id,
-                transition_a,
+                transition_a: transition_a as u16,
                 transition_b: 0,
                 is_bimolecular: false,
             })

@@ -64,12 +64,17 @@ API_URL = "https://api.catalysis-hub.org/graphql"
 
 # (species index, gas reactant key, gas stoichiometry, adsorbed product key)
 # Species indices match extract_energies.py / oc20_ingest.rs: 0=O, 1=H,
-# 2=CO. (3=OH exists in the shared index space but is never sourced via
-# this single-site pattern -- see DISSOCIATIVE_PATTERNS below.)
+# 2=CO, 4=H2O. (3=OH exists in the shared index space but is never sourced
+# via this single-site pattern -- see DISSOCIATIVE_PATTERNS below.) H2O is
+# molecularly adsorbed (1.0 stoichiometry, one site), same shape as CO --
+# distinct from the *dissociative* `2* + H2O(g) -> H* + OH*` reaction in
+# DISSOCIATIVE_PATTERNS, which consumes the same gas but produces two
+# different single-atom species on two different sites instead.
 SPECIES_PATTERNS = [
     (0, "O2gas", 0.5, "Ostar"),
     (1, "H2gas", 0.5, "Hstar"),
     (2, "COgas", 1.0, "COstar"),
+    (4, "H2Ogas", 1.0, "H2Ostar"),
 ]
 
 # Looser per-species key sets for the real-barrier pass: just "does this
@@ -81,6 +86,7 @@ REAL_BARRIER_PATTERNS = [
     (0, {"star", "O2gas", "Ogas"}, "Ostar"),
     (1, {"star", "H2gas"}, "Hstar"),
     (2, {"star", "COgas"}, "COstar"),
+    (4, {"star", "H2Ogas"}, "H2Ostar"),
 ]
 
 # Bimolecular (two-site) *recombination* reactions: every reactant species
