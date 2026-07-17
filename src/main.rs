@@ -66,12 +66,8 @@ impl Config {
                 "--lattice-path" => {
                     lattice_path = PathBuf::from(next_value(&mut args, "--lattice-path")?)
                 }
-                "--lattice-width" => {
-                    lattice_width = parse_value(&mut args, "--lattice-width")?
-                }
-                "--lattice-height" => {
-                    lattice_height = parse_value(&mut args, "--lattice-height")?
-                }
+                "--lattice-width" => lattice_width = parse_value(&mut args, "--lattice-width")?,
+                "--lattice-height" => lattice_height = parse_value(&mut args, "--lattice-height")?,
                 "--lut-path" => lut_path = PathBuf::from(next_value(&mut args, "--lut-path")?),
                 "--trajectory-path" => {
                     trajectory_path = PathBuf::from(next_value(&mut args, "--trajectory-path")?)
@@ -106,7 +102,8 @@ impl Config {
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("`{flag}` requires a value"))
+    args.next()
+        .ok_or_else(|| format!("`{flag}` requires a value"))
 }
 
 fn parse_value<T: std::str::FromStr>(
@@ -177,9 +174,16 @@ fn run(config: &Config) -> std::io::Result<()> {
         config.lattice_height,
         config.lattice_path.display()
     );
-    let mut lattice = SiteLattice::open(&config.lattice_path, config.lattice_width, config.lattice_height)?;
+    let mut lattice = SiteLattice::open(
+        &config.lattice_path,
+        config.lattice_width,
+        config.lattice_height,
+    )?;
 
-    println!("kinetica: mapping reaction LUT {}", config.lut_path.display());
+    println!(
+        "kinetica: mapping reaction LUT {}",
+        config.lut_path.display()
+    );
     let lut = ReactionLut::open(&config.lut_path)?;
     let engine_name = match lut.kind() {
         layout::LutKind::Static => "static composition-rejection (gillespie.rs)",

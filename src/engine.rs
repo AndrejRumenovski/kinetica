@@ -54,7 +54,12 @@ use crate::occupancy::{OccupancyCounters, Pressures};
 /// updated correctly at all. Returns `None` only when `site_idx` has no
 /// neighbor at all within the patch (a degenerate 1x1 patch) -- callers
 /// should skip the event in that case rather than force one.
-fn same_patch_neighbor(rng: &mut Rng, site_idx: usize, width: usize, rows_in_band: usize) -> Option<usize> {
+fn same_patch_neighbor(
+    rng: &mut Rng,
+    site_idx: usize,
+    width: usize,
+    rows_in_band: usize,
+) -> Option<usize> {
     let all = crate::topology::all_neighbors(site_idx, width, rows_in_band);
     let mut candidates = [0usize; crate::topology::MAX_NEIGHBORS];
     let mut count = 0usize;
@@ -128,12 +133,40 @@ fn run_patch(
             // `same_patch_neighbor`'s doc comment for why it's constrained
             // that way); if site A has none (a degenerate 1x1 patch), this
             // event is skipped rather than forced onto an invalid site.
-            if let Some(site_b) = same_patch_neighbor(&mut domain.rng, site_a, width, rows_in_band) {
-                apply_and_record(data, width, y0, site_a, r.transition_a, reaction_id, sim_time_bits, trajectory_tx);
-                apply_and_record(data, width, y0, site_b, r.transition_b, reaction_id, sim_time_bits, trajectory_tx);
+            if let Some(site_b) = same_patch_neighbor(&mut domain.rng, site_a, width, rows_in_band)
+            {
+                apply_and_record(
+                    data,
+                    width,
+                    y0,
+                    site_a,
+                    r.transition_a,
+                    reaction_id,
+                    sim_time_bits,
+                    trajectory_tx,
+                );
+                apply_and_record(
+                    data,
+                    width,
+                    y0,
+                    site_b,
+                    r.transition_b,
+                    reaction_id,
+                    sim_time_bits,
+                    trajectory_tx,
+                );
             }
         } else {
-            apply_and_record(data, width, y0, site_a, r.transition_a, reaction_id, sim_time_bits, trajectory_tx);
+            apply_and_record(
+                data,
+                width,
+                y0,
+                site_a,
+                r.transition_a,
+                reaction_id,
+                sim_time_bits,
+                trajectory_tx,
+            );
         }
 
         let _ = tau; // waiting time already folded into domain.sim_time
@@ -185,22 +218,46 @@ fn run_patch_occupancy_gated(
         let tau = -u.ln() / total;
         sim_time += tau;
 
-        let Some((reaction_id, site_a, site_b)) =
-            counters.select_event(&templates, &weights, total, data, width, rows_in_band, &mut rng)
-        else {
+        let Some((reaction_id, site_a, site_b)) = counters.select_event(
+            &templates,
+            &weights,
+            total,
+            data,
+            width,
+            rows_in_band,
+            &mut rng,
+        ) else {
             break; // structurally unreachable given total > 0 above, but handled defensively
         };
         let r = templates[reaction_id as usize];
         let sim_time_bits = sim_time.to_bits();
 
         let old_a = data[site_a];
-        apply_and_record(data, width, y0, site_a, r.transition_a, reaction_id, sim_time_bits, trajectory_tx);
+        apply_and_record(
+            data,
+            width,
+            y0,
+            site_a,
+            r.transition_a,
+            reaction_id,
+            sim_time_bits,
+            trajectory_tx,
+        );
         let new_a = data[site_a];
         counters.on_occupancy_change(data, site_a, width, rows_in_band, old_a, new_a, seed);
 
         if let Some(site_b) = site_b {
             let old_b = data[site_b];
-            apply_and_record(data, width, y0, site_b, r.transition_b, reaction_id, sim_time_bits, trajectory_tx);
+            apply_and_record(
+                data,
+                width,
+                y0,
+                site_b,
+                r.transition_b,
+                reaction_id,
+                sim_time_bits,
+                trajectory_tx,
+            );
             let new_b = data[site_b];
             counters.on_occupancy_change(data, site_b, width, rows_in_band, old_b, new_b, seed);
         }
@@ -247,10 +304,19 @@ pub fn run_simulation(
             let seed = 0x5EED_0000_0000_0000u64 ^ (i as u64);
 
             scope.spawn(move |_| match lut.kind() {
-                LutKind::Static => run_patch((y0, y1), width, data, lut, steps_per_patch, seed, &tx),
-                LutKind::OccupancyGated => {
-                    run_patch_occupancy_gated((y0, y1), width, data, lut, steps_per_patch, seed, &tx, pressures)
+                LutKind::Static => {
+                    run_patch((y0, y1), width, data, lut, steps_per_patch, seed, &tx)
                 }
+                LutKind::OccupancyGated => run_patch_occupancy_gated(
+                    (y0, y1),
+                    width,
+                    data,
+                    lut,
+                    steps_per_patch,
+                    seed,
+                    &tx,
+                    pressures,
+                ),
             });
         }
     });
@@ -472,22 +538,30 @@ mod tests {
             for _ in 0..20 {
                 let neighbor = same_patch_neighbor(&mut rng, site_idx, width, rows_in_band)
                     .expect("every site in a >1x1 patch has at least one neighbor");
-                assert!(neighbor < width * rows_in_band, "neighbor out of patch bounds");
+                assert!(
+                    neighbor < width * rows_in_band,
+                    "neighbor out of patch bounds"
+                );
 
                 // "Adjacent" on the hexagonal (fcc(111)) topology isn't a
                 // Manhattan-distance-1 relationship (diagonal neighbors
                 // shift both row and column) -- the actual invariant is
                 // that `neighbor` is one of `site_idx`'s topology-defined
                 // neighbors, and adjacency is reciprocal both ways.
-                let forward: Vec<usize> = crate::topology::all_neighbors(site_idx, width, rows_in_band)
-                    .into_iter()
-                    .flatten()
-                    .collect();
-                assert!(forward.contains(&neighbor), "not a topology neighbor of site_idx");
-                let back: Vec<usize> = crate::topology::all_neighbors(neighbor, width, rows_in_band)
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let forward: Vec<usize> =
+                    crate::topology::all_neighbors(site_idx, width, rows_in_band)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                assert!(
+                    forward.contains(&neighbor),
+                    "not a topology neighbor of site_idx"
+                );
+                let back: Vec<usize> =
+                    crate::topology::all_neighbors(neighbor, width, rows_in_band)
+                        .into_iter()
+                        .flatten()
+                        .collect();
                 assert!(back.contains(&site_idx), "adjacency must be reciprocal");
             }
         }
@@ -573,7 +647,15 @@ mod tests {
         let lut = ReactionLut::open(&lut_path).unwrap();
         assert_eq!(lut.kind(), LutKind::OccupancyGated);
 
-        run_simulation(&mut lattice, &lut, 2, 2000, &trajectory_path, &Pressures::ones()).unwrap();
+        run_simulation(
+            &mut lattice,
+            &lut,
+            2,
+            2000,
+            &trajectory_path,
+            &Pressures::ones(),
+        )
+        .unwrap();
 
         for i in 0..width * height {
             let byte = lattice.get(i);
@@ -609,7 +691,9 @@ mod tests {
     /// the entire run regardless of what happens on patch 0's boundary.
     #[test]
     fn run_simulation_patches_never_touch_each_others_real_boundary_row() {
-        use crate::layout::{self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_H, ADS_O, VACANT};
+        use crate::layout::{
+            self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_H, ADS_O, VACANT,
+        };
         use crate::test_support::temp_path;
 
         let lattice_path = temp_path("boundary_lattice");
@@ -641,7 +725,15 @@ mod tests {
         layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
         let lut = ReactionLut::open(&lut_path).unwrap();
 
-        run_simulation(&mut lattice, &lut, 2, 500, &trajectory_path, &Pressures::ones()).unwrap();
+        run_simulation(
+            &mut lattice,
+            &lut,
+            2,
+            500,
+            &trajectory_path,
+            &Pressures::ones(),
+        )
+        .unwrap();
 
         for col in 0..width {
             assert_eq!(
@@ -655,7 +747,11 @@ mod tests {
         // did desorb (otherwise row 2 staying ADS_H would be a vacuous
         // pass rather than a real test of cross-patch isolation).
         for col in 0..width {
-            assert_eq!(lattice.get(width + col), VACANT, "row 1 col {col} should have desorbed");
+            assert_eq!(
+                lattice.get(width + col),
+                VACANT,
+                "row 1 col {col} should have desorbed"
+            );
         }
 
         let _ = std::fs::remove_file(&lattice_path);
@@ -670,7 +766,9 @@ mod tests {
     /// never panicking or spinning once nothing matches anymore.
     #[test]
     fn run_simulation_occupancy_gated_goes_quiescent_once_reactant_is_depleted() {
-        use crate::layout::{self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_O, VACANT};
+        use crate::layout::{
+            self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_O, VACANT,
+        };
         use crate::test_support::temp_path;
 
         let lattice_path = temp_path("occ_quiescent_lattice");
@@ -709,10 +807,22 @@ mod tests {
         // go quiescent (total_propensity == 0 breaking the loop), this
         // would still terminate, but the point is confirming the *state*
         // afterward is fully vacant, not that it doesn't hang.
-        run_simulation(&mut lattice, &lut, 1, 1000, &trajectory_path, &Pressures::ones()).unwrap();
+        run_simulation(
+            &mut lattice,
+            &lut,
+            1,
+            1000,
+            &trajectory_path,
+            &Pressures::ones(),
+        )
+        .unwrap();
 
         for i in 0..width * height {
-            assert_eq!(lattice.get(i), VACANT, "site {i} should be vacant after the only O* desorbed");
+            assert_eq!(
+                lattice.get(i),
+                VACANT,
+                "site {i} should be vacant after the only O* desorbed"
+            );
         }
 
         let _ = std::fs::remove_file(&lattice_path);
@@ -729,7 +839,9 @@ mod tests {
     /// different adsorption kinetics.
     #[test]
     fn run_simulation_raising_adsorption_pressure_shifts_steady_state_coverage() {
-        use crate::layout::{self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_CO, VACANT};
+        use crate::layout::{
+            self, LutKind, ReactionLut, ReactionRecord, SiteLattice, ADS_CO, VACANT,
+        };
         use crate::test_support::temp_path;
 
         let width = 16;
@@ -772,7 +884,9 @@ mod tests {
 
             run_simulation(&mut lattice, &lut, 2, 20_000, &trajectory_path, &pressures).unwrap();
 
-            let co_count = (0..width * height).filter(|&i| lattice.get(i) == ADS_CO).count();
+            let co_count = (0..width * height)
+                .filter(|&i| lattice.get(i) == ADS_CO)
+                .count();
 
             let _ = std::fs::remove_file(&lattice_path);
             let _ = std::fs::remove_file(&trajectory_path);
@@ -782,7 +896,9 @@ mod tests {
         let baseline_co = run_with_pressure("baseline", Pressures::ones());
         let elevated_co = run_with_pressure(
             "elevated",
-            Pressures { values: [1.0, 1.0, 20.0, 1.0, 1.0] },
+            Pressures {
+                values: [1.0, 1.0, 20.0, 1.0, 1.0],
+            },
         );
 
         let total_sites = width * height;

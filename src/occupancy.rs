@@ -52,7 +52,9 @@
 //! free-list above was built for).
 
 use crate::gillespie::Rng;
-use crate::layout::{self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, NUM_SPECIES, SPECIES_BITS};
+use crate::layout::{
+    self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, NUM_SPECIES, SPECIES_BITS,
+};
 
 /// Quantile buckets `oc20_ingest`'s `bucket_by_quantile` splits each
 /// species' real DFT samples into. Must agree with the ingest tool: the
@@ -174,7 +176,9 @@ pub struct Pressures {
 
 impl Pressures {
     pub const fn ones() -> Self {
-        Pressures { values: [1.0; NUM_SPECIES] }
+        Pressures {
+            values: [1.0; NUM_SPECIES],
+        }
     }
 }
 
@@ -657,17 +661,22 @@ mod tests {
     ) -> Option<(u32, usize, Option<usize>)> {
         let weights = counters.weights(templates, pressures);
         let total: f64 = weights.iter().sum();
-        counters.select_event(templates, &weights, total, patch_data, width, rows_in_band, rng)
+        counters.select_event(
+            templates,
+            &weights,
+            total,
+            patch_data,
+            width,
+            rows_in_band,
+            rng,
+        )
     }
 
     #[test]
     fn site_bucket_is_deterministic() {
         for site in [0usize, 1, 1000, 999_999] {
             for species in SPECIES_BITS {
-                assert_eq!(
-                    site_bucket(site, species, 7),
-                    site_bucket(site, species, 7)
-                );
+                assert_eq!(site_bucket(site, species, 7), site_bucket(site, species, 7));
             }
         }
     }
@@ -705,11 +714,15 @@ mod tests {
     }
 
     fn vacant_total(counters: &OccupancyCounters, species: usize) -> u32 {
-        (0..BUCKETS_PER_SPECIES).map(|b| counters.vacant_sets[species].len(b) as u32).sum()
+        (0..BUCKETS_PER_SPECIES)
+            .map(|b| counters.vacant_sets[species].len(b) as u32)
+            .sum()
     }
 
     fn occupied_total(counters: &OccupancyCounters, species: usize) -> u32 {
-        (0..BUCKETS_PER_SPECIES).map(|b| counters.occupied_sets[species].len(b) as u32).sum()
+        (0..BUCKETS_PER_SPECIES)
+            .map(|b| counters.occupied_sets[species].len(b) as u32)
+            .sum()
     }
 
     #[test]
@@ -724,11 +737,20 @@ mod tests {
         assert_eq!(total_vacant, vacant_sites * 3);
 
         let o_occupied = occupied_total(&counters, 0);
-        assert_eq!(o_occupied, data.iter().filter(|&&s| s == ADS_O).count() as u32);
+        assert_eq!(
+            o_occupied,
+            data.iter().filter(|&&s| s == ADS_O).count() as u32
+        );
         let h_occupied = occupied_total(&counters, 1);
-        assert_eq!(h_occupied, data.iter().filter(|&&s| s == ADS_H).count() as u32);
+        assert_eq!(
+            h_occupied,
+            data.iter().filter(|&&s| s == ADS_H).count() as u32
+        );
         let co_occupied = occupied_total(&counters, 2);
-        assert_eq!(co_occupied, data.iter().filter(|&&s| s == ADS_CO).count() as u32);
+        assert_eq!(
+            co_occupied,
+            data.iter().filter(|&&s| s == ADS_CO).count() as u32
+        );
     }
 
     #[test]
@@ -850,21 +872,38 @@ mod tests {
 
     #[test]
     fn pressure_factor_only_scales_adsorption_templates() {
-        let pressures = Pressures { values: [2.0, 3.0, 5.0, 1.0, 11.0] };
+        let pressures = Pressures {
+            values: [2.0, 3.0, 5.0, 1.0, 11.0],
+        };
         // Adsorption: pressure_factor equals that species' own pressure.
         assert_eq!(pressure_factor(&ads_template(ADS_O, 0, 1), &pressures), 2.0);
         assert_eq!(pressure_factor(&ads_template(ADS_H, 0, 1), &pressures), 3.0);
-        assert_eq!(pressure_factor(&ads_template(ADS_CO, 0, 1), &pressures), 5.0);
+        assert_eq!(
+            pressure_factor(&ads_template(ADS_CO, 0, 1), &pressures),
+            5.0
+        );
         // H2O* adsorption is an ordinary single-gas monomolecular channel,
         // same shape as O2/H2/CO -- gates on its own pressure slot exactly
         // like they do (see `Pressures`' doc comment for why this differs
         // from water-splitting's H* + OH* products, which stay neutral).
-        assert_eq!(pressure_factor(&ads_template(ADS_H2O, 0, 1), &pressures), 11.0);
+        assert_eq!(
+            pressure_factor(&ads_template(ADS_H2O, 0, 1), &pressures),
+            11.0
+        );
         // Desorption and bimolecular: untouched by pressure, always 1.0.
         assert_eq!(pressure_factor(&des_template(ADS_O, 0, 1), &pressures), 1.0);
-        assert_eq!(pressure_factor(&des_template(ADS_CO, 0, 1), &pressures), 1.0);
-        assert_eq!(pressure_factor(&des_template(ADS_H2O, 0, 1), &pressures), 1.0);
-        assert_eq!(pressure_factor(&bimolecular_template(ADS_O, ADS_CO, 1), &pressures), 1.0);
+        assert_eq!(
+            pressure_factor(&des_template(ADS_CO, 0, 1), &pressures),
+            1.0
+        );
+        assert_eq!(
+            pressure_factor(&des_template(ADS_H2O, 0, 1), &pressures),
+            1.0
+        );
+        assert_eq!(
+            pressure_factor(&bimolecular_template(ADS_O, ADS_CO, 1), &pressures),
+            1.0
+        );
     }
 
     #[test]
@@ -873,7 +912,10 @@ mod tests {
         let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
         let counters = OccupancyCounters::new(&data, width, 3);
         let bucket = site_bucket(0, ADS_O, 3) as u8;
-        let templates = vec![ads_template(ADS_O, bucket, 1000), des_template(ADS_O, bucket, 500)];
+        let templates = vec![
+            ads_template(ADS_O, bucket, 1000),
+            des_template(ADS_O, bucket, 500),
+        ];
 
         let with_ones = counters.total_propensity(&templates, &Pressures::ones());
         let manual: f64 = templates
@@ -894,15 +936,27 @@ mod tests {
         let templates = vec![ads_template(ADS_CO, bucket, 1000)];
 
         let baseline = counters.total_propensity(&templates, &Pressures::ones());
-        let doubled = counters.total_propensity(&templates, &Pressures { values: [1.0, 1.0, 2.0, 1.0, 1.0] });
-        assert!(baseline > 0.0, "adsorption template should have nonzero live count");
+        let doubled = counters.total_propensity(
+            &templates,
+            &Pressures {
+                values: [1.0, 1.0, 2.0, 1.0, 1.0],
+            },
+        );
+        assert!(
+            baseline > 0.0,
+            "adsorption template should have nonzero live count"
+        );
         assert!((doubled - 2.0 * baseline).abs() < 1e-9);
 
         // Desorption is untouched by the same pressure change.
         let des_templates = vec![des_template(ADS_CO, bucket, 1000)];
         let des_baseline = counters.total_propensity(&des_templates, &Pressures::ones());
-        let des_under_pressure =
-            counters.total_propensity(&des_templates, &Pressures { values: [1.0, 1.0, 2.0, 1.0, 1.0] });
+        let des_under_pressure = counters.total_propensity(
+            &des_templates,
+            &Pressures {
+                values: [1.0, 1.0, 2.0, 1.0, 1.0],
+            },
+        );
         assert_eq!(des_baseline, des_under_pressure);
     }
 
@@ -924,9 +978,15 @@ mod tests {
 
         let mut rng = rng();
         for _ in 0..200 {
-            if let Some((_, site, site_b)) =
-                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
-            {
+            if let Some((_, site, site_b)) = select(
+                &counters,
+                &templates,
+                &data,
+                width,
+                height,
+                &mut rng,
+                &Pressures::ones(),
+            ) {
                 assert_eq!(site, o_site);
                 assert_eq!(site_b, None);
             }
@@ -949,9 +1009,15 @@ mod tests {
 
         let mut rng = rng();
         for _ in 0..200 {
-            if let Some((_, site, site_b)) =
-                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
-            {
+            if let Some((_, site, site_b)) = select(
+                &counters,
+                &templates,
+                &data,
+                width,
+                height,
+                &mut rng,
+                &Pressures::ones(),
+            ) {
                 assert_eq!(site, vacant_site);
                 assert_eq!(site_b, None);
             }
@@ -984,9 +1050,15 @@ mod tests {
 
         let mut rng = rng();
         for _ in 0..200 {
-            if let Some((_, site_a, site_b)) =
-                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
-            {
+            if let Some((_, site_a, site_b)) = select(
+                &counters,
+                &templates,
+                &data,
+                width,
+                height,
+                &mut rng,
+                &Pressures::ones(),
+            ) {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);
                 assert!(
@@ -1018,7 +1090,15 @@ mod tests {
         ];
         let mut rng = rng();
         assert_eq!(
-            select(&counters, &templates, &data, width, 4, &mut rng, &Pressures::ones()),
+            select(
+                &counters,
+                &templates,
+                &data,
+                width,
+                4,
+                &mut rng,
+                &Pressures::ones()
+            ),
             None
         );
     }
@@ -1058,9 +1138,15 @@ mod tests {
 
         let mut rng = rng();
         for _ in 0..200 {
-            if let Some((_, site_a, site_b)) =
-                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
-            {
+            if let Some((_, site_a, site_b)) = select(
+                &counters,
+                &templates,
+                &data,
+                width,
+                height,
+                &mut rng,
+                &Pressures::ones(),
+            ) {
                 let site_b = site_b.expect("dissociative adsorption must return a second site");
                 assert_eq!(data[site_a], VACANT);
                 assert_eq!(data[site_b], VACANT);
@@ -1112,7 +1198,9 @@ mod tests {
 
     #[test]
     fn pressure_couples_dissociative_adsorption_same_as_monomolecular() {
-        let pressures = Pressures { values: [1.0, 7.0, 1.0, 1.0, 1.0] };
+        let pressures = Pressures {
+            values: [1.0, 7.0, 1.0, 1.0, 1.0],
+        };
         let template = dissociative_ads_template(ADS_H, 1);
         assert_eq!(pressure_factor(&template, &pressures), 7.0);
 
@@ -1122,7 +1210,11 @@ mod tests {
         assert_eq!(pressure_factor(&recombination, &pressures), 1.0);
     }
 
-    fn heteroatomic_dissociative_ads_template(species_a_bit: u8, species_b_bit: u8, rate: u32) -> ReactionRecord {
+    fn heteroatomic_dissociative_ads_template(
+        species_a_bit: u8,
+        species_b_bit: u8,
+        rate: u32,
+    ) -> ReactionRecord {
         ReactionRecord {
             rate_q16: rate,
             bin_id: 0,
@@ -1132,7 +1224,11 @@ mod tests {
         }
     }
 
-    fn heteroatomic_recombination_template(species_a_bit: u8, species_b_bit: u8, rate: u32) -> ReactionRecord {
+    fn heteroatomic_recombination_template(
+        species_a_bit: u8,
+        species_b_bit: u8,
+        rate: u32,
+    ) -> ReactionRecord {
         ReactionRecord {
             rate_q16: rate,
             bin_id: 0,
@@ -1213,7 +1309,9 @@ mod tests {
     /// `pressure_factor`'s doc comment.
     #[test]
     fn pressure_factor_is_neutral_for_heteroatomic_dissociative_adsorption() {
-        let pressures = Pressures { values: [1.0, 99.0, 1.0, 1.0, 1.0] }; // H2 pressure cranked up
+        let pressures = Pressures {
+            values: [1.0, 99.0, 1.0, 1.0, 1.0],
+        }; // H2 pressure cranked up
         let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1);
         assert_eq!(
             pressure_factor(&forward, &pressures),
@@ -1252,9 +1350,15 @@ mod tests {
         let templates = vec![heteroatomic_recombination_template(ADS_H, ADS_OH, u32::MAX)];
         let mut rng = rng();
         for _ in 0..200 {
-            if let Some((_, site_a, site_b)) =
-                select(&counters, &templates, &data, width, height, &mut rng, &Pressures::ones())
-            {
+            if let Some((_, site_a, site_b)) = select(
+                &counters,
+                &templates,
+                &data,
+                width,
+                height,
+                &mut rng,
+                &Pressures::ones(),
+            ) {
                 let site_b = site_b.expect("bimolecular event must return a second site");
                 let pair = (data[site_a], data[site_b]);
                 assert!(

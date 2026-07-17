@@ -158,7 +158,11 @@ impl SiteLattice {
         // file, enforced at the process level by the CLI in `main.rs`.
         let mmap = unsafe { MmapOptions::new().len(len).map_mut(&file)? };
 
-        Ok(Self { mmap, width, height })
+        Ok(Self {
+            mmap,
+            width,
+            height,
+        })
     }
 
     /// Flat row-major byte view: `width * height` bytes, one per site,
@@ -541,7 +545,11 @@ pub fn pack_records_into_blocks(mut records: Vec<ReactionRecord>) -> Vec<Reactio
 
 /// Write `kind`'s magic header followed by `blocks` verbatim to `path`, as
 /// the raw bytes `ReactionLut::open` expects to map back in.
-pub fn write_lut(path: impl AsRef<Path>, kind: LutKind, blocks: &[ReactionLutBlock]) -> io::Result<()> {
+pub fn write_lut(
+    path: impl AsRef<Path>,
+    kind: LutKind,
+    blocks: &[ReactionLutBlock],
+) -> io::Result<()> {
     let mut header = [0u8; LUT_HEADER_SIZE];
     header[0..8].copy_from_slice(kind.magic());
 
@@ -553,10 +561,7 @@ pub fn write_lut(path: impl AsRef<Path>, kind: LutKind, blocks: &[ReactionLutBlo
     // there is no uninitialized padding to expose, and no lifetime hazard
     // since the byte slice does not outlive `blocks`.
     let bytes = unsafe {
-        slice::from_raw_parts(
-            blocks.as_ptr() as *const u8,
-            std::mem::size_of_val(blocks),
-        )
+        slice::from_raw_parts(blocks.as_ptr() as *const u8, std::mem::size_of_val(blocks))
     };
 
     let mut file = std::fs::File::create(path)?;
@@ -614,7 +619,12 @@ mod tests {
 
     #[test]
     fn write_and_reopen_lut_round_trips_reaction_rates() {
-        let records = vec![rec(10, 0, 0x01), rec(20, 1, 0x02), rec(30, 2, 0x04), rec(40, 31, 0x00)];
+        let records = vec![
+            rec(10, 0, 0x01),
+            rec(20, 1, 0x02),
+            rec(30, 2, 0x04),
+            rec(40, 31, 0x00),
+        ];
         let blocks = pack_records_into_blocks(records.clone());
         let path = temp_path("lut_roundtrip");
         write_lut(&path, LutKind::Static, &blocks).unwrap();
@@ -634,7 +644,7 @@ mod tests {
         let records = vec![ReactionRecord {
             rate_q16: 500,
             bin_id: 4,
-            transition_a: (ADS_O as u16) << 8, // O* -> vacant
+            transition_a: (ADS_O as u16) << 8,  // O* -> vacant
             transition_b: (ADS_CO as u16) << 8, // CO* -> vacant
             is_bimolecular: true,
         }];
@@ -703,8 +713,14 @@ mod tests {
     fn open_rejects_lattice_dimensions_exceeding_u32_max_sites() {
         let path = temp_path("lattice_too_large");
         let result = SiteLattice::open(&path, 100_000, 100_000);
-        assert!(result.is_err(), "10 billion sites must be rejected, not silently wrapped");
-        assert!(!path.exists(), "must fail before creating/sizing the backing file");
+        assert!(
+            result.is_err(),
+            "10 billion sites must be rejected, not silently wrapped"
+        );
+        assert!(
+            !path.exists(),
+            "must fail before creating/sizing the backing file"
+        );
     }
 
     #[test]

@@ -80,7 +80,12 @@ const ODD_ROW_DELTAS: [(isize, isize); MAX_NEIGHBORS] = [
 /// `forward_neighbors` (given the canonical half). `deltas.len()` is at
 /// most `MAX_NEIGHBORS`, so `out` never overflows.
 #[inline]
-fn gather(idx: usize, width: usize, rows: usize, deltas: &[(isize, isize)]) -> [Option<usize>; MAX_NEIGHBORS] {
+fn gather(
+    idx: usize,
+    width: usize,
+    rows: usize,
+    deltas: &[(isize, isize)],
+) -> [Option<usize>; MAX_NEIGHBORS] {
     let (row, col) = row_col(idx, width);
 
     let mut out = [None; MAX_NEIGHBORS];
@@ -103,7 +108,11 @@ fn gather(idx: usize, width: usize, rows: usize, deltas: &[(isize, isize)]) -> [
 #[inline]
 pub fn all_neighbors(idx: usize, width: usize, rows: usize) -> [Option<usize>; MAX_NEIGHBORS] {
     let row = idx / width;
-    let deltas = if row.is_multiple_of(2) { &EVEN_ROW_DELTAS } else { &ODD_ROW_DELTAS };
+    let deltas = if row.is_multiple_of(2) {
+        &EVEN_ROW_DELTAS
+    } else {
+        &ODD_ROW_DELTAS
+    };
     gather(idx, width, rows, deltas)
 }
 
@@ -135,8 +144,10 @@ mod tests {
         let width = 6;
         let rows = 6;
         let idx = 2 * width + 2;
-        let neighbors: std::collections::BTreeSet<usize> =
-            all_neighbors(idx, width, rows).into_iter().flatten().collect();
+        let neighbors: std::collections::BTreeSet<usize> = all_neighbors(idx, width, rows)
+            .into_iter()
+            .flatten()
+            .collect();
         // W=13, E=15, NW=7, NE=8, SW=19, SE=20
         assert_eq!(neighbors, [13, 15, 7, 8, 19, 20].into_iter().collect());
     }
@@ -147,8 +158,10 @@ mod tests {
         let width = 6;
         let rows = 6;
         let idx = 3 * width + 2;
-        let neighbors: std::collections::BTreeSet<usize> =
-            all_neighbors(idx, width, rows).into_iter().flatten().collect();
+        let neighbors: std::collections::BTreeSet<usize> = all_neighbors(idx, width, rows)
+            .into_iter()
+            .flatten()
+            .collect();
         // W=19, E=21, NW=14, NE=15, SW=26, SE=27
         assert_eq!(neighbors, [19, 21, 14, 15, 26, 27].into_iter().collect());
     }
@@ -157,7 +170,10 @@ mod tests {
     fn all_neighbors_corner_site_has_two() {
         let width = 5;
         let rows = 5;
-        let neighbors: Vec<usize> = all_neighbors(0, width, rows).into_iter().flatten().collect();
+        let neighbors: Vec<usize> = all_neighbors(0, width, rows)
+            .into_iter()
+            .flatten()
+            .collect();
         assert_eq!(neighbors.len(), 2);
         assert!(neighbors.contains(&1));
         assert!(neighbors.contains(&width));
@@ -169,7 +185,10 @@ mod tests {
         let rows = 6;
         for idx in 0..width * rows {
             for neighbor in all_neighbors(idx, width, rows).into_iter().flatten() {
-                let back: Vec<usize> = all_neighbors(neighbor, width, rows).into_iter().flatten().collect();
+                let back: Vec<usize> = all_neighbors(neighbor, width, rows)
+                    .into_iter()
+                    .flatten()
+                    .collect();
                 assert!(back.contains(&idx), "{idx} -> {neighbor} not reciprocal");
             }
         }
@@ -192,7 +211,10 @@ mod tests {
         // would find.
         let mut full_count = 0usize;
         for idx in 0..width * rows {
-            full_count += all_neighbors(idx, width, rows).into_iter().flatten().count();
+            full_count += all_neighbors(idx, width, rows)
+                .into_iter()
+                .flatten()
+                .count();
         }
         assert_eq!(full_count, edges.len() * 2);
     }
@@ -201,7 +223,10 @@ mod tests {
     fn single_row_has_no_vertical_neighbors() {
         let width = 4;
         let rows = 1;
-        let neighbors: Vec<usize> = all_neighbors(1, width, rows).into_iter().flatten().collect();
+        let neighbors: Vec<usize> = all_neighbors(1, width, rows)
+            .into_iter()
+            .flatten()
+            .collect();
         assert_eq!(neighbors, vec![0, 2]);
     }
 
@@ -210,6 +235,12 @@ mod tests {
         let width = 8;
         let rows = 8;
         let idx = 4 * width + 4;
-        assert_eq!(all_neighbors(idx, width, rows).into_iter().flatten().count(), 6);
+        assert_eq!(
+            all_neighbors(idx, width, rows)
+                .into_iter()
+                .flatten()
+                .count(),
+            6
+        );
     }
 }

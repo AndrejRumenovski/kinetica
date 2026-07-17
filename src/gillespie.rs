@@ -89,7 +89,9 @@ impl Rng {
     pub const fn seeded(seed: u64) -> Self {
         // Avoid the fixed point at seed == 0, which would otherwise emit an
         // all-zero stream forever.
-        Rng { state: seed ^ 0x9E37_79B9_7F4A_7C15 }
+        Rng {
+            state: seed ^ 0x9E37_79B9_7F4A_7C15,
+        }
     }
 
     #[inline(always)]
@@ -545,7 +547,10 @@ mod tests {
                     .sample_reaction(&mut rng, &lut)
                     .expect("real reactions exist in every even bin, must never be quiescent");
                 let rate = lut.rate_of(reaction_id as usize).rate_q16;
-                assert!(rate > 0, "sampled a zero-rate/empty-bin reaction: id={reaction_id}, rate={rate}");
+                assert!(
+                    rate > 0,
+                    "sampled a zero-rate/empty-bin reaction: id={reaction_id}, rate={rate}"
+                );
             }
         }
 

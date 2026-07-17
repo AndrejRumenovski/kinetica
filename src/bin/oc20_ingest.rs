@@ -199,7 +199,8 @@ impl Config {
 }
 
 fn next_value(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("`{flag}` requires a value"))
+    args.next()
+        .ok_or_else(|| format!("`{flag}` requires a value"))
 }
 
 fn parse_value<T: std::str::FromStr>(
@@ -448,7 +449,10 @@ fn rate_from_activation(activation_ev: f64, config: &Config) -> f64 {
 /// deliberate, honest broadening from a silent pooling regression. A
 /// species left with zero samples even after falling back stays empty,
 /// same as today's "absent from --input" case.
-fn filter_with_fallback(records: &[EnergyRecord], config: &Config) -> [Vec<EnergyRecord>; SPECIES_BITS.len()] {
+fn filter_with_fallback(
+    records: &[EnergyRecord],
+    config: &Config,
+) -> [Vec<EnergyRecord>; SPECIES_BITS.len()] {
     let mut by_species: [Vec<EnergyRecord>; SPECIES_BITS.len()] = Default::default();
 
     let Some(metal) = config.metal else {
@@ -458,7 +462,11 @@ fn filter_with_fallback(records: &[EnergyRecord], config: &Config) -> [Vec<Energ
         return by_species;
     };
 
-    let metal_only: Vec<EnergyRecord> = records.iter().copied().filter(|r| r.metal == metal).collect();
+    let metal_only: Vec<EnergyRecord> = records
+        .iter()
+        .copied()
+        .filter(|r| r.metal == metal)
+        .collect();
     let metal_name = METALS[metal as usize];
 
     for (species, slot) in by_species.iter_mut().enumerate() {
@@ -502,18 +510,29 @@ fn filter_with_fallback(records: &[EnergyRecord], config: &Config) -> [Vec<Energ
 /// meaningful quantile-bucket threshold to fall back against -- the
 /// fallback here triggers whenever the facet-filtered pool is empty but
 /// the metal-only one isn't.
-fn filter_bimolecular_with_fallback(records: &[BiEnergyRecord], config: &Config) -> Vec<BiEnergyRecord> {
+fn filter_bimolecular_with_fallback(
+    records: &[BiEnergyRecord],
+    config: &Config,
+) -> Vec<BiEnergyRecord> {
     let Some(metal) = config.metal else {
         return records.to_vec();
     };
-    let metal_only: Vec<BiEnergyRecord> = records.iter().copied().filter(|r| r.metal == metal).collect();
+    let metal_only: Vec<BiEnergyRecord> = records
+        .iter()
+        .copied()
+        .filter(|r| r.metal == metal)
+        .collect();
     let metal_name = METALS[metal as usize];
 
     let Some(facet) = config.facet else {
         return metal_only;
     };
 
-    let filtered: Vec<BiEnergyRecord> = metal_only.iter().copied().filter(|r| r.facet == facet).collect();
+    let filtered: Vec<BiEnergyRecord> = metal_only
+        .iter()
+        .copied()
+        .filter(|r| r.facet == facet)
+        .collect();
     if filtered.is_empty() && !metal_only.is_empty() {
         println!(
             "oc20_ingest: bimolecular: no record matches --metal {metal_name} --facet {facet}; \
@@ -774,23 +793,26 @@ fn run(config: &Config) -> io::Result<()> {
 
     let records: Vec<layout::ReactionRecord> = raw_rates
         .into_iter()
-        .map(|(k, transition_a, transition_b, is_bimolecular, bucket_id)| {
-            let rate_q16 = ((k * scale).round() as u64).clamp(1, u32::MAX as u64) as u32;
-            layout::ReactionRecord {
-                rate_q16,
-                // `bin_id`: the quantile bucket index for a monomolecular
-                // template (0 and unused for a bimolecular one) -- *not*
-                // a composition-rejection magnitude class here, unlike
-                // `LutKind::Static` LUTs. See `occupancy.rs`.
-                bin_id: bucket_id,
-                transition_a,
-                transition_b,
-                is_bimolecular,
-            }
-        })
+        .map(
+            |(k, transition_a, transition_b, is_bimolecular, bucket_id)| {
+                let rate_q16 = ((k * scale).round() as u64).clamp(1, u32::MAX as u64) as u32;
+                layout::ReactionRecord {
+                    rate_q16,
+                    // `bin_id`: the quantile bucket index for a monomolecular
+                    // template (0 and unused for a bimolecular one) -- *not*
+                    // a composition-rejection magnitude class here, unlike
+                    // `LutKind::Static` LUTs. See `occupancy.rs`.
+                    bin_id: bucket_id,
+                    transition_a,
+                    transition_b,
+                    is_bimolecular,
+                }
+            },
+        )
         .collect();
 
-    let recombination_bimolecular_count = bimolecular_records.len() - dissociative_bimolecular_count;
+    let recombination_bimolecular_count =
+        bimolecular_records.len() - dissociative_bimolecular_count;
     println!(
         "oc20_ingest: built {} reactions ({} monomolecular adsorption + {} desorption + \
          {} homoatomic dissociative-adsorption bimolecular + {} heteroatomic dissociative \
@@ -882,9 +904,17 @@ mod tests {
 
     #[test]
     fn config_parse_applies_defaults_and_overrides() {
-        let args = ["oc20_ingest", "--input", "energies.bin", "--alpha", "0.5", "--out", "custom.lut"]
-            .iter()
-            .map(|s| s.to_string());
+        let args = [
+            "oc20_ingest",
+            "--input",
+            "energies.bin",
+            "--alpha",
+            "0.5",
+            "--out",
+            "custom.lut",
+        ]
+        .iter()
+        .map(|s| s.to_string());
         let c = Config::parse(args).unwrap();
         assert_eq!(c.input, PathBuf::from("energies.bin"));
         assert_eq!(c.out, PathBuf::from("custom.lut"));
@@ -920,9 +950,17 @@ mod tests {
 
     #[test]
     fn config_parse_accepts_metal_and_facet() {
-        let args = ["oc20_ingest", "--input", "e.bin", "--metal", "Pd", "--facet", "111"]
-            .iter()
-            .map(|s| s.to_string());
+        let args = [
+            "oc20_ingest",
+            "--input",
+            "e.bin",
+            "--metal",
+            "Pd",
+            "--facet",
+            "111",
+        ]
+        .iter()
+        .map(|s| s.to_string());
         let c = Config::parse(args).unwrap();
         assert_eq!(c.metal, metal_index("Pd"));
         assert_eq!(c.facet, Some(111));
@@ -993,10 +1031,17 @@ mod tests {
         c.facet = Some(111);
         let by_species = filter_with_fallback(&records, &c);
         assert_eq!(by_species[0].len(), BUCKETS_PER_SPECIES);
-        assert!(by_species[0].iter().all(|r| r.metal == pd && r.facet == 111));
+        assert!(by_species[0]
+            .iter()
+            .all(|r| r.metal == pd && r.facet == 111));
     }
 
-    fn bimolecular_record_with_metal(species_a: u8, species_b: u8, metal: u8, facet: u16) -> BiEnergyRecord {
+    fn bimolecular_record_with_metal(
+        species_a: u8,
+        species_b: u8,
+        metal: u8,
+        facet: u16,
+    ) -> BiEnergyRecord {
         BiEnergyRecord {
             species_a,
             species_b,
@@ -1017,7 +1062,11 @@ mod tests {
         c.metal = Some(pd);
         c.facet = Some(111);
         let filtered = filter_bimolecular_with_fallback(&records, &c);
-        assert_eq!(filtered.len(), 1, "should broaden to metal-only rather than drop the only record");
+        assert_eq!(
+            filtered.len(),
+            1,
+            "should broaden to metal-only rather than drop the only record"
+        );
     }
 
     fn energy_record(energy_ev: f64, real_ea_ev: Option<f64>) -> EnergyRecord {
@@ -1091,7 +1140,13 @@ mod tests {
         assert_eq!(buckets[0].real_ea_ev, None);
     }
 
-    fn push_record(bytes: &mut Vec<u8>, species: u8, energy_mev: i32, sid: u32, real_ea_mev: Option<i32>) {
+    fn push_record(
+        bytes: &mut Vec<u8>,
+        species: u8,
+        energy_mev: i32,
+        sid: u32,
+        real_ea_mev: Option<i32>,
+    ) {
         push_record_with_metal(bytes, species, energy_mev, sid, real_ea_mev, 0, 0);
     }
 
@@ -1171,7 +1226,9 @@ mod tests {
         sid: u32,
         ea_mev: i32,
     ) {
-        push_bimolecular_record_with_metal(bytes, species_a, species_b, energy_mev, sid, ea_mev, 0, 0, false);
+        push_bimolecular_record_with_metal(
+            bytes, species_a, species_b, energy_mev, sid, ea_mev, 0, 0, false,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1277,7 +1334,11 @@ mod tests {
             .into_iter()
             .filter(|r| r.is_bimolecular)
             .collect();
-        assert_eq!(bimolecular.len(), 1, "exactly one bimolecular reaction, no reverse built");
+        assert_eq!(
+            bimolecular.len(),
+            1,
+            "exactly one bimolecular reaction, no reverse built"
+        );
         let r = bimolecular[0];
         assert_eq!(r.transition_a, (layout::ADS_O as u16) << 8); // O* -> vacant
         assert_eq!(r.transition_b, (layout::ADS_CO as u16) << 8); // CO* -> vacant
@@ -1340,7 +1401,10 @@ mod tests {
             .iter()
             .filter(|r| !r.is_bimolecular && r.transition_a == (layout::ADS_O as u16) << 8)
             .count();
-        assert_eq!(o_desorption, 1, "O's monomolecular desorption must be untouched");
+        assert_eq!(
+            o_desorption, 1,
+            "O's monomolecular desorption must be untouched"
+        );
 
         let h_desorption = real_records
             .iter()
@@ -1353,13 +1417,24 @@ mod tests {
 
         let o_dissociative_adsorption = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_O as u16 && r.transition_b == layout::ADS_O as u16)
+            .filter(|r| {
+                r.is_bimolecular
+                    && r.transition_a == layout::ADS_O as u16
+                    && r.transition_b == layout::ADS_O as u16
+            })
             .count();
-        assert_eq!(o_dissociative_adsorption, 1, "O's dissociative adsorption is built regardless of desorption replacement");
+        assert_eq!(
+            o_dissociative_adsorption, 1,
+            "O's dissociative adsorption is built regardless of desorption replacement"
+        );
 
         let h_dissociative_adsorption = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H as u16 && r.transition_b == layout::ADS_H as u16)
+            .filter(|r| {
+                r.is_bimolecular
+                    && r.transition_a == layout::ADS_H as u16
+                    && r.transition_b == layout::ADS_H as u16
+            })
             .count();
         assert_eq!(
             h_dissociative_adsorption, 1,
@@ -1371,8 +1446,14 @@ mod tests {
             .filter(|r| r.is_bimolecular && r.transition_a == (layout::ADS_H as u16) << 8)
             .collect();
         assert_eq!(recombination_bimolecular.len(), 1);
-        assert_eq!(recombination_bimolecular[0].transition_a, (layout::ADS_H as u16) << 8);
-        assert_eq!(recombination_bimolecular[0].transition_b, (layout::ADS_H as u16) << 8);
+        assert_eq!(
+            recombination_bimolecular[0].transition_a,
+            (layout::ADS_H as u16) << 8
+        );
+        assert_eq!(
+            recombination_bimolecular[0].transition_b,
+            (layout::ADS_H as u16) << 8
+        );
 
         let _ = std::fs::remove_file(&input_path);
         let _ = std::fs::remove_file(&bi_path);
@@ -1485,24 +1566,36 @@ mod tests {
                 .iter()
                 .filter(|r| r.is_bimolecular && r.transition_a == bit && r.transition_b == bit)
                 .count();
-            assert_eq!(dissociative, 1, "{name} adsorption must be a two-site dissociative record");
+            assert_eq!(
+                dissociative, 1,
+                "{name} adsorption must be a two-site dissociative record"
+            );
             let monomolecular_ads = real_records
                 .iter()
                 .filter(|r| !r.is_bimolecular && r.transition_a == bit)
                 .count();
-            assert_eq!(monomolecular_ads, 0, "{name} must not also have a monomolecular adsorption record");
+            assert_eq!(
+                monomolecular_ads, 0,
+                "{name} must not also have a monomolecular adsorption record"
+            );
         }
 
         let co_monomolecular_ads = real_records
             .iter()
             .filter(|r| !r.is_bimolecular && r.transition_a == layout::ADS_CO as u16)
             .count();
-        assert_eq!(co_monomolecular_ads, 1, "CO adsorbs molecularly -- must stay monomolecular");
+        assert_eq!(
+            co_monomolecular_ads, 1,
+            "CO adsorbs molecularly -- must stay monomolecular"
+        );
         let co_dissociative = real_records
             .iter()
             .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_CO as u16)
             .count();
-        assert_eq!(co_dissociative, 0, "CO must not be built as a dissociative-adsorption record");
+        assert_eq!(
+            co_dissociative, 0,
+            "CO must not be built as a dissociative-adsorption record"
+        );
 
         // Desorption is untouched for all three species regardless of the
         // adsorption-direction change.
@@ -1580,17 +1673,31 @@ mod tests {
 
         let forward: Vec<_> = real_records
             .iter()
-            .filter(|r| r.is_bimolecular && r.transition_a == layout::ADS_H as u16 && r.transition_b == layout::ADS_OH as u16)
+            .filter(|r| {
+                r.is_bimolecular
+                    && r.transition_a == layout::ADS_H as u16
+                    && r.transition_b == layout::ADS_OH as u16
+            })
             .collect();
-        assert_eq!(forward.len(), 1, "forward dissociative-adsorption record must be built");
+        assert_eq!(
+            forward.len(),
+            1,
+            "forward dissociative-adsorption record must be built"
+        );
 
         let reverse: Vec<_> = real_records
             .iter()
             .filter(|r| {
-                r.is_bimolecular && r.transition_a == (layout::ADS_H as u16) << 8 && r.transition_b == (layout::ADS_OH as u16) << 8
+                r.is_bimolecular
+                    && r.transition_a == (layout::ADS_H as u16) << 8
+                    && r.transition_b == (layout::ADS_OH as u16) << 8
             })
             .collect();
-        assert_eq!(reverse.len(), 1, "reverse associative-desorption record must be built too");
+        assert_eq!(
+            reverse.len(),
+            1,
+            "reverse associative-desorption record must be built too"
+        );
 
         // Forward uses the real Ea directly; reverse uses Ea_rev = Ea_fwd
         // - dE_rxn = 1.011 - 0.220 = 0.791, a smaller barrier, so its rate

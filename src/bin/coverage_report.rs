@@ -112,17 +112,28 @@ impl Config {
             }
         }
 
-        Ok(Self { trajectory_path, lut_path, lattice_width, lattice_height, sample_every })
+        Ok(Self {
+            trajectory_path,
+            lut_path,
+            lattice_width,
+            lattice_height,
+            sample_every,
+        })
     }
 }
 
 fn next(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
-    args.next().ok_or_else(|| format!("`{flag}` requires a value"))
+    args.next()
+        .ok_or_else(|| format!("`{flag}` requires a value"))
 }
 
-fn value<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<T, String> {
+fn value<T: std::str::FromStr>(
+    args: &mut impl Iterator<Item = String>,
+    flag: &str,
+) -> Result<T, String> {
     let raw = next(args, flag)?;
-    raw.parse().map_err(|_| format!("`{flag}` expects a number, got `{raw}`"))
+    raw.parse()
+        .map_err(|_| format!("`{flag}` expects a number, got `{raw}`"))
 }
 
 fn run(config: &Config) -> io::Result<()> {
