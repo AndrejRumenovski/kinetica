@@ -104,7 +104,9 @@ pub fn apply_transition(current: u8, transition: u16) -> u8 {
 /// allocation, never copying it.
 pub struct SiteLattice {
     mmap: MmapMut,
+    /// Lattice width in sites.
     pub width: usize,
+    /// Lattice height in sites.
     pub height: usize,
 }
 
@@ -177,16 +179,19 @@ impl SiteLattice {
         &self.mmap[..]
     }
 
+    /// Mutable counterpart to [`as_slice`](Self::as_slice).
     #[inline(always)]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.mmap[..]
     }
 
+    /// Read one site's occupancy byte by flat index.
     #[inline(always)]
     pub fn get(&self, idx: usize) -> u8 {
         self.mmap[idx]
     }
 
+    /// Write one site's occupancy byte by flat index.
     #[inline(always)]
     pub fn set(&mut self, idx: usize, state: u8) {
         self.mmap[idx] = state;
@@ -443,16 +448,20 @@ impl ReactionLut {
         })
     }
 
+    /// Total number of reaction records across every block.
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    /// Whether this LUT holds zero reaction records.
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    /// Which engine (`Static` or `OccupancyGated`) this LUT's magic
+    /// header dispatches to.
     #[inline(always)]
     pub fn kind(&self) -> LutKind {
         self.kind
@@ -500,10 +509,15 @@ impl ReactionLut {
 /// lane. See `ReactionLutBlock`'s field docs for what each member means.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReactionRecord {
+    /// See `ReactionLutBlock::rate_q16`.
     pub rate_q16: u32,
+    /// See `ReactionLutBlock::bin_id`.
     pub bin_id: u8,
+    /// See `ReactionLutBlock::transition_a`.
     pub transition_a: u16,
+    /// See `ReactionLutBlock::transition_b`.
     pub transition_b: u16,
+    /// See `ReactionLutBlock::is_bimolecular`.
     pub is_bimolecular: bool,
 }
 

@@ -46,8 +46,12 @@ pub const NUM_BINS: usize = 32;
 pub struct FixedPoint(pub u64);
 
 impl FixedPoint {
+    /// Number of low bits treated as the fractional part of this Q32.32
+    /// representation -- the rest is the integer part.
     pub const FRAC_BITS: u32 = 32;
+    /// The value `1.0` in this Q32.32 representation.
     pub const ONE: FixedPoint = FixedPoint(1u64 << Self::FRAC_BITS);
+    /// The value `0.0` in this Q32.32 representation.
     pub const ZERO: FixedPoint = FixedPoint(0);
 
     /// Widen a LUT rate stored as Q16.16 into this module's Q32.32 domain.
@@ -59,11 +63,17 @@ impl FixedPoint {
         FixedPoint((raw as u64) << 16)
     }
 
+    /// Add without overflow panicking or wrapping -- clamps to `u64::MAX`
+    /// (an astronomically large propensity total, never a value a real
+    /// LUT's rates could actually sum to) rather than silently wrapping
+    /// a bin's running total back toward zero.
     #[inline(always)]
     pub fn saturating_add(self, other: Self) -> Self {
         FixedPoint(self.0.saturating_add(other.0))
     }
 
+    /// Convert to an ordinary `f64`, for display/logging only -- every
+    /// value this module actually computes with stays in fixed-point.
     #[inline(always)]
     pub fn to_f64(self) -> f64 {
         (self.0 as f64) / (Self::ONE.0 as f64)
@@ -85,6 +95,8 @@ pub struct Rng {
 }
 
 impl Rng {
+    /// Construct a stream from any `u64` seed -- every seed, including
+    /// `0`, produces a distinct deterministic stream (see the XOR below).
     #[inline(always)]
     pub const fn seeded(seed: u64) -> Self {
         // Avoid the fixed point at seed == 0, which would otherwise emit an
@@ -94,6 +106,7 @@ impl Rng {
         }
     }
 
+    /// Draw the next raw 64-bit value in the stream.
     #[inline(always)]
     pub fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -194,6 +207,8 @@ impl CompositionTable {
         }
     }
 
+    /// The sum of every bin's `total_propensity` -- the denominator a
+    /// Gillespie draw's uniform sample is scaled against to pick a bin.
     #[inline(always)]
     pub fn total_propensity(&self) -> FixedPoint {
         self.total_propensity
@@ -332,12 +347,21 @@ impl CompositionTable {
 /// part that dominates per-event cost at trillion-event scale) stays
 /// entirely on the fixed-point path above.
 pub struct GillespieDomain {
+    /// The O(1) composition-rejection sampler built from this domain's
+    /// `reactions.lut`.
     pub table: CompositionTable,
+    /// This domain's own PRNG stream -- one per patch, so patches never
+    /// contend on or share RNG state.
     pub rng: Rng,
+    /// Total simulated time elapsed on this domain, advanced by each
+    /// `step`'s exponential waiting time `tau`.
     pub sim_time: f64,
 }
 
 impl GillespieDomain {
+    /// Build a fresh domain over `lut`, seeded deterministically from
+    /// `seed` (so re-running the same patch decomposition with the same
+    /// seeds reproduces the same trajectory).
     pub fn new(lut: &ReactionLut, seed: u64) -> Self {
         Self {
             table: CompositionTable::build(lut),

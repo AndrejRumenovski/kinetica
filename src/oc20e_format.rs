@@ -20,6 +20,8 @@ use std::path::Path;
 
 use crate::layout::SPECIES_BITS;
 
+/// `OC20E003`'s 8-byte magic header, checked at the start of every file
+/// [`read_energy_records`] parses.
 pub const MAGIC: &[u8; 8] = b"OC20E003";
 /// species(1) + energy_mev(4) + sid(4) + has_real_ea(1) + real_ea_mev(4)
 /// + metal(1) + facet(2).
@@ -40,9 +42,15 @@ const RECORD_SIZE_BI: usize = 18;
 /// energy.
 #[derive(Clone, Copy)]
 pub struct EnergyRecord {
+    /// Index into `SPECIES_BITS`/`oc20_ingest`'s `SPECIES_NAMES`.
     pub species: u8,
+    /// Relaxed adsorption/reaction energy, eV.
     pub energy_ev: f64,
+    /// Source system/reaction id -- diagnostics only, never read for
+    /// anything the resulting `reactions.lut` depends on.
     pub sid: u32,
+    /// A genuine DFT-computed activation energy, eV, when the source
+    /// publishes one instead of just the reaction energy.
     pub real_ea_ev: Option<f64>,
     /// Index into `oc20_ingest`'s `METALS`; 0 = unknown/not tracked.
     pub metal: u8,
@@ -74,13 +82,22 @@ pub struct EnergyRecord {
 ///   reverse genuinely is the same elementary step run backward.
 #[derive(Clone, Copy)]
 pub struct BiEnergyRecord {
+    /// Index into `SPECIES_BITS` for the first site.
     pub species_a: u8,
+    /// Index into `SPECIES_BITS` for the second, spatially adjacent site.
     pub species_b: u8,
+    /// Source system/reaction id -- diagnostics only.
     pub sid: u32,
+    /// The forward reaction energy, eV -- only meaningful (used to derive
+    /// a reverse rate) when `is_dissociative` is set.
     pub energy_ev: f64,
+    /// The real, DFT-computed forward activation energy, eV.
     pub ea_ev: f64,
+    /// Index into `oc20_ingest`'s `METALS`; 0 = unknown/not tracked.
     pub metal: u8,
+    /// Decimal-digit Miller-index encoding (e.g. 111); 0 = unknown.
     pub facet: u16,
+    /// See this struct's own doc comment for what `true`/`false` mean.
     pub is_dissociative: bool,
 }
 

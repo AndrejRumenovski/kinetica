@@ -3,6 +3,13 @@
 //! from real Open Catalyst Project data instead of the synthetic demo
 //! generator in `main.rs`.
 
+// Every public item (function, struct, field, constant...) must carry a
+// doc comment. A `warn`-level lint rather than a separate CI step: CI
+// already runs `cargo clippy --all-targets -- -D warnings`, which
+// promotes every warning (including this one) to a hard error, so this
+// is enforced for free rather than needing its own check.
+#![warn(missing_docs)]
+
 pub mod engine;
 pub mod gillespie;
 pub mod layout;

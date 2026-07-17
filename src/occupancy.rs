@@ -171,10 +171,15 @@ fn species_index(species_bit: u8) -> Option<usize> {
 /// propensities (every multiplier 1.0).
 #[derive(Clone, Copy, Debug)]
 pub struct Pressures {
+    /// Relative partial pressure for each species in `SPECIES_BITS`
+    /// order; index 3 (OH) is permanently unused since OH* only ever
+    /// forms via the pressure-neutral heteroatomic water-splitting path.
     pub values: [f64; NUM_SPECIES],
 }
 
 impl Pressures {
+    /// All pressures `1.0` -- reproduces exactly the propensities this
+    /// module had before gas-phase pressure coupling existed.
     pub const fn ones() -> Self {
         Pressures {
             values: [1.0; NUM_SPECIES],
