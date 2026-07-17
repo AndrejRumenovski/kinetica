@@ -1,5 +1,7 @@
 # kinetica
 
+[![CI](https://github.com/AndrejRumenovski/kinetica/actions/workflows/ci.yml/badge.svg)](https://github.com/AndrejRumenovski/kinetica/actions/workflows/ci.yml)
+
 **An asynchronous, out-of-core lattice kinetic Monte Carlo (kMC) engine
 for surface-reaction simulation, written in pure Rust — driven by real
 DFT-computed adsorption energies and transition-state barriers, not
