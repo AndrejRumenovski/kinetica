@@ -61,6 +61,7 @@ second one exists and how it works.
 - [Running the simulator](#running-the-simulator)
 - [Visualizing a run](#visualizing-a-run)
 - [Fuzzing](#fuzzing)
+- [Benchmarks](#benchmarks)
 - [Occupancy-gated kMC](#occupancy-gated-kmc)
 - [Gas-phase pressure coupling](#gas-phase-pressure-coupling)
 - [Lattice geometry and target surface: Pd(111)](#lattice-geometry-and-target-surface-pd111)
@@ -184,6 +185,67 @@ A local 60-second run (1.46M executions) found no crashes before this was
 committed. CI runs a bounded 60-second smoke test of the same target on
 every push — not a substitute for a real fuzzing campaign, but enough to
 catch a regression in this parsing path before it reaches `main`.
+
+## Benchmarks
+
+Real wall-clock numbers, not a marketing table — from the exact commands
+below, on a 12-thread (6-core) AMD Ryzen 5 5600G, release build with the
+recommended `RUSTFLAGS` (see "Building" above), a 1024×1024 lattice, and
+this repo's own real Pd(111) `reactions.lut` (34 reactions) for the
+occupancy-gated numbers:
+
+```sh
+RUSTFLAGS="-C target-cpu=native -C target-feature=+avx2" cargo build --release
+./target/release/kinetica --lattice-width 1024 --lattice-height 1024 \
+    --patches <N> --steps 2000000
+```
+
+| Patches | Occupancy-gated (real data) | Static (`--generate-lut`) |
+|---|---|---|
+| 1  | 1.08M reactions/sec | 5.35M reactions/sec |
+| 2  | 3.22M reactions/sec | 5.41M reactions/sec |
+| 4  | 5.86M reactions/sec | 6.14M reactions/sec |
+| 6  | 6.02M reactions/sec | 5.46M reactions/sec |
+| 8  | 5.03M reactions/sec | 5.50M reactions/sec |
+| 12 | 4.18M reactions/sec | 4.26M reactions/sec |
+
+Two honest things this table shows, rather than hides:
+
+**Throughput peaks around 4-6 patches and *degrades* beyond that**, on
+this 6-physical-core/12-thread machine. `--patches` defaults to
+`rayon::current_num_threads()` (all logical CPUs), which this data says
+is actually past this workload's sweet spot here — every patch's fired
+events funnel through one shared trajectory-writer pipeline (two
+`io_uring` writer threads regardless of patch count, see "Occupancy-gated
+kMC" below), so beyond a machine-specific point, more compute patches
+means more contention feeding that shared pipeline, not more useful
+parallelism. Reported as measured rather than only benchmarking at the
+patch count that looks best — if you're tuning `--patches` for your own
+hardware, sweep it; don't assume "more" or "the default" is optimal.
+
+**The static and occupancy-gated engines are now comparably fast**,
+which is itself worth stating because it *wasn't* true when this table
+was first being assembled: an early pass measured the static engine at
+roughly **1000x slower** (thousands, not millions, of reactions/sec).
+Chasing that discrepancy down (rather than writing benchmark numbers that
+would have quietly enshrined it) found a genuine bug in
+`gillespie::CompositionTable::bin_ceiling` — it used `FixedPoint::FRAC_BITS`
+(32, the fixed-point *type's* own width) as a shift base instead of 16
+(the number of bits `FixedPoint::from_q16` actually shifts a Q16.16 rate
+by to get there), making every rejection-sampling bin's acceptance
+envelope `2^16` (65536x) too large. The module's own doc comment claims
+"expected <= 2 rejection trials"; the bug silently turned that into
+*expected ~65536 trials per event*. Two existing unit tests had encoded
+the bug as correct behavior (they asserted `bin_ceiling`'s own output
+rather than a value derived independently from the invariant it's
+supposed to satisfy) and so never caught it — a reminder that a green
+test suite proves the tests you wrote pass, not that every documented
+property actually holds; this one only surfaced by measuring real
+wall-clock throughput and asking why a number looked wrong. Fixed in
+`gillespie.rs` (see its own doc comment on `bin_ceiling` for the exact
+derivation); both misleading tests were rewritten to derive their
+expected values from `FixedPoint::from_q16`'s actual shift instead of
+mirroring the implementation.
 
 ## Occupancy-gated kMC
 
