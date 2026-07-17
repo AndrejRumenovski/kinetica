@@ -367,6 +367,11 @@ mod tests {
     use super::*;
     use crate::layout;
     use crate::test_support::temp_path;
+    // Not `proptest::prelude::*` -- it re-exports a `Rng` trait (from
+    // `rand`) that collides with this module's own `Rng` struct, already
+    // in scope via `use super::*` above.
+    use proptest::prelude::any;
+    use proptest::{prop_assert, prop_assert_eq, proptest};
 
     fn lut_from(records: Vec<(u32, u8, u8)>, tag: &str) -> (ReactionLut, std::path::PathBuf) {
         let records = records
@@ -464,6 +469,85 @@ mod tests {
         // directly rather than relying on it ever being reachable through
         // `sample_reaction`.
         assert_eq!(CompositionTable::bin_ceiling(47).0, 1u64 << 63);
+    }
+
+    proptest! {
+        /// The property `bin_ceiling`'s whole existence rests on, and the
+        /// one the `65536x`-too-large ceiling bug (see `bin_ceiling`'s doc
+        /// comment) silently violated for an entire session's worth of
+        /// prior "all tests pass" verification: for *any* real rate_q16
+        /// this magnitude-class scheme could ever be asked to bound,
+        /// `bin_ceiling` of that rate's own bin must be a *tight* upper
+        /// bound -- strictly greater than the rate itself, but by no more
+        /// than 2x. The two hand-picked example tests above check this at
+        /// bins 0/1/47; this checks it for every representable rate_q16,
+        /// not just the ones someone thought to write down. Unlike an
+        /// example-based test (which only proves the chosen inputs work),
+        /// this is the actual specification `sample_reaction`'s "expected
+        /// <= 2 rejection trials" documentation claims -- had this existed
+        /// before the bug, it would have failed on its very first
+        /// generated case instead of needing a benchmarking pass to
+        /// surface it three sessions later.
+        #[test]
+        fn bin_ceiling_is_a_tight_upper_bound_for_every_rate_in_its_bin(rate_q16 in 1u32..=u32::MAX) {
+            let bin_index = (31 - rate_q16.leading_zeros()) as usize;
+            let rate = FixedPoint::from_q16(rate_q16);
+            let ceiling = CompositionTable::bin_ceiling(bin_index);
+
+            // Tight: the ceiling must actually bound this rate...
+            prop_assert!(
+                rate.0 < ceiling.0,
+                "rate {} (bin {}) not below its own ceiling {}",
+                rate.0, bin_index, ceiling.0
+            );
+            // ...and must not be so loose that acceptance probability
+            // (rate / ceiling) drops below 1/2, which is what "expected
+            // <= 2 rejection trials" actually requires.
+            prop_assert!(
+                rate.0.saturating_mul(2) >= ceiling.0,
+                "rate {} (bin {}) gives acceptance probability < 1/2 against ceiling {} \
+                 (this is exactly the class of bug bin_ceiling's doc comment documents)",
+                rate.0, bin_index, ceiling.0
+            );
+        }
+
+        /// `pack_records_into_blocks`/`write_lut`/`ReactionLut::open` must
+        /// round-trip *any* well-formed record set, not just the small
+        /// hand-picked ones `layout.rs`'s own example tests cover --
+        /// generated records exercise `bin_id`/`rate_q16`/transition
+        /// values those tests never happened to pick (0, `u32::MAX`,
+        /// values that land in the same block after the stable
+        /// sort-by-`bin_id`, etc). Sorts the input the same
+        /// (stable-by-`bin_id`) way `pack_records_into_blocks` does before
+        /// comparing, since packing itself reorders records.
+        #[test]
+        fn lut_round_trips_arbitrary_records(
+            records in proptest::collection::vec(
+                (any::<u32>(), any::<u8>(), any::<u16>(), any::<u16>(), any::<bool>()),
+                0..40,
+            )
+        ) {
+            let records: Vec<layout::ReactionRecord> = records
+                .into_iter()
+                .map(|(rate_q16, bin_id, transition_a, transition_b, is_bimolecular)| {
+                    layout::ReactionRecord { rate_q16, bin_id, transition_a, transition_b, is_bimolecular }
+                })
+                .collect();
+
+            let mut expected = records.clone();
+            expected.sort_by_key(|r| r.bin_id);
+
+            let blocks = layout::pack_records_into_blocks(records);
+            let path = crate::test_support::temp_path("proptest_lut_roundtrip");
+            layout::write_lut(&path, layout::LutKind::Static, &blocks).unwrap();
+            let lut = ReactionLut::open(&path).unwrap();
+
+            for (i, want) in expected.iter().enumerate() {
+                prop_assert_eq!(lut.rate_of(i), *want, "mismatch at index {}", i);
+            }
+
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]

@@ -1373,4 +1373,20 @@ mod tests {
             }
         }
     }
+
+    proptest::proptest! {
+        /// `pair_matches`' entire reason to exist is treating `{a, b}` as
+        /// an *unordered* pair -- every call site (`add_pair`,
+        /// `remove_pair`, `live_count`) relies on `pair_matches(a, b, x,
+        /// y)` and `pair_matches(b, a, x, y)` agreeing, since a real
+        /// lattice scan visits each site pair from an arbitrary side. An
+        /// asymmetric implementation would silently undercount half of
+        /// every matching pair's occurrences -- checked here for every
+        /// representable species byte, not just the handful of ordered
+        /// pairs the example tests above happen to construct.
+        #[test]
+        fn pair_matches_is_symmetric_in_its_first_two_arguments(a: u8, b: u8, x: u8, y: u8) {
+            proptest::prop_assert_eq!(pair_matches(a, b, x, y), pair_matches(b, a, x, y));
+        }
+    }
 }

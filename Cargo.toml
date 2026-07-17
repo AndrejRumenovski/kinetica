@@ -33,3 +33,6 @@ memmap2 = "=0.9.11"
 rio = "=0.9.4"
 rayon = "=1.12.0"
 crossbeam-channel = "=0.5.16"
+
+[dev-dependencies]
+proptest = "=1.11.0"

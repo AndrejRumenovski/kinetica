@@ -62,6 +62,7 @@ second one exists and how it works.
 - [Visualizing a run](#visualizing-a-run)
 - [Fuzzing](#fuzzing)
 - [Benchmarks](#benchmarks)
+- [Property-based testing](#property-based-testing)
 - [Occupancy-gated kMC](#occupancy-gated-kmc)
 - [Gas-phase pressure coupling](#gas-phase-pressure-coupling)
 - [Lattice geometry and target surface: Pd(111)](#lattice-geometry-and-target-surface-pd111)
@@ -246,7 +247,43 @@ wall-clock throughput and asking why a number looked wrong. Fixed in
 `gillespie.rs` (see its own doc comment on `bin_ceiling` for the exact
 derivation); both misleading tests were rewritten to derive their
 expected values from `FixedPoint::from_q16`'s actual shift instead of
-mirroring the implementation.
+mirroring the implementation. A new property-based test closes the gap
+that let it hide in the first place — see "Property-based testing" below.
+
+## Property-based testing
+
+Every existing test before this section was example-based: hand-picked
+inputs checked against hand-picked expected outputs. That style is what
+let the `bin_ceiling` bug above survive multiple test-suite-green audits
+— the two tests covering it asserted the function's own output rather
+than a value derived independently from the invariant it claims to
+satisfy, so a wrong implementation and a wrong test agreed with each
+other indefinitely. [`proptest`](https://github.com/proptest-rs/proptest)
+generates hundreds of inputs per run and shrinks any failure to a minimal
+reproducing case, checking a *property* instead of an example:
+
+- **`bin_ceiling_is_a_tight_upper_bound_for_every_rate_in_its_bin`**
+  (`gillespie.rs`) — for every representable `rate_q16`, its own bin's
+  ceiling must be a tight upper bound (strictly greater, but by no more
+  than 2x) — the actual specification behind "expected <= 2 rejection
+  trials." Reintroducing the old buggy shift and rerunning this test
+  fails immediately, on its very first shrunk case (`rate_q16 = 1`) —
+  confirmed before trusting the fix, the same "verify, don't assume"
+  discipline this project applies to its chemistry claims.
+- **`lut_round_trips_arbitrary_records`** (`gillespie.rs`) — arbitrary
+  `ReactionRecord` sets (not just the small hand-picked ones the example
+  tests in `layout.rs` cover) survive `pack_records_into_blocks` ->
+  `write_lut` -> `ReactionLut::open` unchanged, once sorted by `bin_id`
+  the same stable way packing does.
+- **`pair_matches_is_symmetric_in_its_first_two_arguments`**
+  (`occupancy.rs`) — every call site depends on `pair_matches(a, b, x,
+  y) == pair_matches(b, a, x, y)`, since a lattice scan visits an
+  adjacent pair from an arbitrary side; checked for every representable
+  species byte, not just the ordered pairs the example tests construct.
+
+```sh
+cargo test --lib   # runs the property tests alongside everything else
+```
 
 ## Occupancy-gated kMC
 
