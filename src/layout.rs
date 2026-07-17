@@ -112,9 +112,12 @@ impl SiteLattice {
     /// Open (creating and zero-extending if necessary) the backing lattice
     /// file at `path` and map `width * height` bytes of it read-write.
     pub fn open(path: impl AsRef<Path>, width: usize, height: usize) -> io::Result<Self> {
-        let len = width
-            .checked_mul(height)
-            .expect("lattice dimensions overflow usize");
+        let len = width.checked_mul(height).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("lattice of {width}x{height} overflows usize"),
+            )
+        })?;
         // `engine.rs`'s `TrajectoryRecord.site_idx` and the global
         // reaction-id math both narrow a site's flat index to `u32` --
         // fine on a 64-bit `usize`, which comfortably exceeds `u32::MAX`
@@ -716,6 +719,29 @@ mod tests {
         assert!(
             result.is_err(),
             "10 billion sites must be rejected, not silently wrapped"
+        );
+        assert!(
+            !path.exists(),
+            "must fail before creating/sizing the backing file"
+        );
+    }
+
+    /// An error-handling audit found `width.checked_mul(height)` was
+    /// followed by `.expect(...)`, so dimensions large enough to overflow
+    /// `usize` itself (reachable via `--lattice-width`/`--lattice-height`,
+    /// both plain CLI-parsed integers) panicked instead of returning the
+    /// same clean `io::Error` the `u32::MAX` check above already uses for a
+    /// smaller version of the same problem. Chosen dimensions each exceed
+    /// 2^32, so their product exceeds `usize::MAX` on a 64-bit target
+    /// without needing to actually allocate anything.
+    #[test]
+    fn open_rejects_lattice_dimensions_overflowing_usize() {
+        let path = temp_path("lattice_usize_overflow");
+        let huge = 1usize << 40;
+        let result = SiteLattice::open(&path, huge, huge);
+        assert!(
+            result.is_err(),
+            "a usize-overflowing product must be rejected, not panic"
         );
         assert!(
             !path.exists(),

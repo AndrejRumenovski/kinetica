@@ -266,6 +266,18 @@ fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> 
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
 
+    let required_len = 12usize.saturating_add(count.saturating_mul(RECORD_SIZE));
+    if bytes.len() < required_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "OC20E003 file claims {count} records ({required_len} bytes incl. header) \
+                 but is only {} bytes -- truncated or corrupted",
+                bytes.len()
+            ),
+        ));
+    }
+
     let mut records = Vec::with_capacity(count);
     let mut offset = 12usize;
     for _ in 0..count {
@@ -340,6 +352,18 @@ fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRe
         ));
     }
     let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+
+    let required_len = 12usize.saturating_add(count.saturating_mul(RECORD_SIZE_BI));
+    if bytes.len() < required_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "OC20BI03 file claims {count} records ({required_len} bytes incl. header) \
+                 but is only {} bytes -- truncated or corrupted",
+                bytes.len()
+            ),
+        ));
+    }
 
     let mut records = Vec::with_capacity(count);
     let mut offset = 12usize;
@@ -1218,6 +1242,32 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// An error-handling audit found a truncated/corrupted file (a valid
+    /// magic header, but a `count` claiming more records than actually
+    /// follow -- e.g. from a killed extraction script) crashed with a raw
+    /// slice-index panic instead of a clean `Err`, since the reader trusted
+    /// `count` without checking the buffer was actually long enough first.
+    /// Verified this reproduced (panic on a hand-built truncated file)
+    /// before fixing it; this test locks in the fixed, non-panicking
+    /// behavior.
+    #[test]
+    fn read_energy_records_rejects_truncated_file_with_inflated_count() {
+        let path = temp_path("energy_truncated");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&500u32.to_le_bytes()); // claims 500 records
+        bytes.extend_from_slice(&[0u8; 5]); // far fewer bytes actually follow
+
+        std::fs::write(&path, &bytes).unwrap();
+        let result = read_energy_records(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            result.is_err(),
+            "a record count exceeding the file's actual length must be rejected, not panic"
+        );
+    }
+
     fn push_bimolecular_record(
         bytes: &mut Vec<u8>,
         species_a: u8,
@@ -1282,6 +1332,28 @@ mod tests {
         std::fs::write(&path, b"NOTMAGIC\x00\x00\x00\x00").unwrap();
         assert!(read_bimolecular_records(&path).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same finding as `read_energy_records_rejects_truncated_file_with_
+    /// inflated_count`, for the bimolecular reader -- an inflated `count`
+    /// against a short file must return `Err`, not panic on an
+    /// out-of-bounds slice.
+    #[test]
+    fn read_bimolecular_records_rejects_truncated_file_with_inflated_count() {
+        let path = temp_path("bi_truncated");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC_BI);
+        bytes.extend_from_slice(&500u32.to_le_bytes()); // claims 500 records
+        bytes.extend_from_slice(&[0u8; 5]); // far fewer bytes actually follow
+
+        std::fs::write(&path, &bytes).unwrap();
+        let result = read_bimolecular_records(&path);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            result.is_err(),
+            "a record count exceeding the file's actual length must be rejected, not panic"
+        );
     }
 
     #[test]
