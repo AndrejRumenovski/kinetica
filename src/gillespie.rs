@@ -199,20 +199,46 @@ impl CompositionTable {
         self.total_propensity
     }
 
-    /// This bin's rejection-envelope ceiling: every member has rate in
-    /// `[2^bin_index, 2^(bin_index+1))` in the fixed-point rate domain, so
-    /// `2^(bin_index+1)` (expressed relative to `FixedPoint::ONE`) is a
-    /// valid upper bound for the acceptance test without inspecting any
-    /// individual member. The shift amount is clamped to stay inside `u64`
-    /// -- bins beyond that point saturate to `u64::MAX` and simply always
-    /// accept, which only matters for magnitude classes far outside any
-    /// physically meaningful OC20 rate constant.
+    /// This bin's rejection-envelope ceiling: every member has raw
+    /// `rate_q16` in `[2^bin_index, 2^(bin_index+1))` (that integer
+    /// magnitude class is exactly what `bin_id = 31 -
+    /// rate_q16.leading_zeros()` computes), so after `FixedPoint::from_q16`
+    /// widens `rate_q16` into this type's raw `u64` bits (a `<< 16`, since
+    /// the source is Q16.16, not `<<
+    /// FixedPoint::FRAC_BITS` (32) -- `FixedPoint` itself is Q32.32, but
+    /// that's this *type's* width, not the shift `from_q16` actually
+    /// performs to land a Q16.16 value in it), every member's raw bits
+    /// fall in `[2^(bin_index+16), 2^(bin_index+17))`. `2^(bin_index+17)`
+    /// is therefore the tight upper bound the rejection test needs.
+    ///
+    /// **This shift used to be `FixedPoint::FRAC_BITS + 1 + bin_index`
+    /// (`33 + bin_index`) -- using the `FixedPoint` type's own 32-bit
+    /// width here instead of the 16 bits `from_q16` actually shifts by
+    /// was a real, confirmed bug**, not a naming quibble: it made every
+    /// ceiling `2^16` (65536x) too large, so the rejection loop's
+    /// acceptance probability collapsed from the documented `>= 1/2` to
+    /// `~1/65536` -- "expected <= 2 trials" became expected ~65536 trials.
+    /// Found while benchmarking the `Static`/`--generate-lut` engine for
+    /// the README (its throughput was ~1000x lower than the
+    /// occupancy-gated engine's, which doesn't go through this rejection
+    /// loop at all -- exactly the asymmetry this bug would produce). See
+    /// the README's "Benchmarks" section for real before/after numbers.
+    /// The shift amount is still clamped to stay inside `u64` -- with the
+    /// fix, `NUM_BINS`'s real range (`bin_index` in `0..32`) never
+    /// actually reaches the clamp (max real shift is `17 + 31 = 48`); it's
+    /// pure defense-in-depth against a future `NUM_BINS` increase, not a
+    /// path any current call exercises.
     #[inline(always)]
     fn bin_ceiling(bin_index: usize) -> FixedPoint {
-        let shift = (Self::FRAC_BITS_PLUS_ONE + bin_index as u32).min(63);
+        let shift = (Self::RATE_Q16_FRAC_BITS_PLUS_ONE + bin_index as u32).min(63);
         FixedPoint(1u64 << shift)
     }
-    const FRAC_BITS_PLUS_ONE: u32 = FixedPoint::FRAC_BITS + 1;
+    /// `rate_q16`'s own Q16.16 fractional-bit width, plus one -- see
+    /// `bin_ceiling`'s doc comment for why this must NOT be
+    /// `FixedPoint::FRAC_BITS` (a different type's width, coincidentally
+    /// also plausible-looking as "the" frac-bits constant, which is
+    /// exactly how the bug it replaces went unnoticed).
+    const RATE_Q16_FRAC_BITS_PLUS_ONE: u32 = 16 + 1;
 
     /// Select the next reaction to fire in expected O(1) time, independent
     /// of the total reaction count. Returns `None` only when every bin is
@@ -415,15 +441,29 @@ mod tests {
 
     #[test]
     fn bin_ceiling_matches_upper_bound_of_its_magnitude_class() {
-        assert_eq!(CompositionTable::bin_ceiling(0).0, 1u64 << 33);
-        assert_eq!(CompositionTable::bin_ceiling(1).0, 1u64 << 34);
+        // Bin 0 covers raw rate_q16 in [1, 2); FixedPoint::from_q16 shifts
+        // that left by 16, so the tight raw-bit upper bound is 1 << 17.
+        // Bin 1 covers [2, 4), landing at 1 << 18. Derived independently
+        // from `FixedPoint::from_q16`'s actual shift, not copied from
+        // `bin_ceiling`'s own implementation -- see its doc comment for
+        // why the previous version of this test encoded a real bug
+        // (asserted 1 << 33 / 1 << 34, a factor of 2^16 too large) instead
+        // of catching it.
+        assert_eq!(CompositionTable::bin_ceiling(0).0, 1u64 << 17);
+        assert_eq!(CompositionTable::bin_ceiling(1).0, 1u64 << 18);
+        assert_eq!(FixedPoint::from_q16(1).0, 1u64 << 16); // just under bin 0's ceiling
+        assert!(FixedPoint::from_q16(1).0 < CompositionTable::bin_ceiling(0).0);
     }
 
     #[test]
     fn bin_ceiling_clamps_shift_to_63_bits() {
-        // FRAC_BITS_PLUS_ONE (33) + (NUM_BINS - 1) (31) = 64, which would
-        // overflow a u64 shift -- must clamp to 63.
-        assert_eq!(CompositionTable::bin_ceiling(NUM_BINS - 1).0, 1u64 << 63);
+        // RATE_Q16_FRAC_BITS_PLUS_ONE (17) + bin_index must reach 64 to
+        // need clamping -- bin_index = 47. No real caller passes a
+        // bin_index anywhere near that (NUM_BINS is 32, so real indices
+        // top out at 31, shift 48); this exercises the defensive clamp
+        // directly rather than relying on it ever being reachable through
+        // `sample_reaction`.
+        assert_eq!(CompositionTable::bin_ceiling(47).0, 1u64 << 63);
     }
 
     #[test]
