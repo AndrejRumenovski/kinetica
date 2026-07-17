@@ -60,6 +60,7 @@ second one exists and how it works.
 - [Layout](#layout)
 - [Running the simulator](#running-the-simulator)
 - [Visualizing a run](#visualizing-a-run)
+- [Fuzzing](#fuzzing)
 - [Occupancy-gated kMC](#occupancy-gated-kmc)
 - [Gas-phase pressure coupling](#gas-phase-pressure-coupling)
 - [Lattice geometry and target surface: Pd(111)](#lattice-geometry-and-target-surface-pd111)
@@ -158,6 +159,31 @@ whatever order each patch/writer happened to be scheduled, not global
 chronological order — `coverage_report` sorts every record by its own
 logged `sim_time` before replaying, which is what makes "coverage at time
 T" well-defined at all across independently-running patches.
+
+## Fuzzing
+
+`layout::ReactionLut::open` maps a `reactions.lut` file and reinterprets
+its bytes as `[ReactionLutBlock]` via an `unsafe` pointer cast — sound
+only because of the length/alignment checks that run *before* the cast
+(see the function's own safety comment), not because the file is assumed
+well-formed. `fuzz/fuzz_targets/reactions_lut_parse.rs` (via
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)/libFuzzer) throws
+arbitrary bytes at it and checks the one property that has to hold for
+*any* input: `open` either returns `Err`, or a `ReactionLut` whose every
+block and record can be read back out without panicking or triggering
+undefined behavior (which ASan/UBSan, wired up by cargo-fuzz's default
+sanitizer, would catch even where safe Rust can't observe it directly).
+
+```sh
+cargo install cargo-fuzz
+rustup toolchain install nightly   # cargo-fuzz/libFuzzer requires nightly
+cargo +nightly fuzz run reactions_lut_parse -- -max_total_time=300
+```
+
+A local 60-second run (1.46M executions) found no crashes before this was
+committed. CI runs a bounded 60-second smoke test of the same target on
+every push — not a substitute for a real fuzzing campaign, but enough to
+catch a regression in this parsing path before it reaches `main`.
 
 ## Occupancy-gated kMC
 

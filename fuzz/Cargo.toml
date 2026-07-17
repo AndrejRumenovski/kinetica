@@ -1,0 +1,21 @@
+[package]
+name = "kinetica-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kinetica]
+path = ".."
+
+[[bin]]
+name = "reactions_lut_parse"
+path = "fuzz_targets/reactions_lut_parse.rs"
+test = false
+doc = false
+bench = false

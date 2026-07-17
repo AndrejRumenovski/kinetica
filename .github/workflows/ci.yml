@@ -32,3 +32,28 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets --locked
+
+  fuzz-smoke:
+    name: fuzz smoke test (reactions_lut_parse)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (nightly, required by cargo-fuzz/libFuzzer)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz reactions_lut_parse for 60s
+        # A short, bounded run on every push -- not a substitute for a
+        # real fuzzing campaign, but enough to catch a regression that
+        # breaks ReactionLut::open's "never panic/UB on arbitrary bytes"
+        # property before it reaches main. Run locally with a longer
+        # -max_total_time for real fuzzing (see README's "Fuzzing" section).
+        run: cargo fuzz run reactions_lut_parse -- -max_total_time=60
