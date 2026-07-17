@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Asynchronous, out-of-core lattice kinetic Monte Carlo engine for single-workstation OC20-scale surface reaction simulation."
 authors = ["AndrejRumenovski"]
+license = "MIT OR Apache-2.0"
 
 # ------------------------------------------------------------------------------
 # BUILD NOTES

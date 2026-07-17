@@ -68,6 +68,7 @@ second one exists and how it works.
 - [Broader reaction coverage: OH\* and water splitting](#broader-reaction-coverage-oh-and-water-splitting)
 - [Widening past four species: H2O\*](#widening-past-four-species-h2o)
 - [Building `reactions.lut` from real data](#building-reactionslut-from-real-data)
+- [License](#license)
 
 ## Building
 
@@ -931,3 +932,9 @@ untracked — see `.gitignore`. `scripts/extract_energies.py`,
 `scripts/extract_catalysis_hub.py`, and `scripts/oc20e_format.py` (the
 shared binary format both scripts write) are all tracked; only the
 downloads, extractions, and generated `.bin` files under `data/` are not.
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache License, Version
+2.0](LICENSE-APACHE), at your option — the Rust ecosystem's usual
+convention.
