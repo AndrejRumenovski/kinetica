@@ -67,11 +67,13 @@
 //! hundreds of individually-untracked channels the engine has no way to
 //! gate on actual occupancy.
 
-use std::fs::File;
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 
 use kinetica::layout::{self, ReactionLutBlock, SPECIES_BITS};
+use kinetica::oc20e_format::{
+    read_bimolecular_records, read_energy_records, BiEnergyRecord, EnergyRecord,
+};
 use kinetica::occupancy::BUCKETS_PER_SPECIES;
 
 /// `SPECIES_BITS`'s index order, named. Indices 0-2 (O, H, CO) match
@@ -95,19 +97,6 @@ const SPECIES_NAMES: [&str; 5] = ["O", "H", "CO", "OH", "H2O"];
 /// CO adsorbs molecularly (`COgas` at 1.0 stoichiometry, one site), so it
 /// keeps the ordinary monomolecular adsorption/desorption pair unchanged.
 const DISSOCIATIVE_SPECIES: [usize; 2] = [0, 1]; // O, H
-
-const MAGIC: &[u8; 8] = b"OC20E003";
-/// species(1) + energy_mev(4) + sid(4) + has_real_ea(1) + real_ea_mev(4)
-/// + metal(1) + facet(2).
-const RECORD_SIZE: usize = 17;
-
-/// `OC20BI03`: the parallel bimolecular format `extract_catalysis_hub.py`'s
-/// `write_bimolecular_records` writes -- see `scripts/oc20e_format.py` for
-/// the authoritative byte layout this must match.
-const MAGIC_BI: &[u8; 8] = b"OC20BI03";
-/// species_a(1) + species_b(1) + energy_mev(4) + sid(4) + ea_mev(4)
-/// + metal(1) + facet(2) + is_dissociative(1).
-const RECORD_SIZE_BI: usize = 18;
 
 /// Metal index table, in lockstep with `scripts/oc20e_format.py`'s own
 /// `METALS` list -- the numeric index is what's on disk in both
@@ -234,167 +223,6 @@ fn usage() -> String {
                                     [default: no filter]\n    \
        -h, --help                  Print this message"
         .to_string()
-}
-
-/// One parsed input record: which adsorbate, its relaxed adsorption/
-/// reaction energy in eV, the source system/reaction id (kept only for
-/// diagnostics), and -- rarely -- a genuine DFT-computed activation energy
-/// in eV, when the source publishes one instead of just the reaction
-/// energy.
-#[derive(Clone, Copy)]
-struct EnergyRecord {
-    species: u8,
-    energy_ev: f64,
-    #[allow(dead_code)]
-    sid: u32,
-    real_ea_ev: Option<f64>,
-    /// Index into `METALS`; 0 = unknown/not tracked.
-    metal: u8,
-    /// Decimal-digit Miller-index encoding (e.g. 111); 0 = unknown.
-    facet: u16,
-}
-
-fn read_energy_records(path: &std::path::Path) -> io::Result<Vec<EnergyRecord>> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-
-    if bytes.len() < 12 || &bytes[0..8] != MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not an OC20E003 energy file (bad magic/too short)",
-        ));
-    }
-    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-
-    let required_len = 12usize.saturating_add(count.saturating_mul(RECORD_SIZE));
-    if bytes.len() < required_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "OC20E003 file claims {count} records ({required_len} bytes incl. header) \
-                 but is only {} bytes -- truncated or corrupted",
-                bytes.len()
-            ),
-        ));
-    }
-
-    let mut records = Vec::with_capacity(count);
-    let mut offset = 12usize;
-    for _ in 0..count {
-        let species = bytes[offset];
-        let energy_mev = i32::from_le_bytes(bytes[offset + 1..offset + 5].try_into().unwrap());
-        let sid = u32::from_le_bytes(bytes[offset + 5..offset + 9].try_into().unwrap());
-        let has_real_ea = bytes[offset + 9] != 0;
-        let real_ea_mev = i32::from_le_bytes(bytes[offset + 10..offset + 14].try_into().unwrap());
-        let metal = bytes[offset + 14];
-        let facet = u16::from_le_bytes(bytes[offset + 15..offset + 17].try_into().unwrap());
-        offset += RECORD_SIZE;
-
-        if (species as usize) >= SPECIES_BITS.len() {
-            continue; // defensive: ignore any species index this build doesn't know
-        }
-        records.push(EnergyRecord {
-            species,
-            energy_ev: energy_mev as f64 / 1000.0,
-            sid,
-            real_ea_ev: has_real_ea.then_some(real_ea_mev as f64 / 1000.0),
-            metal,
-            facet,
-        });
-    }
-
-    Ok(records)
-}
-
-/// One parsed bimolecular record: two adsorbed species consumed/produced by
-/// the same event (indices into `SPECIES_BITS`, same convention as
-/// `EnergyRecord::species`), a real DFT-computed forward activation energy
-/// (this format never carries a BEP-derived one, since there is no
-/// bimolecular BEP relation here), and the forward reaction energy --
-/// meaningful (and used, for the first time) when `is_dissociative` is
-/// set, to derive a real thermodynamic-consistency reverse rate the same
-/// way monomolecular adsorption/desorption pairs already do.
-///
-/// `is_dissociative` distinguishes which *direction* this real barrier
-/// was measured in, since the two site transitions this drives are
-/// direction-dependent, not just a magnitude:
-/// - `false` (recombination, e.g. CO-oxidation, H2-recombination): both
-///   sites start occupied and clear to vacant, releasing a gas product.
-///   Forward-only, same as before this field existed -- there's no
-///   thermodynamically meaningful reverse for a gas product that doesn't
-///   dissociatively re-adsorb the same way it left.
-/// - `true` (dissociative adsorption, e.g. water splitting): both sites
-///   start vacant and fill from a gas reactant. Built *both* directions --
-///   forward from the real `ea_ev` directly, reverse (associative
-///   desorption) via `Ea_rev = ea_ev - energy_ev`, since this direction's
-///   reverse genuinely is the same elementary step run backward.
-#[derive(Clone, Copy)]
-struct BiEnergyRecord {
-    species_a: u8,
-    species_b: u8,
-    #[allow(dead_code)]
-    sid: u32,
-    energy_ev: f64,
-    ea_ev: f64,
-    metal: u8,
-    facet: u16,
-    is_dissociative: bool,
-}
-
-fn read_bimolecular_records(path: &std::path::Path) -> io::Result<Vec<BiEnergyRecord>> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-
-    if bytes.len() < 12 || &bytes[0..8] != MAGIC_BI {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not an OC20BI03 bimolecular-energy file (bad magic/too short)",
-        ));
-    }
-    let count = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-
-    let required_len = 12usize.saturating_add(count.saturating_mul(RECORD_SIZE_BI));
-    if bytes.len() < required_len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "OC20BI03 file claims {count} records ({required_len} bytes incl. header) \
-                 but is only {} bytes -- truncated or corrupted",
-                bytes.len()
-            ),
-        ));
-    }
-
-    let mut records = Vec::with_capacity(count);
-    let mut offset = 12usize;
-    for _ in 0..count {
-        let species_a = bytes[offset];
-        let species_b = bytes[offset + 1];
-        let energy_mev = i32::from_le_bytes(bytes[offset + 2..offset + 6].try_into().unwrap());
-        let sid = u32::from_le_bytes(bytes[offset + 6..offset + 10].try_into().unwrap());
-        let ea_mev = i32::from_le_bytes(bytes[offset + 10..offset + 14].try_into().unwrap());
-        let metal = bytes[offset + 14];
-        let facet = u16::from_le_bytes(bytes[offset + 15..offset + 17].try_into().unwrap());
-        let is_dissociative = bytes[offset + 17] != 0;
-        offset += RECORD_SIZE_BI;
-
-        if (species_a as usize) >= SPECIES_BITS.len() || (species_b as usize) >= SPECIES_BITS.len()
-        {
-            continue; // defensive: ignore any species index this build doesn't know
-        }
-        records.push(BiEnergyRecord {
-            species_a,
-            species_b,
-            sid,
-            energy_ev: energy_mev as f64 / 1000.0,
-            ea_ev: ea_mev as f64 / 1000.0,
-            metal,
-            facet,
-            is_dissociative,
-        });
-    }
-
-    Ok(records)
 }
 
 /// One quantile bucket's summary: how many real DFT samples fell into it,
@@ -867,6 +695,7 @@ fn run(config: &Config) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kinetica::oc20e_format::{MAGIC, MAGIC_BI};
 
     fn temp_path(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -1234,39 +1063,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn read_energy_records_rejects_bad_magic() {
-        let path = temp_path("bad_magic");
-        std::fs::write(&path, b"NOTMAGIC\x00\x00\x00\x00").unwrap();
-        assert!(read_energy_records(&path).is_err());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// An error-handling audit found a truncated/corrupted file (a valid
-    /// magic header, but a `count` claiming more records than actually
-    /// follow -- e.g. from a killed extraction script) crashed with a raw
-    /// slice-index panic instead of a clean `Err`, since the reader trusted
-    /// `count` without checking the buffer was actually long enough first.
-    /// Verified this reproduced (panic on a hand-built truncated file)
-    /// before fixing it; this test locks in the fixed, non-panicking
-    /// behavior.
-    #[test]
-    fn read_energy_records_rejects_truncated_file_with_inflated_count() {
-        let path = temp_path("energy_truncated");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&500u32.to_le_bytes()); // claims 500 records
-        bytes.extend_from_slice(&[0u8; 5]); // far fewer bytes actually follow
-
-        std::fs::write(&path, &bytes).unwrap();
-        let result = read_energy_records(&path);
-        let _ = std::fs::remove_file(&path);
-
-        assert!(
-            result.is_err(),
-            "a record count exceeding the file's actual length must be rejected, not panic"
-        );
-    }
+    // `read_energy_records`'s bad-magic and truncated-file rejection are
+    // now tested directly in `oc20e_format`'s own test module, where the
+    // function lives -- see `read_energy_records_rejects_bad_magic` and
+    // `read_energy_records_rejects_truncated_file_with_inflated_count`
+    // there. The round-trip test above stays here since it also exercises
+    // this binary's own species-filtering usage of the reader.
 
     fn push_bimolecular_record(
         bytes: &mut Vec<u8>,
@@ -1326,35 +1128,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn read_bimolecular_records_rejects_bad_magic() {
-        let path = temp_path("bi_bad_magic");
-        std::fs::write(&path, b"NOTMAGIC\x00\x00\x00\x00").unwrap();
-        assert!(read_bimolecular_records(&path).is_err());
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// Same finding as `read_energy_records_rejects_truncated_file_with_
-    /// inflated_count`, for the bimolecular reader -- an inflated `count`
-    /// against a short file must return `Err`, not panic on an
-    /// out-of-bounds slice.
-    #[test]
-    fn read_bimolecular_records_rejects_truncated_file_with_inflated_count() {
-        let path = temp_path("bi_truncated");
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(MAGIC_BI);
-        bytes.extend_from_slice(&500u32.to_le_bytes()); // claims 500 records
-        bytes.extend_from_slice(&[0u8; 5]); // far fewer bytes actually follow
-
-        std::fs::write(&path, &bytes).unwrap();
-        let result = read_bimolecular_records(&path);
-        let _ = std::fs::remove_file(&path);
-
-        assert!(
-            result.is_err(),
-            "a record count exceeding the file's actual length must be rejected, not panic"
-        );
-    }
+    // `read_bimolecular_records`'s bad-magic and truncated-file rejection
+    // are now tested directly in `oc20e_format`'s own test module -- see
+    // `read_bimolecular_records_rejects_bad_magic` and
+    // `read_bimolecular_records_rejects_truncated_file_with_inflated_count`
+    // there. The round-trip test above stays here since it also exercises
+    // this binary's own species-filtering usage of the reader.
 
     #[test]
     fn run_builds_a_single_bimolecular_reaction_with_no_reverse() {

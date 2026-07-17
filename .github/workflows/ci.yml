@@ -34,7 +34,7 @@ jobs:
         run: cargo test --all-targets --locked
 
   fuzz-smoke:
-    name: fuzz smoke test (reactions_lut_parse)
+    name: fuzz smoke test (untrusted-input parsers)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -50,10 +50,16 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
+      # Short, bounded runs on every push -- not a substitute for a real
+      # fuzzing campaign, but enough to catch a regression in any of these
+      # untrusted-disk-bytes parsers before it reaches main. Run locally
+      # with a longer -max_total_time for real fuzzing (see README's
+      # "Fuzzing" section).
       - name: Fuzz reactions_lut_parse for 60s
-        # A short, bounded run on every push -- not a substitute for a
-        # real fuzzing campaign, but enough to catch a regression that
-        # breaks ReactionLut::open's "never panic/UB on arbitrary bytes"
-        # property before it reaches main. Run locally with a longer
-        # -max_total_time for real fuzzing (see README's "Fuzzing" section).
         run: cargo fuzz run reactions_lut_parse -- -max_total_time=60
+
+      - name: Fuzz oc20_energy_records_parse for 30s
+        run: cargo fuzz run oc20_energy_records_parse -- -max_total_time=30
+
+      - name: Fuzz oc20_bimolecular_records_parse for 30s
+        run: cargo fuzz run oc20_bimolecular_records_parse -- -max_total_time=30

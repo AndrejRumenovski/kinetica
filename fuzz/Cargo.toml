@@ -19,3 +19,17 @@ path = "fuzz_targets/reactions_lut_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "oc20_energy_records_parse"
+path = "fuzz_targets/oc20_energy_records_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oc20_bimolecular_records_parse"
+path = "fuzz_targets/oc20_bimolecular_records_parse.rs"
+test = false
+doc = false
+bench = false

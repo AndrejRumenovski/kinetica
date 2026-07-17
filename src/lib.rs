@@ -6,13 +6,14 @@
 pub mod engine;
 pub mod gillespie;
 pub mod layout;
+pub mod oc20e_format;
 pub mod occupancy;
 pub mod topology;
 
-/// Shared by `layout`'s and `gillespie`'s test modules, both of which need
-/// a real on-disk file to back a `SiteLattice`/`ReactionLut` mmap (neither
-/// type can be exercised over an in-memory buffer). Not visible outside
-/// this crate's own test builds.
+/// Shared by `layout`'s, `gillespie`'s, and `oc20e_format`'s test modules,
+/// all of which need a real on-disk file to exercise a path-based
+/// `open`/read function (none can be exercised over an in-memory buffer
+/// alone). Not visible outside this crate's own test builds.
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::path::PathBuf;

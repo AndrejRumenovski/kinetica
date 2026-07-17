@@ -102,6 +102,7 @@ tested, so the documented build and the tested build now agree.
 | `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
 | `src/occupancy.rs`       | Live per-patch occupancy counters + O(1) free-list site selection (bimolecular pair search still bounded-rejection) -- the `OccupancyGated`/real-data engine |
 | `src/engine.rs`          | Spatial domain decomposition, rayon work-stealing, fully independent patches (no cross-patch communication), double-buffered `io_uring` trajectory writer, dispatch between the two engines |
+| `src/oc20e_format.rs`    | Reader for the `OC20E003`/`OC20BI03` binary formats `--input`/`--bimolecular-input` load; lives in the library (not in `oc20_ingest.rs`) so the untrusted-input fuzz targets exercise the real parsing code, not a duplicate |
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
 | `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
@@ -174,28 +175,46 @@ T" well-defined at all across independently-running patches.
 
 ## Fuzzing
 
-`layout::ReactionLut::open` maps a `reactions.lut` file and reinterprets
-its bytes as `[ReactionLutBlock]` via an `unsafe` pointer cast — sound
-only because of the length/alignment checks that run *before* the cast
-(see the function's own safety comment), not because the file is assumed
-well-formed. `fuzz/fuzz_targets/reactions_lut_parse.rs` (via
-[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)/libFuzzer) throws
-arbitrary bytes at it and checks the one property that has to hold for
-*any* input: `open` either returns `Err`, or a `ReactionLut` whose every
-block and record can be read back out without panicking or triggering
-undefined behavior (which ASan/UBSan, wired up by cargo-fuzz's default
-sanitizer, would catch even where safe Rust can't observe it directly).
+Three parsers in this codebase read untrusted on-disk bytes -- files this
+process didn't itself just write in the same run, so nothing guarantees
+they're well-formed:
+
+- `layout::ReactionLut::open` maps a `reactions.lut` file and
+  reinterprets its bytes as `[ReactionLutBlock]` via an `unsafe` pointer
+  cast — sound only because of the length/alignment checks that run
+  *before* the cast (see the function's own safety comment), not because
+  the file is assumed well-formed.
+- `oc20e_format::read_energy_records` / `read_bimolecular_records` parse
+  the `OC20E003`/`OC20BI03` files `--input`/`--bimolecular-input` load —
+  written by a separate Python extraction script, so a killed extraction
+  run, a stale format version, or plain corruption can produce bytes
+  these readers have to survive. An error-handling audit found (and
+  fixed) exactly this: a file whose `count` field claimed more records
+  than actually followed panicked on an out-of-bounds slice index
+  instead of returning `Err`.
+
+`fuzz/fuzz_targets/{reactions_lut_parse,oc20_energy_records_parse,
+oc20_bimolecular_records_parse}.rs` (via
+[`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)/libFuzzer) throw
+arbitrary bytes at each and check the one property that has to hold for
+*any* input: the function either returns `Err`, or a value that can be
+read back out without panicking or triggering undefined behavior (which
+ASan/UBSan, wired up by cargo-fuzz's default sanitizer, would catch even
+where safe Rust can't observe it directly).
 
 ```sh
 cargo install cargo-fuzz
 rustup toolchain install nightly   # cargo-fuzz/libFuzzer requires nightly
 cargo +nightly fuzz run reactions_lut_parse -- -max_total_time=300
+cargo +nightly fuzz run oc20_energy_records_parse -- -max_total_time=300
+cargo +nightly fuzz run oc20_bimolecular_records_parse -- -max_total_time=300
 ```
 
-A local 60-second run (1.46M executions) found no crashes before this was
-committed. CI runs a bounded 60-second smoke test of the same target on
-every push — not a substitute for a real fuzzing campaign, but enough to
-catch a regression in this parsing path before it reaches `main`.
+Local 30-60-second runs (900K-1.5M executions each) found no crashes on
+any of the three before they were committed. CI runs a bounded smoke
+test of all three on every push — not a substitute for a real fuzzing
+campaign, but enough to catch a regression in any of these parsing paths
+before it reaches `main`.
 
 ## Benchmarks
 
