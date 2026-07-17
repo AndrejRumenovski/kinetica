@@ -51,16 +51,27 @@ struct Record {
 /// "unwritten padding, not a real event at time zero" -- this tool's one
 /// load-bearing assumption about the format beyond the fixed record
 /// layout itself.
+///
+/// Every sub-slice below is fetched via `.get(..)?` and converted via
+/// `.try_into().ok()?` rather than direct indexing + `.unwrap()`. Today
+/// this is unreachable defensively-dead code: `chunks_exact(RECORD_SIZE)`
+/// already guarantees `chunk` is exactly `RECORD_SIZE` bytes, so these
+/// slices can never actually be out of range. Written this way anyway so
+/// a future change to the chunking method (e.g. swapping in plain
+/// `chunks`, which does *not* guarantee a full-size final chunk) fails
+/// closed -- silently skipping one malformed record, the same way a
+/// zero-padding record already is -- instead of panicking and taking the
+/// whole analysis pass down with it.
 fn parse_records(bytes: &[u8]) -> Vec<Record> {
     bytes
         .chunks_exact(RECORD_SIZE)
         .filter_map(|chunk| {
-            let sim_time_bits = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
+            let sim_time_bits = u64::from_le_bytes(chunk.get(0..8)?.try_into().ok()?);
             if sim_time_bits == 0 {
                 return None;
             }
-            let site_idx = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-            let reaction_id = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+            let site_idx = u32::from_le_bytes(chunk.get(8..12)?.try_into().ok()?);
+            let reaction_id = u32::from_le_bytes(chunk.get(12..16)?.try_into().ok()?);
             Some(Record {
                 sim_time: f64::from_bits(sim_time_bits),
                 site_idx,
