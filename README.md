@@ -1,8 +1,18 @@
 # kinetica
 
-Asynchronous, out-of-core lattice kinetic Monte Carlo (kMC) engine for
-single-workstation, OC20-scale surface reaction simulation, written in
-pure Rust.
+**An asynchronous, out-of-core lattice kinetic Monte Carlo (kMC) engine
+for surface-reaction simulation, written in pure Rust — driven by real
+DFT-computed adsorption energies and transition-state barriers, not
+synthetic placeholder rates.**
+
+![Real Pd(111) surface coverage settling to steady state, plotted from this project's own release binary](docs/coverage.png)
+
+*O\*/H\*/CO\*/H2O\* coverage vs. simulated time, replayed from a real run
+of this repo's own `kinetica` binary against its own `reactions.lut` —
+reaction rates derived entirely from real Catalysis-Hub.org DFT data for
+Pd(111) (see "Building `reactions.lut` from real data" below). Regenerate
+it yourself with `coverage_report` + `scripts/plot_coverage.py` — see
+"Visualizing a run".*
 
 The lattice lives as a memory-mapped file rather than in heap-resident
 `Vec`s, is a real hexagonal fcc(111) close-packed surface geometry (see
@@ -21,6 +31,39 @@ built data — propensity scales with how many lattice sites *currently*
 match a reaction's reactant state, so a reaction can only ever fire where
 its reactant genuinely is). See "Occupancy-gated kMC" below for why the
 second one exists and how it works.
+
+**What this project is meant to demonstrate**, as a portfolio piece:
+
+- **Systems engineering** — zero-copy memory-mapped state, a cache-line-
+  aligned AoSOA reaction table sized to fit whole hardware cache lines
+  with no implicit padding, `unsafe` used narrowly and justified inline
+  rather than avoided by pretending it isn't needed.
+- **Concurrency** — `rayon` work-stealing spatial decomposition into fully
+  independent patches, a double-buffered `io_uring` trajectory writer that
+  never blocks a compute thread on disk I/O.
+- **Algorithms** — O(1) composition-rejection stochastic simulation
+  (Gillespie SSA) for the synthetic path, O(1) sparse-set free-lists for
+  *exact* occupancy-gated site selection on the real-data path.
+- **Scientific honesty** — every "real chemistry" claim below is checked
+  against actual DFT records rather than assumed, and a negative result
+  (data that turned out *not* to apply once actually checked) is
+  documented as carefully as a positive one — see "Lattice geometry and
+  target surface: Pd(111)" and "OC22: investigated, not integrated" for
+  two examples where a plausible-looking data source didn't pan out, and
+  the README says so instead of quietly moving on.
+
+## Table of contents
+
+- [Building](#building)
+- [Layout](#layout)
+- [Running the simulator](#running-the-simulator)
+- [Visualizing a run](#visualizing-a-run)
+- [Occupancy-gated kMC](#occupancy-gated-kmc)
+- [Gas-phase pressure coupling](#gas-phase-pressure-coupling)
+- [Lattice geometry and target surface: Pd(111)](#lattice-geometry-and-target-surface-pd111)
+- [Broader reaction coverage: OH\* and water splitting](#broader-reaction-coverage-oh-and-water-splitting)
+- [Widening past four species: H2O\*](#widening-past-four-species-h2o)
+- [Building `reactions.lut` from real data](#building-reactionslut-from-real-data)
 
 ## Building
 
@@ -47,9 +90,11 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
 | `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
+| `src/bin/coverage_report.rs` | Replays `trajectory.bin` against `reactions.lut` into a per-species coverage-over-time CSV (see "Visualizing a run") |
 | `scripts/extract_energies.py` | Pulls adsorption-energy records from OC20 IS2RE LMDB shards |
 | `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API, plus real transition-state barriers where they exist |
 | `scripts/oc20e_format.py`     | Shared binary format both extraction scripts write |
+| `scripts/plot_coverage.py`    | Turns `coverage_report`'s CSV into the coverage-vs-time PNG at the top of this README |
 
 ## Running the simulator
 
@@ -73,13 +118,44 @@ not portable across heterogeneous CPU fleets — rebuild per target machine.
 | `--pressure-o2 <F>`   | `1.0`                | Relative O2 partial pressure — gates O* adsorption |
 | `--pressure-h2 <F>`   | `1.0`                | Relative H2 partial pressure — gates H* adsorption |
 | `--pressure-co <F>`   | `1.0`                | Relative CO partial pressure — gates CO* adsorption |
+| `--pressure-h2o <F>`  | `1.0`                | Relative H2O partial pressure — gates H2O* adsorption (not water splitting) |
 
-The three `--pressure-*` flags are runtime simulator parameters, not baked
+The four `--pressure-*` flags are runtime simulator parameters, not baked
 into `reactions.lut` — changing the feed-gas composition never requires
 rebuilding the LUT. They only affect the occupancy-gated engine (real
 data), and only an adsorption channel's propensity (`VACANT -> species`);
 desorption and bimolecular reactions are untouched, since neither consumes
 a gas-phase molecule. See "Gas-phase pressure coupling" below.
+
+## Visualizing a run
+
+`coverage_report` replays a `trajectory.bin` fired-reaction log against
+`reactions.lut` to reconstruct per-species surface coverage over simulated
+time (the log itself only stores `(sim_time, site_idx, reaction_id)` per
+event, not the resulting occupancy) and prints it as CSV;
+`scripts/plot_coverage.py` turns that into the PNG at the top of this
+README:
+
+```sh
+./target/release/kinetica \
+    --lattice-width 256 --lattice-height 256 --patches 8 --steps 150000
+./target/release/coverage_report \
+    --trajectory-path trajectory.bin --lut-path reactions.lut \
+    --lattice-width 256 --lattice-height 256 \
+    > coverage.csv
+python3 scripts/plot_coverage.py coverage.csv coverage.png
+```
+
+`--lattice-width`/`--lattice-height` must match whatever the real run
+used — `trajectory.bin` logs a flat global site index, not a `(width,
+height)` pair, so `coverage_report` has no way to recover the lattice
+shape on its own. Because `run_simulation`'s patches are fully independent
+(see "Occupancy-gated kMC" below) and write to the trajectory file through
+two alternating `io_uring` writer threads, records land in the file in
+whatever order each patch/writer happened to be scheduled, not global
+chronological order — `coverage_report` sorts every record by its own
+logged `sim_time` before replaying, which is what makes "coverage at time
+T" well-defined at all across independently-running patches.
 
 ## Occupancy-gated kMC
 
