@@ -69,6 +69,7 @@ second one exists and how it works.
 - [Fuzzing](#fuzzing)
 - [Benchmarks](#benchmarks)
 - [Property-based testing](#property-based-testing)
+- [Real-data regression test](#real-data-regression-test)
 - [Occupancy-gated kMC](#occupancy-gated-kmc)
 - [Gas-phase pressure coupling](#gas-phase-pressure-coupling)
 - [Lattice geometry and target surface: Pd(111)](#lattice-geometry-and-target-surface-pd111)
@@ -371,6 +372,54 @@ reproducing case, checking a *property* instead of an example:
 ```sh
 cargo test --lib   # runs the property tests alongside everything else
 ```
+
+## Real-data regression test
+
+Every "verified against the real Pd(111) `reactions.lut`" claim elsewhere
+in this README and in the project's own session history was, until now, a
+manual check — someone ran the real pipeline once, by hand, per session.
+That's exactly the class of gap that let the `bin_ceiling` performance bug
+above survive multiple prior "all green" audits: it only ever surfaced
+from a human measuring real wall-clock throughput and asking why a number
+looked wrong, not from anything `cargo test` itself was checking.
+
+`tests/real_data_regression.rs` is a standard Cargo integration test that
+closes that gap for what a single frozen real-data run can check
+automatically. It runs the actual `oc20_ingest` and `kinetica` binaries
+(via `CARGO_BIN_EXE_*`, Cargo's own mechanism for an integration test to
+invoke a sibling binary) against two tiny, committed, already-real,
+already-DFT-derived fixture files
+(`tests/fixtures/pd111_{energies,bimolecular}.bin` — the same 386 and 48
+bytes `data/oc20/energies_pd111*.bin` holds locally, just copied into a
+path that isn't gitignored), then asserts:
+
+- `oc20_ingest` builds exactly 34 real reactions from that data (opened
+  back via `layout::ReactionLut::open`, not string-matched from stdout).
+- A deterministic multi-patch (`--patches 4`) run against that LUT never
+  leaves a lattice site holding a byte other than a known one-hot species
+  value, and reaches an **exact**, hardcoded final per-species coverage
+  histogram — not just "didn't crash."
+
+Deliberately fixture-based, not live-API-based: this project's own
+history (see "What has failed" in past session notes) documents
+Catalysis-Hub's live GraphQL API as non-deterministic run to run
+(pagination flakiness, record counts that drift over time) — making CI
+depend on it would trade a real gap for a flakier one. The engine's
+per-patch seed depends only on the patch index
+(`0x5EED_0000_0000_0000 ^ i`, see `engine.rs`), never on wall-clock time
+or thread scheduling, so the same fixed lattice size/patch count/step
+count reproduces the same histogram on every run, on every machine.
+
+```sh
+cargo test --test real_data_regression
+```
+
+Runs automatically under CI's existing `cargo test --all-targets` step —
+no new CI job needed. Any *intentional* future change to the real
+chemistry pipeline (new species, different BEP defaults, a different
+bucket count) will need to update this test's hardcoded expected reaction
+count/histogram — a deliberate cost, matching this project's "verify,
+don't assume" approach to real-data behavior changes elsewhere.
 
 ## Occupancy-gated kMC
 
