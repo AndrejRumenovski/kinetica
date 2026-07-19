@@ -25,12 +25,23 @@ import sys
 
 import lmdb
 
+from kinetica_config import load_config
 from oc20e_format import facet_code, metal_index, miller_facet_string, parse_pure_metal, write_records
 
-# OC20's global adsorbate-index table (mapping_adsorbates_2020may12.txt)
-# assigns these three indices to exactly the three adsorbates kinetica's
-# bitflags (layout.rs) model: *O, *H, *CO.
-ADS_ID_TO_SPECIES = {0: 0, 1: 1, 5: 2}  # O -> 0, H -> 1, CO -> 2
+
+def build_ads_id_to_species(config):
+    """`{OC20 global adsorbate-index table id: kinetica species index}` --
+    derived from `--config`'s `[species]` rows instead of the hardcoded
+    `{0: 0, 1: 1, 5: 2}` this used to be. OC20's global adsorbate-index
+    table (`mapping_adsorbates_2020may12.txt`) assigns id `0` to `*O`, `1`
+    to `*H`, `5` to `*CO`; a species with no `oc20_ads_id` declared (e.g.
+    `OH`, `product_only`, or `H2O`, currently only sourced via
+    Catalysis-Hub) simply has no entry here."""
+    return {
+        entry.oc20_ads_id: i
+        for i, entry in enumerate(config.species)
+        if entry.oc20_ads_id is not None
+    }
 
 
 class AnyStub:
@@ -69,7 +80,7 @@ class StubUnpickler(pickle.Unpickler):
         return None
 
 
-def load_sid_map(mapping_path):
+def load_sid_map(mapping_path, ads_id_to_species):
     """`{sid: (species, metal_idx, facet_val)}`.
 
     `metal`/`facet` are best-effort: OC20's bulks are frequently
@@ -84,7 +95,7 @@ def load_sid_map(mapping_path):
         mapping = pickle.load(f)
     sid_to_meta = {}
     for key, meta in mapping.items():
-        species = ADS_ID_TO_SPECIES.get(meta.get("ads_id"))
+        species = ads_id_to_species.get(meta.get("ads_id"))
         if species is None:
             continue
         # keys look like "random<sid>"
@@ -125,9 +136,19 @@ def main():
     parser.add_argument("--lmdb", required=True, help="path to a data.lmdb shard")
     parser.add_argument("--mapping", required=True, help="path to oc20_data_mapping.pkl")
     parser.add_argument("--out", required=True, help="output flat binary path")
+    parser.add_argument(
+        "--config",
+        required=True,
+        help="path to the sectioned config file oc20_ingest --config also reads "
+        "(see kinetica_config.py); its [species] rows' oc20_ads_id fields drive "
+        "which OC20 adsorbate-index ids this extraction recognizes",
+    )
     args = parser.parse_args()
 
-    sid_to_meta = load_sid_map(args.mapping)
+    config = load_config(args.config)
+    ads_id_to_species = build_ads_id_to_species(config)
+
+    sid_to_meta = load_sid_map(args.mapping, ads_id_to_species)
     print(f"loaded {len(sid_to_meta)} target sids from mapping", file=sys.stderr)
 
     records = extract(args.lmdb, sid_to_meta, args.out)

@@ -116,8 +116,9 @@ tested, so the documented build and the tested build now agree.
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
 | `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub), driven by a required `--config` file (see `configs/pd111.conf`) |
 | `src/bin/coverage_report.rs` | Replays `trajectory.bin` against `reactions.lut` into a per-species coverage-over-time CSV (see "Visualizing a run") |
-| `scripts/extract_energies.py` | Pulls adsorption-energy records from OC20 IS2RE LMDB shards |
-| `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API, plus real transition-state barriers where they exist |
+| `scripts/kinetica_config.py`  | Hand-rolled parser for the same sectioned config file `oc20_ingest --config` reads (Python counterpart to `src/config.rs`); drives both extraction scripts' species/reaction patterns |
+| `scripts/extract_energies.py` | Pulls adsorption-energy records from OC20 IS2RE LMDB shards, driven by a required `--config` file |
+| `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API, plus real transition-state barriers where they exist, driven by a required `--config` file |
 | `scripts/oc20e_format.py`     | Shared binary format both extraction scripts write |
 | `scripts/plot_coverage.py`    | Turns `coverage_report`'s CSV into the coverage-vs-time PNG at the top of this README |
 | `scripts/plot_lattice.py`     | Reads `surface.lattice` directly (no Rust tool needed) and renders a spatial hex-tiling snapshot of the final surface state (see "Visualizing a run") |
@@ -758,6 +759,31 @@ still exist and now *override* the config file's `[system]`/`[bep]`
 values for a one-off run, rather than being the only way to set them —
 see `oc20_ingest --help`.
 
+**Both Python extraction scripts read the same config file, too.**
+`scripts/kinetica_config.py` is a hand-rolled parser mirroring
+`src/config.rs`'s format exactly (same sections, same field order, same
+error style) — zero new Python dependencies, same reasoning as the Rust
+side's no-`serde` convention. `scripts/extract_energies.py` and
+`scripts/extract_catalysis_hub.py` both take a required `--config <PATH>`
+and generate their species/reaction pattern lists (which OC20
+adsorbate-index ids to recognize, which single-site adsorption reactions
+to fetch, which two-site recombination/dissociative-adsorption reactions
+to look for) from `[species]`/`[bimolecular]` at runtime, instead of each
+hardcoding its own parallel copy — the last piece of the "keep these five
+files in sync by hand-comment convention" problem this arc set out to
+close. `--metal`/`--facet` on the extraction scripts stay independent CLI
+flags (a GraphQL server-side query filter), not defaulted from
+`--config`'s `[system]` section, so a broad, unrestricted extraction pass
+and a config-driven `oc20_ingest` build can still be composed freely --
+`oc20_ingest` applies its own metal/facet restriction downstream
+regardless of how broadly the extraction step pulled.
+
+`scripts/test_kinetica_config.py` (stdlib `unittest`, no new dependency)
+mirrors `src/config.rs`'s own test module case-for-case — same example
+config text, same malformed-input error cases — so the two parsers are
+checked against one shared contract: `cd scripts && python3 -m unittest
+test_kinetica_config -v`.
+
 ### OC20
 
 OC20's IS2RE task publishes only relaxed adsorption energies (initial
@@ -820,6 +846,7 @@ pip install --user lmdb numpy
    python3 scripts/extract_energies.py \
        --lmdb data/oc20/is2res_train_val_test_lmdbs/data/is2re/100k/train/data.lmdb \
        --mapping data/oc20/oc20_data_mapping.pkl \
+       --config configs/pd111.conf \
        --out data/oc20/energies_all.bin
    ```
 
@@ -855,7 +882,9 @@ queryable live over a public GraphQL API — no multi-GB download needed.
 Unlike OC20 it has real `*CO` adsorption data:
 
 ```sh
-python3 scripts/extract_catalysis_hub.py --out data/oc20/energies_catalysis_hub.bin
+python3 scripts/extract_catalysis_hub.py \
+    --out data/oc20/energies_catalysis_hub.bin \
+    --config configs/pd111.conf
 cargo run --release --bin oc20_ingest -- \
     --input data/oc20/energies_catalysis_hub.bin \
     --config configs/pd111.conf \
@@ -864,15 +893,17 @@ cargo run --release --bin oc20_ingest -- \
 
 **Restricting to one real surface (`--metal`/`--facet`).** The extraction
 script accepts its own `--metal`/`--facet` flags — pushed down to the
-GraphQL API as server-side `surfaceComposition`/`facet` filter args — and
-`oc20_ingest` reads the same restriction from `--config`'s `[system]`
-section (with a per-species fallback to metal-only if `--facet` leaves too
-few samples to bucket). This is what this repo's own `reactions.lut` is
-built from — see "Lattice geometry and target surface: Pd(111)" above:
+GraphQL API as server-side `surfaceComposition`/`facet` filter args,
+independent of `--config` — and `oc20_ingest` reads its own restriction
+from `--config`'s `[system]` section (with a per-species fallback to
+metal-only if `--facet` leaves too few samples to bucket). This is what
+this repo's own `reactions.lut` is built from — see "Lattice geometry and
+target surface: Pd(111)" above:
 
 ```sh
 python3 scripts/extract_catalysis_hub.py \
     --out data/oc20/energies_pd111.bin \
+    --config configs/pd111.conf \
     --metal Pd --facet 111
 cargo run --release --bin oc20_ingest -- \
     --input data/oc20/energies_pd111.bin \
@@ -1039,17 +1070,19 @@ from 10.8% to 29.2%, zero invalid occupancy states.
 **`oc20_ingest` can build real standalone bimolecular reactions from
 Catalysis-Hub data, in either of two directions.**
 `scripts/extract_catalysis_hub.py`'s real-barrier sweep picks out genuine
-two-site barriers in either shape — `RECOMBINATION_PATTERNS` (both sites
-occupied -> gas + 2 vacant) or `DISSOCIATIVE_PATTERNS` (both sites vacant
--> gas dissociates onto them, e.g. water splitting) — and writes them,
-tagged with which direction, to a second, parallel binary file (`OC20BI03`
-format — see `scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that
-file to `oc20_ingest --bimolecular-input`:
+two-site barriers in either shape — a "recombination" `--config`
+`[bimolecular]` entry (both sites occupied -> gas + 2 vacant) or a
+"dissociative" one (both sites vacant -> gas dissociates onto them, e.g.
+water splitting) — and writes them, tagged with which direction, to a
+second, parallel binary file (`OC20BI03` format — see
+`scripts/oc20e_format.py`) via `--bimolecular-out`. Pass that file to
+`oc20_ingest --bimolecular-input`:
 
 ```sh
 python3 scripts/extract_catalysis_hub.py \
     --out data/oc20/energies_catalysis_hub.bin \
-    --bimolecular-out data/oc20/energies_catalysis_hub_bimolecular.bin
+    --bimolecular-out data/oc20/energies_catalysis_hub_bimolecular.bin \
+    --config configs/pd111.conf
 cargo run --release --bin oc20_ingest -- \
     --input data/oc20/energies_catalysis_hub.bin \
     --bimolecular-input data/oc20/energies_catalysis_hub_bimolecular.bin \
