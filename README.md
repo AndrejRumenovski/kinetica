@@ -104,7 +104,8 @@ tested, so the documented build and the tested build now agree.
 
 | Path                    | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
-| `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind` |
+| `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind`, self-described `SpeciesTable` in the LUT header |
+| `src/config.rs`          | Hand-rolled parser for a sectioned text config file (metal/facet/BEP/species/bimolecular) driving a config-based ingestion pipeline; not yet wired into any binary's CLI |
 | `src/topology.rs`        | Neighbor topology (hexagonal, fcc(111) -- six neighbors per site) shared by the occupancy-gated engine and the bimolecular partner search |
 | `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
 | `src/occupancy.rs`       | Live per-patch occupancy counters + O(1) free-list site selection (bimolecular pair search still bounded-rejection) -- the `OccupancyGated`/real-data engine |
@@ -211,15 +212,18 @@ distinguishable rather than rendering as an indistinguishable blob.
 
 ## Fuzzing
 
-Three parsers in this codebase read untrusted on-disk bytes -- files this
-process didn't itself just write in the same run, so nothing guarantees
-they're well-formed:
+Four parsers in this codebase read untrusted input -- bytes this process
+didn't itself just write in the same run, so nothing guarantees they're
+well-formed:
 
 - `layout::ReactionLut::open` maps a `reactions.lut` file and
   reinterprets its bytes as `[ReactionLutBlock]` via an `unsafe` pointer
   cast — sound only because of the length/alignment checks that run
   *before* the cast (see the function's own safety comment), not because
-  the file is assumed well-formed.
+  the file is assumed well-formed. This now also decodes a self-described
+  species-identity table (`layout::SpeciesTable`) from the header's
+  reserved bytes — its own decoder is equally defensive, never panicking
+  on a malformed count/length/UTF-8 name.
 - `oc20e_format::read_energy_records` / `read_bimolecular_records` parse
   the `OC20E003`/`OC20BI03` files `--input`/`--bimolecular-input` load —
   written by a separate Python extraction script, so a killed extraction
@@ -228,9 +232,15 @@ they're well-formed:
   fixed) exactly this: a file whose `count` field claimed more records
   than actually followed panicked on an out-of-bounds slice index
   instead of returning `Err`.
+- `config::SimConfig::parse` — a new hand-rolled text-config parser
+  (`src/config.rs`) for a config-driven metal/facet/species pipeline, not
+  yet wired into any binary's CLI. Fuzzed from the moment it landed
+  rather than waiting for that wiring: a future `oc20_ingest --config
+  <path>` will read a file someone else authored, the same untrusted-
+  input class as the other three.
 
 `fuzz/fuzz_targets/{reactions_lut_parse,oc20_energy_records_parse,
-oc20_bimolecular_records_parse}.rs` (via
+oc20_bimolecular_records_parse,config_parse}.rs` (via
 [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)/libFuzzer) throw
 arbitrary bytes at each and check the one property that has to hold for
 *any* input: the function either returns `Err`, or a value that can be
@@ -244,11 +254,12 @@ rustup toolchain install nightly   # cargo-fuzz/libFuzzer requires nightly
 cargo +nightly fuzz run reactions_lut_parse -- -max_total_time=300
 cargo +nightly fuzz run oc20_energy_records_parse -- -max_total_time=300
 cargo +nightly fuzz run oc20_bimolecular_records_parse -- -max_total_time=300
+cargo +nightly fuzz run config_parse -- -max_total_time=300
 ```
 
-Local 30-60-second runs (900K-1.5M executions each) found no crashes on
-any of the three before they were committed. CI runs a bounded smoke
-test of all three on every push — not a substitute for a real fuzzing
+Local 30-60-second runs (900K-3.6M executions each) found no crashes on
+any of the four before they were committed. CI runs a bounded smoke
+test of all four on every push — not a substitute for a real fuzzing
 campaign, but enough to catch a regression in any of these parsing paths
 before it reaches `main`.
 

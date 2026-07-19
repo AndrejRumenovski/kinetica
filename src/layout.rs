@@ -381,6 +381,165 @@ impl LutKind {
 /// block after the first.
 const LUT_HEADER_SIZE: usize = 64;
 
+/// How many of `LUT_HEADER_SIZE`'s bytes are available for `SpeciesTable`
+/// to encode into, after the 8-byte magic.
+const SPECIES_HEADER_CAPACITY: usize = LUT_HEADER_SIZE - 8;
+
+/// Runtime species identity self-described inside a `reactions.lut`'s own
+/// header -- the LUT's own record of "what does bit 0x01 mean" so any
+/// binary that opens it (not just the tool that built it) can label
+/// pressures, CSV columns, and log output without needing the config file
+/// that built the LUT in the first place. See `ReactionLut::species`.
+///
+/// Deliberately holds only a one-hot bit and a display name per species --
+/// everything else a config file might carry for a species (gas source,
+/// stoichiometry, adsorption role...) is `oc20_ingest`-internal build
+/// information with no reason to survive into the built artifact.
+///
+/// The empty table (`SpeciesTable::default()`) is what every LUT built
+/// before this type existed decodes to (a zeroed header reads as `count =
+/// 0`), and what a `Static` demo LUT carries deliberately, since it has no
+/// real species identity to self-describe.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpeciesTable {
+    entries: Vec<(u8, String)>,
+}
+
+impl SpeciesTable {
+    /// Build a table from `(one-hot bit, display name)` pairs, in the
+    /// order they correspond to reaction-record species indices. Errors
+    /// on anything `ReactionLut::open` would later refuse to decode from
+    /// a file, so a caller finds out at build time rather than being
+    /// handed a `reactions.lut` that fails to reopen: more than
+    /// `MAX_SPECIES` entries, a non-one-hot bit, a duplicate bit, or a
+    /// total encoding that wouldn't fit the header's reserved space.
+    pub fn new(entries: Vec<(u8, String)>) -> Result<Self, String> {
+        if entries.len() > MAX_SPECIES {
+            return Err(format!(
+                "{} species exceeds the architectural ceiling of {MAX_SPECIES} \
+                 (see layout::SPECIES_BITS's doc comment for why)",
+                entries.len()
+            ));
+        }
+        let mut encoded_size = 1usize; // the leading species-count byte
+        for (i, (bit, name)) in entries.iter().enumerate() {
+            if bit.count_ones() != 1 {
+                return Err(format!("species `{name}`'s bit {bit:#04x} is not one-hot"));
+            }
+            if entries[..i].iter().any(|(b, _)| b == bit) {
+                return Err(format!("species bit {bit:#04x} is named more than once"));
+            }
+            encoded_size += 2 + name.len();
+        }
+        if encoded_size > SPECIES_HEADER_CAPACITY {
+            return Err(format!(
+                "species table needs {encoded_size} bytes to encode, only \
+                 {SPECIES_HEADER_CAPACITY} are available in the LUT header"
+            ));
+        }
+        Ok(SpeciesTable { entries })
+    }
+
+    /// How many species this table names.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether this table names zero species.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// This table's species index for `bit`, if any -- the runtime
+    /// counterpart to `occupancy`'s compile-time `species_index` against
+    /// the fixed `SPECIES_BITS` list.
+    pub fn index_of(&self, bit: u8) -> Option<usize> {
+        self.entries.iter().position(|&(b, _)| b == bit)
+    }
+
+    /// The display name for the species at `index`, if this table names
+    /// one there.
+    pub fn name(&self, index: usize) -> Option<&str> {
+        self.entries.get(index).map(|(_, name)| name.as_str())
+    }
+
+    /// The one-hot bit for the species at `index`, if this table names
+    /// one there.
+    pub fn bit(&self, index: usize) -> Option<u8> {
+        self.entries.get(index).map(|(bit, _)| *bit)
+    }
+
+    /// Serialize into `header` (must be exactly `SPECIES_HEADER_CAPACITY`
+    /// bytes -- the LUT header's reserved region past the 8-byte magic):
+    /// a leading count byte, then each entry as `[bit, name_len,
+    /// name_bytes...]`. Infallible: `new`'s validation already guarantees
+    /// this table's encoding fits, and both other constructors
+    /// (`Default`, `decode_from`) only ever produce already-valid tables.
+    fn encode_into(&self, header: &mut [u8]) {
+        debug_assert_eq!(header.len(), SPECIES_HEADER_CAPACITY);
+        header[0] = self.entries.len() as u8;
+        let mut offset = 1usize;
+        for (bit, name) in &self.entries {
+            let name_bytes = name.as_bytes();
+            header[offset] = *bit;
+            header[offset + 1] = name_bytes.len() as u8;
+            header[offset + 2..offset + 2 + name_bytes.len()].copy_from_slice(name_bytes);
+            offset += 2 + name_bytes.len();
+        }
+    }
+
+    /// Decode a table from `header` (must be exactly
+    /// `SPECIES_HEADER_CAPACITY` bytes). Never panics on malformed input
+    /// -- these are bytes read from a file that might be corrupted or
+    /// adversarial (see `fuzz/fuzz_targets/reactions_lut_parse.rs`), so
+    /// any inconsistency (a count exceeding `MAX_SPECIES`, a length prefix
+    /// running past the header's end, a non-one-hot bit, a duplicate bit,
+    /// or non-UTF-8 name bytes) is a decode error, not a panic.
+    fn decode_from(header: &[u8]) -> io::Result<Self> {
+        debug_assert_eq!(header.len(), SPECIES_HEADER_CAPACITY);
+        let bad_data = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_string());
+
+        let count = header[0] as usize;
+        if count > MAX_SPECIES {
+            return Err(bad_data(&format!(
+                "reactions.lut header claims {count} species, exceeding the {MAX_SPECIES} ceiling"
+            )));
+        }
+
+        let mut entries: Vec<(u8, String)> = Vec::with_capacity(count);
+        let mut offset = 1usize;
+        for _ in 0..count {
+            if offset + 2 > header.len() {
+                return Err(bad_data("reactions.lut species header is truncated"));
+            }
+            let bit = header[offset];
+            let name_len = header[offset + 1] as usize;
+            offset += 2;
+
+            if bit.count_ones() != 1 {
+                return Err(bad_data(&format!(
+                    "reactions.lut species bit {bit:#04x} is not one-hot"
+                )));
+            }
+            if entries.iter().any(|&(b, _)| b == bit) {
+                return Err(bad_data(&format!(
+                    "reactions.lut names species bit {bit:#04x} more than once"
+                )));
+            }
+            if offset + name_len > header.len() {
+                return Err(bad_data("reactions.lut species name overruns the header"));
+            }
+            let name = std::str::from_utf8(&header[offset..offset + name_len])
+                .map_err(|_| bad_data("reactions.lut species name is not valid UTF-8"))?
+                .to_string();
+            offset += name_len;
+
+            entries.push((bit, name));
+        }
+        Ok(SpeciesTable { entries })
+    }
+}
+
 /// Read-only, memory-mapped view over a prebuilt `reactions.lut` file: an
 /// `LUT_HEADER_SIZE`-byte magic header followed by a flat run of
 /// `ReactionLutBlock`s, so mapping it (past the header) is just a pointer
@@ -392,6 +551,7 @@ pub struct ReactionLut {
     blocks: *const ReactionLutBlock,
     len: usize,
     kind: LutKind,
+    species: SpeciesTable,
 }
 
 // SAFETY: `ReactionLut` is a read-only view over mapped file bytes with no
@@ -422,6 +582,7 @@ impl ReactionLut {
             ));
         }
         let kind = LutKind::from_magic(&mmap[0..8])?;
+        let species = SpeciesTable::decode_from(&mmap[8..LUT_HEADER_SIZE])?;
 
         let body_len = mmap.len() - LUT_HEADER_SIZE;
         let block_size = std::mem::size_of::<ReactionLutBlock>();
@@ -455,6 +616,7 @@ impl ReactionLut {
             blocks,
             len,
             kind,
+            species,
         })
     }
 
@@ -475,6 +637,14 @@ impl ReactionLut {
     #[inline(always)]
     pub fn kind(&self) -> LutKind {
         self.kind
+    }
+
+    /// This LUT's self-described species identity (see `SpeciesTable`) --
+    /// empty for a `Static` demo LUT or any LUT built before this table
+    /// existed.
+    #[inline(always)]
+    pub fn species(&self) -> &SpeciesTable {
+        &self.species
     }
 
     /// The full LUT as a typed slice of cache-line blocks.
@@ -571,14 +741,30 @@ pub fn pack_records_into_blocks(mut records: Vec<ReactionRecord>) -> Vec<Reactio
 }
 
 /// Write `kind`'s magic header followed by `blocks` verbatim to `path`, as
-/// the raw bytes `ReactionLut::open` expects to map back in.
+/// the raw bytes `ReactionLut::open` expects to map back in. The header's
+/// species-identity region is left empty (`SpeciesTable::default()`) --
+/// see `write_lut_with_species` for a build that stamps one in.
 pub fn write_lut(
     path: impl AsRef<Path>,
     kind: LutKind,
     blocks: &[ReactionLutBlock],
 ) -> io::Result<()> {
+    write_lut_with_species(path, kind, blocks, &SpeciesTable::default())
+}
+
+/// Like `write_lut`, but also stamps `species`'s runtime identity table
+/// into the header's reserved bytes, so a later `ReactionLut::open` can
+/// recover species names/bits (see `ReactionLut::species`) without
+/// needing the config file that built this LUT.
+pub fn write_lut_with_species(
+    path: impl AsRef<Path>,
+    kind: LutKind,
+    blocks: &[ReactionLutBlock],
+    species: &SpeciesTable,
+) -> io::Result<()> {
     let mut header = [0u8; LUT_HEADER_SIZE];
     header[0..8].copy_from_slice(kind.magic());
+    species.encode_into(&mut header[8..LUT_HEADER_SIZE]);
 
     // SAFETY: `ReactionLutBlock` is `repr(C, align(64))`, `Copy`, and every
     // field is a plain fixed-width integer array with no padding bytes
@@ -683,6 +869,146 @@ mod tests {
         assert_eq!(lut.kind(), LutKind::OccupancyGated);
         assert_eq!(lut.rate_of(0), records[0]);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn species_table_round_trips_through_write_lut_with_species() {
+        let species = SpeciesTable::new(vec![
+            (ADS_O, "O".to_string()),
+            (ADS_H, "H".to_string()),
+            (ADS_CO, "CO".to_string()),
+        ])
+        .unwrap();
+        let path = temp_path("lut_species_roundtrip");
+        write_lut_with_species(&path, LutKind::OccupancyGated, &[], &species).unwrap();
+
+        let lut = ReactionLut::open(&path).unwrap();
+        let decoded = lut.species();
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.bit(0), Some(ADS_O));
+        assert_eq!(decoded.name(0), Some("O"));
+        assert_eq!(decoded.bit(1), Some(ADS_H));
+        assert_eq!(decoded.name(1), Some("H"));
+        assert_eq!(decoded.bit(2), Some(ADS_CO));
+        assert_eq!(decoded.name(2), Some("CO"));
+        assert_eq!(decoded.index_of(ADS_CO), Some(2));
+        assert_eq!(decoded.index_of(ADS_OH), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_lut_leaves_species_table_empty() {
+        let path = temp_path("lut_species_default_empty");
+        write_lut(&path, LutKind::Static, &[]).unwrap();
+
+        let lut = ReactionLut::open(&path).unwrap();
+        assert!(lut.species().is_empty());
+        assert_eq!(lut.species(), &SpeciesTable::default());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn species_table_new_rejects_more_than_max_species_entries() {
+        let entries: Vec<(u8, String)> = (0..(MAX_SPECIES + 1) as u32)
+            .map(|i| (1u8 << (i % 8), format!("S{i}")))
+            .collect();
+        assert!(SpeciesTable::new(entries).is_err());
+    }
+
+    #[test]
+    fn species_table_new_rejects_non_one_hot_bit() {
+        assert!(SpeciesTable::new(vec![(0x03, "bad".to_string())]).is_err());
+        assert!(SpeciesTable::new(vec![(0x00, "vacant".to_string())]).is_err());
+    }
+
+    #[test]
+    fn species_table_new_rejects_duplicate_bit() {
+        assert!(SpeciesTable::new(vec![
+            (ADS_O, "O".to_string()),
+            (ADS_O, "O-again".to_string()),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn species_table_new_rejects_encoding_that_overflows_the_header_budget() {
+        // 8 species x a name long enough that the total can't fit in the
+        // header's 56 reserved bytes (1 count byte + 8 x (2 + name_len)).
+        let entries: Vec<(u8, String)> = (0..8)
+            .map(|i| (1u8 << i, "a_very_long_species_name".to_string()))
+            .collect();
+        assert!(SpeciesTable::new(entries).is_err());
+    }
+
+    #[test]
+    fn open_rejects_species_header_claiming_more_than_max_species() {
+        let path = temp_path("lut_species_header_too_many");
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(LutKind::Static.magic());
+        bytes[8] = (MAX_SPECIES + 1) as u8; // claims more species than the ceiling allows
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_species_header_with_non_one_hot_bit() {
+        let path = temp_path("lut_species_header_bad_bit");
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(LutKind::Static.magic());
+        bytes[8] = 1; // count = 1
+        bytes[9] = 0x03; // not one-hot
+        bytes[10] = 1; // name_len = 1
+        bytes[11] = b'X';
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_species_header_with_duplicate_bit() {
+        let path = temp_path("lut_species_header_dup_bit");
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(LutKind::Static.magic());
+        bytes[8] = 2; // count = 2
+        bytes[9] = ADS_O; // first entry: bit=ADS_O, name_len=1, "A"
+        bytes[10] = 1;
+        bytes[11] = b'A';
+        bytes[12] = ADS_O; // second entry: same bit again
+        bytes[13] = 1;
+        bytes[14] = b'B';
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_species_header_with_name_overrunning_the_header() {
+        let path = temp_path("lut_species_header_name_overrun");
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(LutKind::Static.magic());
+        bytes[8] = 1; // count = 1
+        bytes[9] = ADS_O;
+        bytes[10] = 255; // name_len claims far more bytes than the header has left
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_species_header_with_invalid_utf8_name() {
+        let path = temp_path("lut_species_header_bad_utf8");
+        let mut bytes = vec![0u8; LUT_HEADER_SIZE];
+        bytes[0..8].copy_from_slice(LutKind::Static.magic());
+        bytes[8] = 1; // count = 1
+        bytes[9] = ADS_O;
+        bytes[10] = 1; // name_len = 1
+        bytes[11] = 0xFF; // not valid UTF-8 on its own
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(ReactionLut::open(&path).is_err());
         let _ = std::fs::remove_file(&path);
     }
 

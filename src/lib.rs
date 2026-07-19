@@ -10,6 +10,7 @@
 // is enforced for free rather than needing its own check.
 #![warn(missing_docs)]
 
+pub mod config;
 pub mod engine;
 pub mod gillespie;
 pub mod layout;

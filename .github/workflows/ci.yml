@@ -63,3 +63,6 @@ jobs:
 
       - name: Fuzz oc20_bimolecular_records_parse for 30s
         run: cargo fuzz run oc20_bimolecular_records_parse -- -max_total_time=30
+
+      - name: Fuzz config_parse for 30s
+        run: cargo fuzz run config_parse -- -max_total_time=30

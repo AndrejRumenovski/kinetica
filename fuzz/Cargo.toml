@@ -33,3 +33,10 @@ path = "fuzz_targets/oc20_bimolecular_records_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
