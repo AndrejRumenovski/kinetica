@@ -1,19 +1,22 @@
-//! Hand-rolled parser for the sectioned text config file that will drive
-//! which metal/facet/species set `oc20_ingest` builds a `reactions.lut`
-//! from, and that the matching Python extraction scripts pull real data
-//! for -- a single shared source of truth, replacing the hand-comment
-//! convention ("species index N means adsorbate X, keep these five files
-//! in sync") this project relied on before.
+//! Hand-rolled parser for the sectioned text config file that drives
+//! which metal/facet/species set `oc20_ingest --config <PATH>` builds a
+//! `reactions.lut` from -- a single shared source of truth, replacing
+//! the hand-comment convention ("species index N means adsorbate X, keep
+//! these five files in sync") this project relied on before. The
+//! matching Python extraction scripts don't read this file yet (they
+//! still carry their own hardcoded species patterns) -- that's the next
+//! item of work, not yet done.
 //!
 //! Zero new dependencies (no `serde`/`toml`): consistent with this
 //! crate's deliberately minimal, exact-pinned dependency list and the
 //! hand-rolled CLI parsing already used elsewhere (see
 //! `bin/oc20_ingest.rs`'s own `Config::parse`).
 //!
-//! Not yet consumed by any binary -- this module exists on its own first
-//! so the parser and its LUT-header counterpart (`layout::SpeciesTable`)
-//! can be tested and fuzzed in isolation before `oc20_ingest` grows a
-//! `--config` flag that depends on them.
+//! `SimConfig::parse` and its LUT-header counterpart
+//! (`layout::SpeciesTable`) were built and fuzzed in isolation one phase
+//! before `oc20_ingest` grew the `--config` flag that depends on them --
+//! see `configs/pd111.conf` for the config this repo's own
+//! `reactions.lut` is built from.
 //!
 //! # File format
 //!

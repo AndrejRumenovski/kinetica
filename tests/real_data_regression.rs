@@ -58,6 +58,10 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn pd111_config() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/pd111.conf")
+}
+
 /// Real per-species byte histogram from a fixed, deterministic run (16x16
 /// lattice, 4 patches, 2000 steps/patch) against the real Pd(111) LUT this
 /// test builds below. `engine.rs`'s per-patch seed
@@ -92,18 +96,19 @@ fn real_pd111_pipeline_builds_expected_reactions_and_never_corrupts_the_lattice(
     let trajectory_path = temp_path("trajectory_bin");
 
     // --- Stage 1: build reactions.lut from real, frozen Pd(111) data via
-    // the real oc20_ingest binary. ---
+    // the real oc20_ingest binary, driven by the committed configs/
+    // pd111.conf (metal=Pd, facet=111, and the 5-species set come from
+    // the config file now, not CLI flags -- see "Config-driven ingestion"
+    // below). ---
     let ingest_status = Command::new(env!("CARGO_BIN_EXE_oc20_ingest"))
         .arg("--input")
         .arg(fixture("pd111_energies.bin"))
         .arg("--bimolecular-input")
         .arg(fixture("pd111_bimolecular.bin"))
+        .arg("--config")
+        .arg(pd111_config())
         .arg("--out")
         .arg(&lut_path)
-        .arg("--metal")
-        .arg("Pd")
-        .arg("--facet")
-        .arg("111")
         .status()
         .expect("failed to run oc20_ingest binary");
     assert!(ingest_status.success(), "oc20_ingest exited non-zero");
@@ -116,6 +121,22 @@ fn real_pd111_pipeline_builds_expected_reactions_and_never_corrupts_the_lattice(
         LutKind::OccupancyGated,
         "real Pd(111) data should always build an occupancy-gated LUT"
     );
+    // The LUT's header now self-describes its species identity (see
+    // layout::SpeciesTable) -- confirms configs/pd111.conf's species
+    // declarations actually made it into the built artifact, not just
+    // into oc20_ingest's in-memory Config.
+    let species = lut.species();
+    assert_eq!(species.len(), 5);
+    assert_eq!(species.index_of(ADS_O), Some(0));
+    assert_eq!(species.name(0), Some("O"));
+    assert_eq!(species.index_of(ADS_H), Some(1));
+    assert_eq!(species.name(1), Some("H"));
+    assert_eq!(species.index_of(ADS_CO), Some(2));
+    assert_eq!(species.name(2), Some("CO"));
+    assert_eq!(species.index_of(ADS_OH), Some(3));
+    assert_eq!(species.name(3), Some("OH"));
+    assert_eq!(species.index_of(ADS_H2O), Some(4));
+    assert_eq!(species.name(4), Some("H2O"));
     // `ReactionLut::len()` is a block count, not a record count (see
     // `main.rs`/`gillespie.rs`'s own `lut.len() * ReactionLutBlock::LANES`
     // usage) -- 2 cache-line blocks * 32 lanes/block = 64 total slots;

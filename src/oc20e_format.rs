@@ -18,7 +18,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::path::Path;
 
-use crate::layout::SPECIES_BITS;
+use crate::layout::MAX_SPECIES;
 
 /// `OC20E003`'s 8-byte magic header, checked at the start of every file
 /// [`read_energy_records`] parses.
@@ -146,8 +146,8 @@ pub fn read_energy_records(path: &Path) -> io::Result<Vec<EnergyRecord>> {
         let facet = u16::from_le_bytes(bytes[offset + 15..offset + 17].try_into().unwrap());
         offset += RECORD_SIZE;
 
-        if (species as usize) >= SPECIES_BITS.len() {
-            continue; // defensive: ignore any species index this build doesn't know
+        if (species as usize) >= MAX_SPECIES {
+            continue; // defensive: ignore any species index beyond the architectural ceiling
         }
         records.push(EnergyRecord {
             species,
@@ -202,9 +202,8 @@ pub fn read_bimolecular_records(path: &Path) -> io::Result<Vec<BiEnergyRecord>> 
         let is_dissociative = bytes[offset + 17] != 0;
         offset += RECORD_SIZE_BI;
 
-        if (species_a as usize) >= SPECIES_BITS.len() || (species_b as usize) >= SPECIES_BITS.len()
-        {
-            continue; // defensive: ignore any species index this build doesn't know
+        if (species_a as usize) >= MAX_SPECIES || (species_b as usize) >= MAX_SPECIES {
+            continue; // defensive: ignore any species index beyond the architectural ceiling
         }
         records.push(BiEnergyRecord {
             species_a,

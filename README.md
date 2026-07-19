@@ -105,7 +105,8 @@ tested, so the documented build and the tested build now agree.
 | Path                    | Purpose                                                                 |
 |--------------------------|-------------------------------------------------------------------------|
 | `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind`, self-described `SpeciesTable` in the LUT header |
-| `src/config.rs`          | Hand-rolled parser for a sectioned text config file (metal/facet/BEP/species/bimolecular) driving a config-based ingestion pipeline; not yet wired into any binary's CLI |
+| `src/config.rs`          | Hand-rolled parser for a sectioned text config file (metal/facet/BEP/species/bimolecular) driving `oc20_ingest --config` |
+| `configs/pd111.conf`     | The config this repo's own `reactions.lut` is built from -- Pd(111), 5 real species (O, H, CO, OH, H2O) |
 | `src/topology.rs`        | Neighbor topology (hexagonal, fcc(111) -- six neighbors per site) shared by the occupancy-gated engine and the bimolecular partner search |
 | `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
 | `src/occupancy.rs`       | Live per-patch occupancy counters + O(1) free-list site selection (bimolecular pair search still bounded-rejection) -- the `OccupancyGated`/real-data engine |
@@ -113,7 +114,7 @@ tested, so the documented build and the tested build now agree.
 | `src/oc20e_format.rs`    | Reader for the `OC20E003`/`OC20BI03` binary formats `--input`/`--bimolecular-input` load; lives in the library (not in `oc20_ingest.rs`) so the untrusted-input fuzz targets exercise the real parsing code, not a duplicate |
 | `src/lib.rs`             | Library surface shared by `kinetica` and auxiliary tools              |
 | `src/main.rs`            | `kinetica` CLI entrypoint                                              |
-| `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub) |
+| `src/bin/oc20_ingest.rs` | Builds `reactions.lut` from real adsorption-energy data (OC20 or Catalysis-Hub), driven by a required `--config` file (see `configs/pd111.conf`) |
 | `src/bin/coverage_report.rs` | Replays `trajectory.bin` against `reactions.lut` into a per-species coverage-over-time CSV (see "Visualizing a run") |
 | `scripts/extract_energies.py` | Pulls adsorption-energy records from OC20 IS2RE LMDB shards |
 | `scripts/extract_catalysis_hub.py` | Pulls the same record format from the Catalysis-Hub.org GraphQL API, plus real transition-state barriers where they exist |
@@ -232,12 +233,12 @@ well-formed:
   fixed) exactly this: a file whose `count` field claimed more records
   than actually followed panicked on an out-of-bounds slice index
   instead of returning `Err`.
-- `config::SimConfig::parse` — a new hand-rolled text-config parser
-  (`src/config.rs`) for a config-driven metal/facet/species pipeline, not
-  yet wired into any binary's CLI. Fuzzed from the moment it landed
-  rather than waiting for that wiring: a future `oc20_ingest --config
-  <path>` will read a file someone else authored, the same untrusted-
-  input class as the other three.
+- `config::SimConfig::parse` — a hand-rolled text-config parser
+  (`src/config.rs`) reading the file `oc20_ingest --config <PATH>` (now a
+  required flag, see "Config-driven ingestion") requires. Fuzzed from the
+  moment it landed, before `--config` existed as a flag at all: it reads
+  a file someone else authored, the same untrusted-input class as the
+  other three.
 
 `fuzz/fuzz_targets/{reactions_lut_parse,oc20_energy_records_parse,
 oc20_bimolecular_records_parse,config_parse}.rs` (via
@@ -734,6 +735,23 @@ see the CO-gap note below for why you likely want both. A third candidate,
 OC22, was investigated and found not to apply to this project — see "OC22:
 investigated, not integrated" below.
 
+### Config-driven ingestion
+
+`oc20_ingest` requires a `--config <PATH>` pointing at a sectioned text
+file (see `src/config.rs`'s own doc comment for the full format) declaring
+the metal, facet, BEP defaults, and species set to build from —
+[`configs/pd111.conf`](configs/pd111.conf) is the config this repo's own
+`reactions.lut` is built from (Pd(111), the 5 real species this README
+documents throughout: O, H, CO, OH, H2O). This replaced what used to be
+`oc20_ingest`'s own compile-time `SPECIES_NAMES`/`SPECIES_BITS`/
+`DISSOCIATIVE_SPECIES` constants — targeting a different metal, facet, or
+species set is now a config-file edit, not a source change.
+
+`--metal`/`--facet`/`--alpha`/`--beta`/`--nu`/`--temperature` CLI flags
+still exist and now *override* the config file's `[system]`/`[bep]`
+values for a one-off run, rather than being the only way to set them —
+see `oc20_ingest --help`.
+
 ### OC20
 
 OC20's IS2RE task publishes only relaxed adsorption energies (initial
@@ -804,6 +822,7 @@ pip install --user lmdb numpy
    ```sh
    cargo run --release --bin oc20_ingest -- \
        --input data/oc20/energies_all.bin \
+       --config configs/pd111.conf \
        --out reactions.lut
    ```
 
@@ -833,16 +852,17 @@ Unlike OC20 it has real `*CO` adsorption data:
 python3 scripts/extract_catalysis_hub.py --out data/oc20/energies_catalysis_hub.bin
 cargo run --release --bin oc20_ingest -- \
     --input data/oc20/energies_catalysis_hub.bin \
+    --config configs/pd111.conf \
     --out reactions.lut
 ```
 
-**Restricting to one real surface (`--metal`/`--facet`).** Both the
-extraction script and `oc20_ingest` accept `--metal`/`--facet` filters —
-pushed down to the GraphQL API as server-side `surfaceComposition`/`facet`
-filter args on the extraction side, applied post-hoc (with a per-species
-fallback to metal-only if `--facet` leaves too few samples to bucket) on
-the ingest side. This is what this repo's own `reactions.lut` is built
-from — see "Lattice geometry and target surface: Pd(111)" above:
+**Restricting to one real surface (`--metal`/`--facet`).** The extraction
+script accepts its own `--metal`/`--facet` flags — pushed down to the
+GraphQL API as server-side `surfaceComposition`/`facet` filter args — and
+`oc20_ingest` reads the same restriction from `--config`'s `[system]`
+section (with a per-species fallback to metal-only if `--facet` leaves too
+few samples to bucket). This is what this repo's own `reactions.lut` is
+built from — see "Lattice geometry and target surface: Pd(111)" above:
 
 ```sh
 python3 scripts/extract_catalysis_hub.py \
@@ -850,7 +870,7 @@ python3 scripts/extract_catalysis_hub.py \
     --metal Pd --facet 111
 cargo run --release --bin oc20_ingest -- \
     --input data/oc20/energies_pd111.bin \
-    --metal Pd --facet 111 \
+    --config configs/pd111.conf \
     --out reactions.lut
 ```
 
@@ -1027,6 +1047,7 @@ python3 scripts/extract_catalysis_hub.py \
 cargo run --release --bin oc20_ingest -- \
     --input data/oc20/energies_catalysis_hub.bin \
     --bimolecular-input data/oc20/energies_catalysis_hub_bimolecular.bin \
+    --config configs/pd111.conf \
     --out reactions.lut
 ```
 

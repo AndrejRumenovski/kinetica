@@ -70,33 +70,12 @@
 use std::io;
 use std::path::PathBuf;
 
-use kinetica::layout::{self, ReactionLutBlock, MAX_SPECIES, SPECIES_BITS};
+use kinetica::config::{SimConfig, SpeciesEntry, SpeciesRole};
+use kinetica::layout::{self, ReactionLutBlock, MAX_SPECIES};
 use kinetica::oc20e_format::{
     read_bimolecular_records, read_energy_records, BiEnergyRecord, EnergyRecord,
 };
 use kinetica::occupancy::BUCKETS_PER_SPECIES;
-
-/// `SPECIES_BITS`'s index order, named. Indices 0-2 (O, H, CO) match
-/// OC20's global adsorbate-index table (`mapping_adsorbates_2020may12.txt`:
-/// 0 = *O, 1 = *H, 5 = *CO) as remapped to a dense range by the extraction
-/// scripts. Index 3 (OH) has no OC20 equivalent -- it's sourced entirely
-/// from the water-splitting bimolecular reaction below, never from a
-/// monomolecular `--input` energy record (see `DISSOCIATIVE_SPECIES` and
-/// the bimolecular-records loop in `run`). Index 4 (H2O, molecularly
-/// adsorbed water, distinct from the H*/OH* dissociation products above)
-/// *is* sourced from a monomolecular `--input` record, same as O/H/CO --
-/// real Pd(111) `star + H2O(g) -> H2Ostar` samples exist in Catalysis-Hub
-/// (3 records as of this writing), BEP-estimated like the others since
-/// none carry a real activation energy.
-const SPECIES_NAMES: [&str; 5] = ["O", "H", "CO", "OH", "H2O"];
-
-/// Species indices whose adsorption is genuinely a two-site dissociative
-/// step (`2* + X2(g) -> 2 X*`) rather than a single-site one: O (from
-/// `O2gas` at 0.5 stoichiometry) and H (from `H2gas` at 0.5
-/// stoichiometry) -- see `extract_catalysis_hub.py`'s `SPECIES_PATTERNS`.
-/// CO adsorbs molecularly (`COgas` at 1.0 stoichiometry, one site), so it
-/// keeps the ordinary monomolecular adsorption/desorption pair unchanged.
-const DISSOCIATIVE_SPECIES: [usize; 2] = [0, 1]; // O, H
 
 /// Metal index table, in lockstep with `scripts/oc20e_format.py`'s own
 /// `METALS` list -- the numeric index is what's on disk in both
@@ -129,6 +108,13 @@ struct Config {
     /// see `run`'s `filter_with_fallback`.
     metal: Option<u8>,
     facet: Option<u16>,
+    /// The active species set (identity, gas role) for this run, in
+    /// `--config`'s `[species]` declaration order -- that order is each
+    /// species' index into `EnergyRecord`/`BiEnergyRecord`'s on-disk
+    /// `species`/`species_a`/`species_b` bytes, replacing what used to be
+    /// the compile-time `SPECIES_NAMES`/`SPECIES_BITS`/
+    /// `DISSOCIATIVE_SPECIES` constants.
+    species: Vec<SpeciesEntry>,
 }
 
 impl Config {
@@ -139,12 +125,13 @@ impl Config {
         let mut input = None;
         let mut bimolecular_input = None;
         let mut out = PathBuf::from("reactions.lut");
-        let mut alpha = 0.87; // typical BEP slope for atomic adsorption/dissociation steps
-        let mut beta_ev = 0.0; // typical BEP intercept, eV
-        let mut nu = 1.0e13; // typical harmonic TST attempt frequency, s^-1
-        let mut temperature_k = 298.15;
-        let mut metal = None;
-        let mut facet = None;
+        let mut config_path = None;
+        let mut alpha_override = None;
+        let mut beta_override = None;
+        let mut nu_override = None;
+        let mut temperature_override = None;
+        let mut metal_override = None;
+        let mut facet_override = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -154,35 +141,56 @@ impl Config {
                         Some(PathBuf::from(next_value(&mut args, "--bimolecular-input")?))
                 }
                 "--out" => out = PathBuf::from(next_value(&mut args, "--out")?),
-                "--alpha" => alpha = parse_value(&mut args, "--alpha")?,
-                "--beta" => beta_ev = parse_value(&mut args, "--beta")?,
-                "--nu" => nu = parse_value(&mut args, "--nu")?,
-                "--temperature" => temperature_k = parse_value(&mut args, "--temperature")?,
-                "--metal" => {
-                    let symbol = next_value(&mut args, "--metal")?;
-                    metal = Some(metal_index(&symbol).ok_or_else(|| {
-                        format!(
-                            "`--metal` value `{symbol}` isn't tracked; known metals: {}",
-                            METALS[1..].join(", ")
-                        )
-                    })?);
+                "--config" => config_path = Some(PathBuf::from(next_value(&mut args, "--config")?)),
+                "--alpha" => alpha_override = Some(parse_value(&mut args, "--alpha")?),
+                "--beta" => beta_override = Some(parse_value(&mut args, "--beta")?),
+                "--nu" => nu_override = Some(parse_value(&mut args, "--nu")?),
+                "--temperature" => {
+                    temperature_override = Some(parse_value(&mut args, "--temperature")?)
                 }
-                "--facet" => facet = Some(parse_value(&mut args, "--facet")?),
+                "--metal" => metal_override = Some(next_value(&mut args, "--metal")?),
+                "--facet" => facet_override = Some(parse_value(&mut args, "--facet")?),
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unrecognized argument `{other}`\n\n{}", usage())),
             }
         }
 
+        let config_path =
+            config_path.ok_or_else(|| format!("`--config` is required\n\n{}", usage()))?;
+        let config_text = std::fs::read_to_string(&config_path).map_err(|e| {
+            format!(
+                "failed to read --config file {}: {e}",
+                config_path.display()
+            )
+        })?;
+        let sim_config = SimConfig::parse(&config_text)
+            .map_err(|e| format!("error in --config file {}: {e}", config_path.display()))?;
+
+        let resolve_metal = |symbol: &str| -> Result<u8, String> {
+            metal_index(symbol).ok_or_else(|| {
+                format!(
+                    "metal `{symbol}` isn't tracked; known metals: {}",
+                    METALS[1..].join(", ")
+                )
+            })
+        };
+        let metal = match metal_override {
+            Some(symbol) => Some(resolve_metal(&symbol)?),
+            None => sim_config.metal.as_deref().map(resolve_metal).transpose()?,
+        };
+        let facet = facet_override.or(sim_config.facet);
+
         Ok(Self {
             input: input.ok_or_else(|| format!("`--input` is required\n\n{}", usage()))?,
             bimolecular_input,
             out,
-            alpha,
-            beta_ev,
-            nu,
-            temperature_k,
+            alpha: alpha_override.unwrap_or(sim_config.alpha),
+            beta_ev: beta_override.unwrap_or(sim_config.beta_ev),
+            nu: nu_override.unwrap_or(sim_config.nu),
+            temperature_k: temperature_override.unwrap_or(sim_config.temperature_k),
             metal,
             facet,
+            species: sim_config.species,
         })
     }
 }
@@ -204,23 +212,29 @@ fn parse_value<T: std::str::FromStr>(
 fn usage() -> String {
     "oc20_ingest: build reactions.lut from real adsorption-energy data\n\n\
      USAGE:\n    \
-       oc20_ingest --input <PATH> [OPTIONS]\n\n\
+       oc20_ingest --input <PATH> --config <PATH> [OPTIONS]\n\n\
      OPTIONS:\n    \
        --input <PATH>              Flat binary from an extract_*.py script (required)\n    \
+       --config <PATH>             Sectioned text config declaring the metal/facet/\n                                    \
+                                    BEP defaults/species set to build from (required;\n                                    \
+                                    see configs/pd111.conf for an example, and\n                                    \
+                                    kinetica::config's own doc comment for the format)\n    \
        --bimolecular-input <PATH>  Optional OC20BI01 binary (from\n                                    \
                                     extract_catalysis_hub.py's --bimolecular-out)\n                                    \
                                     carrying real two-site reaction barriers,\n                                    \
                                     e.g. CO oxidation\n    \
        --out <PATH>                Output reactions.lut [default: reactions.lut]\n    \
-       --alpha <F>                 BEP relation slope [default: 0.87]\n    \
-       --beta <F>                  BEP relation intercept, eV [default: 0.0]\n    \
-       --nu <F>                    Arrhenius prefactor, s^-1 [default: 1e13]\n    \
-       --temperature <F>           Temperature, K [default: 298.15]\n    \
-       --metal <SYMBOL>            Restrict to this metal (e.g. Pd); per-species\n                                    \
-                                    fallback to metal/any-facet if --facet leaves\n                                    \
-                                    too few samples to bucket [default: no filter]\n    \
-       --facet <N>                 Restrict to this Miller-index facet (e.g. 111)\n                                    \
-                                    [default: no filter]\n    \
+       --alpha <F>                 BEP relation slope [default: --config's [bep] alpha]\n    \
+       --beta <F>                  BEP relation intercept, eV [default: --config's [bep] beta]\n    \
+       --nu <F>                    Arrhenius prefactor, s^-1 [default: --config's [bep] nu]\n    \
+       --temperature <F>           Temperature, K [default: --config's [bep] temperature]\n    \
+       --metal <SYMBOL>            Restrict to this metal (e.g. Pd), overriding\n                                    \
+                                    --config's [system] metal; per-species fallback\n                                    \
+                                    to metal/any-facet if --facet leaves too few\n                                    \
+                                    samples to bucket [default: --config's [system] metal]\n    \
+       --facet <N>                 Restrict to this Miller-index facet (e.g. 111),\n                                    \
+                                    overriding --config's [system] facet\n                                    \
+                                    [default: --config's [system] facet]\n    \
        -h, --help                  Print this message"
         .to_string()
 }
@@ -294,7 +308,7 @@ fn rate_from_activation(activation_ev: f64, config: &Config) -> f64 {
 }
 
 /// Apply `config`'s `--metal`/`--facet` filters to `records`, grouped per
-/// species (`SPECIES_BITS`'s index order). When both are set and a given
+/// species (`config.species`'s declaration order). When both are set and a given
 /// species' `(metal, facet)`-filtered pool has fewer than
 /// `BUCKETS_PER_SPECIES` samples, that species alone falls back to
 /// `metal`-only (any facet) -- logged explicitly so a reader can tell a
@@ -321,7 +335,7 @@ fn filter_with_fallback(
         .collect();
     let metal_name = METALS[metal as usize];
 
-    for species in 0..SPECIES_BITS.len() {
+    for (species, slot) in by_species.iter_mut().enumerate().take(config.species.len()) {
         let metal_only_species: Vec<EnergyRecord> = metal_only
             .iter()
             .copied()
@@ -329,7 +343,7 @@ fn filter_with_fallback(
             .collect();
 
         let Some(facet) = config.facet else {
-            by_species[species] = metal_only_species;
+            *slot = metal_only_species;
             continue;
         };
 
@@ -344,13 +358,13 @@ fn filter_with_fallback(
                 "oc20_ingest: species {}: only {} record(s) match --metal {metal_name} \
                  --facet {facet}; broadening to --metal {metal_name} (any facet) -> \
                  {} record(s)",
-                SPECIES_NAMES[species],
+                config.species[species].name,
                 filtered.len(),
                 metal_only_species.len()
             );
-            by_species[species] = metal_only_species;
+            *slot = metal_only_species;
         } else {
-            by_species[species] = filtered;
+            *slot = filtered;
         }
     }
 
@@ -453,7 +467,7 @@ fn run(config: &Config) -> io::Result<()> {
     let by_species = filter_with_fallback(&energy_records, config);
 
     let mut bucketed_by_species: [Vec<BucketSummary>; MAX_SPECIES] = Default::default();
-    for species in 0..SPECIES_BITS.len() {
+    for species in 0..config.species.len() {
         let count = by_species[species].len();
         let real_ea_count = by_species[species]
             .iter()
@@ -469,7 +483,7 @@ fn run(config: &Config) -> io::Result<()> {
         };
         println!(
             "oc20_ingest: species {}: {count} adsorption-energy records{note}",
-            SPECIES_NAMES[species]
+            config.species[species].name
         );
 
         let buckets = bucket_by_quantile(&by_species[species], BUCKETS_PER_SPECIES);
@@ -477,7 +491,7 @@ fn run(config: &Config) -> io::Result<()> {
             let sizes: Vec<String> = buckets.iter().map(|b| b.sample_count.to_string()).collect();
             println!(
                 "oc20_ingest: species {}: collapsed into {} quantile bucket(s) (sizes: {})",
-                SPECIES_NAMES[species],
+                config.species[species].name,
                 buckets.len(),
                 sizes.join(", ")
             );
@@ -545,9 +559,20 @@ fn run(config: &Config) -> io::Result<()> {
     let mut ads_count = 0usize;
     let mut dissociative_ads_count = 0usize;
     let mut des_count = 0usize;
-    for species in 0..SPECIES_BITS.len() {
-        let species_bit = SPECIES_BITS[species];
-        let dissociative = DISSOCIATIVE_SPECIES.contains(&species);
+    for species in 0..config.species.len() {
+        // A `product_only` species (e.g. OH, which only ever forms via
+        // water splitting) has no single-gas source of its own -- it must
+        // never get a monomolecular adsorption/desorption template built
+        // for it, regardless of what (unexpectedly) shows up in
+        // `--input`. Today this is a no-op against real data (no
+        // extraction script ever emits an OH monomolecular record), but
+        // it makes the "no direct gas source" contract explicit rather
+        // than relying on data happening to be absent.
+        if config.species[species].role == SpeciesRole::ProductOnly {
+            continue;
+        }
+        let species_bit = config.species[species].bit;
+        let dissociative = config.species[species].role == SpeciesRole::Dissociative;
         for (bucket_idx, bucket) in bucketed_by_species[species].iter().enumerate() {
             let ea_fwd = activation_energy_ev(bucket.mean_energy_ev, bucket.real_ea_ev, config);
             let k_ads = rate_from_activation(ea_fwd, config);
@@ -570,11 +595,12 @@ fn run(config: &Config) -> io::Result<()> {
             }
         }
     }
-    for (name, replaced) in SPECIES_NAMES.iter().zip(replaces_desorption.iter()) {
+    for (entry, replaced) in config.species.iter().zip(replaces_desorption.iter()) {
         if *replaced {
             println!(
-                "oc20_ingest: species {name}: monomolecular desorption replaced by real \
-                 bimolecular recombination records (see --bimolecular-input)"
+                "oc20_ingest: species {}: monomolecular desorption replaced by real \
+                 bimolecular recombination records (see --bimolecular-input)",
+                entry.name
             );
         }
     }
@@ -603,8 +629,20 @@ fn run(config: &Config) -> io::Result<()> {
     // enough to meaningfully quantile-split.
     let mut dissociative_bimolecular_count = 0usize;
     for rec in &bimolecular_records {
-        let bit_a = SPECIES_BITS[rec.species_a as usize];
-        let bit_b = SPECIES_BITS[rec.species_b as usize];
+        // `oc20e_format::read_bimolecular_records` only bounds-checks
+        // against the architectural `MAX_SPECIES` ceiling, not this run's
+        // *active* species count (it has no way to know that) -- a record
+        // naming a species index this `--config` didn't declare is
+        // ignored here the same way an unknown species already is
+        // upstream, rather than indexing `config.species` out of bounds.
+        let (Some(entry_a), Some(entry_b)) = (
+            config.species.get(rec.species_a as usize),
+            config.species.get(rec.species_b as usize),
+        ) else {
+            continue;
+        };
+        let bit_a = entry_a.bit;
+        let bit_b = entry_b.bit;
         let k_fwd = rate_from_activation(rec.ea_ev, config);
         if rec.is_dissociative {
             // Forward: 2* -> species_a* + species_b* (both sites: vacant
@@ -680,7 +718,20 @@ fn run(config: &Config) -> io::Result<()> {
     );
 
     let blocks: Vec<ReactionLutBlock> = layout::pack_records_into_blocks(records);
-    layout::write_lut(&config.out, layout::LutKind::OccupancyGated, &blocks)?;
+    let species_table = layout::SpeciesTable::new(
+        config
+            .species
+            .iter()
+            .map(|entry| (entry.bit, entry.name.clone()))
+            .collect(),
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    layout::write_lut_with_species(
+        &config.out,
+        layout::LutKind::OccupancyGated,
+        &blocks,
+        &species_table,
+    )?;
 
     println!(
         "oc20_ingest: wrote {} blocks ({} reactions) to {}",
@@ -704,6 +755,60 @@ mod tests {
         ))
     }
 
+    /// The pd111.conf-equivalent 5-species set (O, H, CO, OH, H2O), same
+    /// bits/roles the compile-time `SPECIES_NAMES`/`SPECIES_BITS`/
+    /// `DISSOCIATIVE_SPECIES` constants used to hardcode -- shared by
+    /// every test below so each doesn't have to spell it out.
+    fn default_species() -> Vec<SpeciesEntry> {
+        vec![
+            SpeciesEntry {
+                name: "O".to_string(),
+                bit: layout::ADS_O,
+                gas: None,
+                stoich: None,
+                product: None,
+                role: SpeciesRole::Dissociative,
+                oc20_ads_id: None,
+            },
+            SpeciesEntry {
+                name: "H".to_string(),
+                bit: layout::ADS_H,
+                gas: None,
+                stoich: None,
+                product: None,
+                role: SpeciesRole::Dissociative,
+                oc20_ads_id: None,
+            },
+            SpeciesEntry {
+                name: "CO".to_string(),
+                bit: layout::ADS_CO,
+                gas: None,
+                stoich: None,
+                product: None,
+                role: SpeciesRole::Molecular,
+                oc20_ads_id: None,
+            },
+            SpeciesEntry {
+                name: "OH".to_string(),
+                bit: layout::ADS_OH,
+                gas: None,
+                stoich: None,
+                product: None,
+                role: SpeciesRole::ProductOnly,
+                oc20_ads_id: None,
+            },
+            SpeciesEntry {
+                name: "H2O".to_string(),
+                bit: layout::ADS_H2O,
+                gas: None,
+                stoich: None,
+                product: None,
+                role: SpeciesRole::Molecular,
+                oc20_ads_id: None,
+            },
+        ]
+    }
+
     fn cfg(alpha: f64, beta_ev: f64, nu: f64, temperature_k: f64) -> Config {
         Config {
             input: PathBuf::new(),
@@ -715,6 +820,7 @@ mod tests {
             temperature_k,
             metal: None,
             facet: None,
+            species: default_species(),
         }
     }
 
@@ -755,19 +861,39 @@ mod tests {
         assert!(err.contains("--input"));
     }
 
+    /// A minimal but valid `--config` file for CLI-parsing tests that
+    /// don't care about species specifics -- just enough for
+    /// `SimConfig::parse` to succeed so `Config::parse` reaches the
+    /// CLI-flag logic these tests actually exercise. `tag` must be unique
+    /// per call site: `temp_path` (this file's own, not the library's
+    /// counter-suffixed one) derives its path from the tag and this
+    /// process's pid alone, so two tests sharing a tag can race on the
+    /// same file when `cargo test` runs them in parallel threads.
+    fn write_minimal_config(tag: &str) -> PathBuf {
+        let path = temp_path(tag);
+        std::fs::write(
+            &path,
+            "[species]\nO = 0x01, O2gas, 0.5, Ostar, dissociative, 0\n",
+        )
+        .unwrap();
+        path
+    }
+
     #[test]
     fn config_parse_applies_defaults_and_overrides() {
+        let config_path = write_minimal_config("defaults_and_overrides");
         let args = [
-            "oc20_ingest",
-            "--input",
-            "energies.bin",
-            "--alpha",
-            "0.5",
-            "--out",
-            "custom.lut",
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "energies.bin".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+            "--alpha".to_string(),
+            "0.5".to_string(),
+            "--out".to_string(),
+            "custom.lut".to_string(),
         ]
-        .iter()
-        .map(|s| s.to_string());
+        .into_iter();
         let c = Config::parse(args).unwrap();
         assert_eq!(c.input, PathBuf::from("energies.bin"));
         assert_eq!(c.out, PathBuf::from("custom.lut"));
@@ -775,6 +901,7 @@ mod tests {
         assert_eq!(c.beta_ev, 0.0);
         assert_eq!(c.nu, 1.0e13);
         assert_eq!(c.temperature_k, 298.15);
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[test]
@@ -788,44 +915,142 @@ mod tests {
 
     #[test]
     fn config_parse_accepts_bimolecular_input() {
+        let config_path = write_minimal_config("accepts_bimolecular_input");
         let args = [
-            "oc20_ingest",
-            "--input",
-            "e.bin",
-            "--bimolecular-input",
-            "bi.bin",
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "e.bin".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+            "--bimolecular-input".to_string(),
+            "bi.bin".to_string(),
         ]
-        .iter()
-        .map(|s| s.to_string());
+        .into_iter();
         let c = Config::parse(args).unwrap();
         assert_eq!(c.bimolecular_input, Some(PathBuf::from("bi.bin")));
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[test]
     fn config_parse_accepts_metal_and_facet() {
+        let config_path = write_minimal_config("accepts_metal_and_facet");
         let args = [
-            "oc20_ingest",
-            "--input",
-            "e.bin",
-            "--metal",
-            "Pd",
-            "--facet",
-            "111",
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "e.bin".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+            "--metal".to_string(),
+            "Pd".to_string(),
+            "--facet".to_string(),
+            "111".to_string(),
         ]
-        .iter()
-        .map(|s| s.to_string());
+        .into_iter();
         let c = Config::parse(args).unwrap();
         assert_eq!(c.metal, metal_index("Pd"));
         assert_eq!(c.facet, Some(111));
+        let _ = std::fs::remove_file(&config_path);
     }
 
     #[test]
     fn config_parse_rejects_unknown_metal() {
-        let args = ["oc20_ingest", "--input", "e.bin", "--metal", "Unobtainium"]
+        let config_path = write_minimal_config("rejects_unknown_metal");
+        let args = [
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "e.bin".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+            "--metal".to_string(),
+            "Unobtainium".to_string(),
+        ]
+        .into_iter();
+        let err = Config::parse(args).unwrap_err();
+        assert!(err.contains("Unobtainium"));
+        let _ = std::fs::remove_file(&config_path);
+    }
+
+    #[test]
+    fn config_parse_requires_config() {
+        let args = ["oc20_ingest", "--input", "e.bin"]
             .iter()
             .map(|s| s.to_string());
         let err = Config::parse(args).unwrap_err();
-        assert!(err.contains("Unobtainium"));
+        assert!(err.contains("--config"));
+    }
+
+    #[test]
+    fn config_parse_resolves_metal_and_facet_from_config_file() {
+        let path = temp_path("config_with_system");
+        std::fs::write(
+            &path,
+            "[system]\nmetal = Pd\nfacet = 111\n\n[species]\nO = 0x01, O2gas, 0.5, Ostar, dissociative, 0\n",
+        )
+        .unwrap();
+        let args = [
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "e.bin".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ]
+        .into_iter();
+        let c = Config::parse(args).unwrap();
+        assert_eq!(c.metal, metal_index("Pd"));
+        assert_eq!(c.facet, Some(111));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_parse_cli_metal_overrides_config_file_metal() {
+        let path = temp_path("config_with_system_override");
+        std::fs::write(
+            &path,
+            "[system]\nmetal = Pd\nfacet = 111\n\n[species]\nO = 0x01, O2gas, 0.5, Ostar, dissociative, 0\n",
+        )
+        .unwrap();
+        let args = [
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "e.bin".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+            "--metal".to_string(),
+            "Pt".to_string(),
+        ]
+        .into_iter();
+        let c = Config::parse(args).unwrap();
+        assert_eq!(
+            c.metal,
+            metal_index("Pt"),
+            "--metal must override the config file's [system] metal"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn config_parse_loads_species_from_config_file() {
+        let path = temp_path("config_with_species");
+        std::fs::write(
+            &path,
+            "[species]\n\
+             O = 0x01, O2gas, 0.5, Ostar, dissociative, 0\n\
+             CO = 0x02, COgas, 1.0, COstar, molecular, 5\n",
+        )
+        .unwrap();
+        let args = [
+            "oc20_ingest".to_string(),
+            "--input".to_string(),
+            "e.bin".to_string(),
+            "--config".to_string(),
+            path.display().to_string(),
+        ]
+        .into_iter();
+        let c = Config::parse(args).unwrap();
+        assert_eq!(c.species.len(), 2);
+        assert_eq!(c.species[0].name, "O");
+        assert_eq!(c.species[1].name, "CO");
+        let _ = std::fs::remove_file(&path);
     }
 
     fn energy_record_with_metal(species: u8, metal: u8, facet: u16) -> EnergyRecord {
@@ -1215,6 +1440,7 @@ mod tests {
             temperature_k: 298.15,
             metal: None,
             facet: None,
+            species: default_species(),
         };
         run(&config).unwrap();
 
@@ -1277,6 +1503,7 @@ mod tests {
             temperature_k: 298.15,
             metal: None,
             facet: None,
+            species: default_species(),
         };
         run(&config).unwrap();
 
@@ -1386,6 +1613,7 @@ mod tests {
             temperature_k: 298.15,
             metal: None,
             facet: None,
+            species: default_species(),
         };
         run(&config).unwrap();
 
@@ -1446,6 +1674,7 @@ mod tests {
             temperature_k: 298.15,
             metal: None,
             facet: None,
+            species: default_species(),
         };
         run(&config).unwrap();
 
@@ -1557,6 +1786,7 @@ mod tests {
             temperature_k: 298.15,
             metal: None,
             facet: None,
+            species: default_species(),
         };
         run(&config).unwrap();
 
