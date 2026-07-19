@@ -52,7 +52,7 @@
 //! free-list above was built for).
 
 use crate::gillespie::Rng;
-use crate::layout::{self, ReactionRecord, MAX_SPECIES, SPECIES_BITS};
+use crate::layout::{self, ReactionRecord, SpeciesTable, MAX_SPECIES};
 
 /// Quantile buckets `oc20_ingest`'s `bucket_by_quantile` splits each
 /// species' real DFT samples into. Must agree with the ingest tool: the
@@ -136,31 +136,29 @@ impl BucketedSet {
     }
 }
 
-fn species_index(species_bit: u8) -> Option<usize> {
-    SPECIES_BITS.iter().position(|&b| b == species_bit)
-}
-
-/// Relative gas-phase partial-pressure multipliers, indexed by species the
-/// same way `SPECIES_BITS`/`occupancy::OccupancyCounters` are -- a runtime
-/// simulator parameter (`kinetica --pressure-o2 --pressure-h2 --pressure-co
-/// --pressure-h2o`), not baked into `reactions.lut`, so changing the
-/// feed-gas composition never requires rebuilding it. Without this, two
-/// runs meant to represent different partial pressures produced identical
-/// adsorption kinetics -- the same rate-constant table applied regardless
-/// of how much of each gas was actually being fed in.
+/// Relative gas-phase partial-pressure multipliers, indexed the same way a
+/// LUT's own `SpeciesTable` (`ReactionLut::species`) orders its species --
+/// a runtime simulator parameter (`kinetica --pressure <name> <value>`, or
+/// the legacy per-gas `--pressure-o2 --pressure-h2 --pressure-co
+/// --pressure-h2o` aliases), not baked into `reactions.lut`, so changing
+/// the feed-gas composition never requires rebuilding it. Without this,
+/// two runs meant to represent different partial pressures produced
+/// identical adsorption kinetics -- the same rate-constant table applied
+/// regardless of how much of each gas was actually being fed in.
 ///
-/// Sized `MAX_SPECIES` (the architectural ceiling, not today's active
-/// `NUM_SPECIES`) so a future runtime-configurable species set never
-/// needs this array resized -- only indices `NUM_SPECIES..MAX_SPECIES` go
-/// unused for today's fixed 5-species build. Index 3 (OH) is always
-/// ignored: OH only ever forms via the heteroatomic dissociative-
-/// adsorption path (water splitting), which `pressure_factor`
-/// short-circuits to `1.0` *before* ever indexing into this array -- see
-/// its doc comment for why a species that only ever appears as one side
-/// of a two-species gas reaction can't correctly be gated by looking up
-/// its own slot. H2O (index 4) *is* a real, used slot: `star + H2O(g) ->
-/// H2Ostar` is an ordinary single-gas monomolecular adsorption, same
-/// shape as O2/H2/CO, so it gates exactly like they do.
+/// Sized `MAX_SPECIES` (the architectural ceiling) so any runtime species
+/// count up to that ceiling fits without resizing this array -- indices
+/// past a given LUT's actual species count are unused padding. A
+/// `ProductOnly` species (e.g. OH, which only ever forms via the
+/// heteroatomic dissociative-adsorption path, water splitting) is always
+/// ignored regardless of its index: `pressure_factor` short-circuits to
+/// `1.0` *before* ever indexing into this array for such a species -- see
+/// its doc comment for why a species that only ever appears as one side of
+/// a two-species gas reaction can't correctly be gated by looking up its
+/// own slot. An ordinary `Molecular`/`Dissociative` species (e.g. H2O) is a
+/// real, used slot: `star + H2O(g) -> H2Ostar` is an ordinary single-gas
+/// monomolecular adsorption, same shape as O2/H2/CO, so it gates exactly
+/// like they do.
 ///
 /// Desorption and bimolecular *recombination* templates (CO-oxidation,
 /// H2-recombination) are untouched -- pressure only gates a reaction that
@@ -172,10 +170,12 @@ fn species_index(species_bit: u8) -> Option<usize> {
 /// propensities (every multiplier 1.0).
 #[derive(Clone, Copy, Debug)]
 pub struct Pressures {
-    /// Relative partial pressure for each species in `SPECIES_BITS`
-    /// order; index 3 (OH) is permanently unused since OH* only ever
-    /// forms via the pressure-neutral heteroatomic water-splitting path.
-    /// Indices `NUM_SPECIES..MAX_SPECIES` are unused padding.
+    /// Relative partial pressure for each species, in the same order as
+    /// the LUT's own `SpeciesTable` (`ReactionLut::species`); a
+    /// `ProductOnly` species' slot (e.g. OH, today always index 3) is
+    /// permanently unused since it only ever forms via the
+    /// pressure-neutral heteroatomic water-splitting path. Indices past a
+    /// given LUT's actual species count are unused padding.
     pub values: [f64; MAX_SPECIES],
 }
 
@@ -211,7 +211,11 @@ impl Pressures {
 /// Rather than get that wrong silently, heteroatomic dissociative
 /// adsorption stays pressure-neutral -- a documented simplification, not a
 /// bug (see README).
-fn pressure_factor(template: &ReactionRecord, pressures: &Pressures) -> f64 {
+fn pressure_factor(
+    template: &ReactionRecord,
+    pressures: &Pressures,
+    species: &SpeciesTable,
+) -> f64 {
     let reactant_mask = (template.transition_a >> 8) as u8;
     if reactant_mask != 0 {
         return 1.0; // desorption or recombination: no gas-phase reactant
@@ -220,7 +224,8 @@ fn pressure_factor(template: &ReactionRecord, pressures: &Pressures) -> f64 {
     if template.is_bimolecular && product_mask != (template.transition_b & 0xFF) as u8 {
         return 1.0; // heteroatomic dissociative adsorption -- see doc comment
     }
-    species_index(product_mask)
+    species
+        .index_of(product_mask)
         .and_then(|s| pressures.values.get(s))
         .copied()
         .unwrap_or(1.0)
@@ -364,14 +369,20 @@ impl PairTable {
 /// a patch starts (`new`), then kept in sync in O(1) amortized time per
 /// event (`on_occupancy_change`) rather than ever rescanned.
 pub struct OccupancyCounters {
+    /// This patch's LUT's own runtime species identity (`ReactionLut::
+    /// species`), replacing what used to be the compile-time `SPECIES_BITS`
+    /// list -- every species-bit-to-index lookup below goes through this
+    /// table instead of a fixed array, so a LUT naming a different species
+    /// set (fewer, more, or reordered) works without any code change here.
+    species: SpeciesTable,
     /// `vacant_sets[species]`: free-list of currently-vacant sites,
     /// bucketed by that species' `site_bucket` hash -- the live pool an
     /// adsorption template for that species/bucket fires against. A single
-    /// vacant site is a member of all `NUM_SPECIES` of these simultaneously
-    /// (once per species, generally in a different bucket per species,
-    /// since any species could in principle adsorb there). Sized
+    /// vacant site is a member of `species.len()` of these simultaneously
+    /// (once per active species, generally in a different bucket per
+    /// species, since any species could in principle adsorb there). Sized
     /// `MAX_SPECIES` (see `Pressures.values`'s doc comment for why); slots
-    /// `NUM_SPECIES..MAX_SPECIES` are constructed but never populated.
+    /// past `species.len()` are constructed but never populated.
     vacant_sets: [BucketedSet; MAX_SPECIES],
     /// `occupied_sets[species]`: free-list of sites currently occupied *by
     /// that species*, bucketed the same way -- the live pool a desorption
@@ -388,16 +399,28 @@ pub struct OccupancyCounters {
 
 impl OccupancyCounters {
     /// One O(N) pass over `patch_data`'s initial state, seeding every
-    /// counter from scratch. `templates` seeds `pairs`' distinct-pair
-    /// slots (see `PairTable::from_templates`) before the scan below ever
-    /// calls `add_pair`. Pair counting only looks at each site's
+    /// counter from scratch. `species` (typically a LUT's own
+    /// `ReactionLut::species()`) drives every species-bit-to-index lookup
+    /// this patch uses for its whole lifetime -- cloned once here rather
+    /// than threaded through every call as a borrow, since it's a small,
+    /// cheap-to-clone table (at most 8 short entries) built once per patch,
+    /// not per event. `templates` seeds `pairs`' distinct-pair slots (see
+    /// `PairTable::from_templates`) before the scan below ever calls
+    /// `add_pair`. Pair counting only looks at each site's
     /// `topology::forward_neighbors` (not all up to six) specifically so a
     /// full scan counts every unordered adjacent pair exactly once --
     /// checking every neighbor from every site would double-count each
     /// pair, once from each side.
-    pub fn new(patch_data: &[u8], width: usize, seed: u64, templates: &[ReactionRecord]) -> Self {
+    pub fn new(
+        patch_data: &[u8],
+        width: usize,
+        seed: u64,
+        species: &SpeciesTable,
+        templates: &[ReactionRecord],
+    ) -> Self {
         let site_count = patch_data.len();
         let mut counters = OccupancyCounters {
+            species: species.clone(),
             vacant_sets: std::array::from_fn(|_| BucketedSet::new(site_count)),
             occupied_sets: std::array::from_fn(|_| BucketedSet::new(site_count)),
             pairs: PairTable::from_templates(templates),
@@ -430,13 +453,17 @@ impl OccupancyCounters {
     /// Add (`insert = true`) or remove (`insert = false`) `site_idx` --
     /// currently holding `state` -- from whichever `vacant_sets`/
     /// `occupied_sets` bucket that state belongs to. The one place this
-    /// branch (VACANT -> every species' vacant set, a known species ->
-    /// just that species' occupied set, anything else -> no set at all)
+    /// branch (VACANT -> every active species' vacant set, a known species
+    /// -> just that species' occupied set, anything else -> no set at all)
     /// is written, shared by `new`'s seeding pass and
     /// `on_occupancy_change`'s old-state removal and new-state insertion.
     fn update_membership(&mut self, site_idx: usize, state: u8, seed: u64, insert: bool) {
         if state == layout::VACANT {
-            for (species, &bit) in SPECIES_BITS.iter().enumerate() {
+            for species in 0..self.species.len() {
+                let bit = self
+                    .species
+                    .bit(species)
+                    .expect("species < self.species.len() always names a bit");
                 let bucket = site_bucket(site_idx, bit, seed);
                 if insert {
                     self.vacant_sets[species].insert(site_idx, bucket);
@@ -444,7 +471,7 @@ impl OccupancyCounters {
                     self.vacant_sets[species].remove(site_idx, bucket);
                 }
             }
-        } else if let Some(species) = species_index(state) {
+        } else if let Some(species) = self.species.index_of(state) {
             let bucket = site_bucket(site_idx, state, seed);
             if insert {
                 self.occupied_sets[species].insert(site_idx, bucket);
@@ -529,11 +556,13 @@ impl OccupancyCounters {
             if reactant_mask == 0 {
                 // Adsorption: reactant is VACANT, species comes from the
                 // product side.
-                species_index(product_mask)
+                self.species
+                    .index_of(product_mask)
                     .map(|s| self.vacant_sets[s].len(bucket) as u64)
                     .unwrap_or(0)
             } else {
-                species_index(reactant_mask)
+                self.species
+                    .index_of(reactant_mask)
                     .map(|s| self.occupied_sets[s].len(bucket) as u64)
                     .unwrap_or(0)
             }
@@ -551,7 +580,11 @@ impl OccupancyCounters {
     pub(crate) fn weights(&self, templates: &[ReactionRecord], pressures: &Pressures) -> Vec<f64> {
         templates
             .iter()
-            .map(|t| t.rate_q16 as f64 * self.live_count(t) as f64 * pressure_factor(t, pressures))
+            .map(|t| {
+                t.rate_q16 as f64
+                    * self.live_count(t) as f64
+                    * pressure_factor(t, pressures, &self.species)
+            })
             .collect()
     }
 
@@ -630,10 +663,10 @@ impl OccupancyCounters {
             return None;
         }
         if reactant_mask == 0 {
-            let species = species_index(product_mask)?;
+            let species = self.species.index_of(product_mask)?;
             self.vacant_sets[species].pick(bucket, rng)
         } else {
-            let species = species_index(reactant_mask)?;
+            let species = self.species.index_of(reactant_mask)?;
             self.occupied_sets[species].pick(bucket, rng)
         }
     }
@@ -701,10 +734,27 @@ fn neighbor_with_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, ADS_OH, NUM_SPECIES, VACANT};
+    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, ADS_OH, NUM_SPECIES, SPECIES_BITS, VACANT};
 
     fn rng() -> Rng {
         Rng::seeded(42)
+    }
+
+    /// The runtime species identity every test in this module builds its
+    /// `OccupancyCounters` against -- deliberately reproduces
+    /// `layout::SPECIES_BITS`'s exact bit/name/order (today's real
+    /// Pd(111) build), so every existing test's behavior and assertions
+    /// carry over unchanged now that `OccupancyCounters::new` takes a
+    /// runtime `SpeciesTable` instead of reading the compile-time list.
+    fn test_species() -> SpeciesTable {
+        SpeciesTable::new(vec![
+            (ADS_O, "O".to_string()),
+            (ADS_H, "H".to_string()),
+            (ADS_CO, "CO".to_string()),
+            (ADS_OH, "OH".to_string()),
+            (ADS_H2O, "H2O".to_string()),
+        ])
+        .unwrap()
     }
 
     /// Test convenience wrapper matching `select_event`'s pre-refactor
@@ -778,7 +828,7 @@ mod tests {
         seed: u64,
         templates: &[ReactionRecord],
     ) -> OccupancyCounters {
-        OccupancyCounters::new(patch_data, width, seed, templates)
+        OccupancyCounters::new(patch_data, width, seed, &test_species(), templates)
     }
 
     fn vacant_total(counters: &OccupancyCounters, species: usize) -> u32 {
@@ -797,7 +847,7 @@ mod tests {
     fn new_counts_vacant_and_occupied_sites_correctly() {
         let width = 4;
         let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
-        let counters = OccupancyCounters::new(&data, width, 99, &[]);
+        let counters = OccupancyCounters::new(&data, width, 99, &test_species(), &[]);
 
         let total_vacant: u32 = (0..3).map(|s| vacant_total(&counters, s)).sum();
         // Every vacant site contributes to all 3 species' vacant counts.
@@ -832,7 +882,7 @@ mod tests {
             bimolecular_template(ADS_O, ADS_CO, 1),
             bimolecular_template(ADS_H, ADS_H, 1),
         ];
-        let counters = OccupancyCounters::new(&data, width, 5, &templates);
+        let counters = OccupancyCounters::new(&data, width, 5, &test_species(), &templates);
         assert_eq!(counters.pairs.count(ADS_O, ADS_CO), 1); // (0,1) horizontal
         assert_eq!(counters.pairs.count(ADS_H, ADS_H), 1); // (2,3) horizontal
     }
@@ -853,7 +903,7 @@ mod tests {
             bimolecular_template(ADS_O, ADS_CO, 1),
             bimolecular_template(ADS_H, ADS_H, 1),
         ];
-        let mut counters = OccupancyCounters::new(&data, width, seed, &templates);
+        let mut counters = OccupancyCounters::new(&data, width, seed, &test_species(), &templates);
 
         for _ in 0..500 {
             let site = rng.next_u32_below((width * height) as u32) as usize;
@@ -958,10 +1008,16 @@ mod tests {
             values: [2.0, 3.0, 5.0, 1.0, 11.0, 1.0, 1.0, 1.0],
         };
         // Adsorption: pressure_factor equals that species' own pressure.
-        assert_eq!(pressure_factor(&ads_template(ADS_O, 0, 1), &pressures), 2.0);
-        assert_eq!(pressure_factor(&ads_template(ADS_H, 0, 1), &pressures), 3.0);
         assert_eq!(
-            pressure_factor(&ads_template(ADS_CO, 0, 1), &pressures),
+            pressure_factor(&ads_template(ADS_O, 0, 1), &pressures, &test_species()),
+            2.0
+        );
+        assert_eq!(
+            pressure_factor(&ads_template(ADS_H, 0, 1), &pressures, &test_species()),
+            3.0
+        );
+        assert_eq!(
+            pressure_factor(&ads_template(ADS_CO, 0, 1), &pressures, &test_species()),
             5.0
         );
         // H2O* adsorption is an ordinary single-gas monomolecular channel,
@@ -969,21 +1025,28 @@ mod tests {
         // like they do (see `Pressures`' doc comment for why this differs
         // from water-splitting's H* + OH* products, which stay neutral).
         assert_eq!(
-            pressure_factor(&ads_template(ADS_H2O, 0, 1), &pressures),
+            pressure_factor(&ads_template(ADS_H2O, 0, 1), &pressures, &test_species()),
             11.0
         );
         // Desorption and bimolecular: untouched by pressure, always 1.0.
-        assert_eq!(pressure_factor(&des_template(ADS_O, 0, 1), &pressures), 1.0);
         assert_eq!(
-            pressure_factor(&des_template(ADS_CO, 0, 1), &pressures),
+            pressure_factor(&des_template(ADS_O, 0, 1), &pressures, &test_species()),
             1.0
         );
         assert_eq!(
-            pressure_factor(&des_template(ADS_H2O, 0, 1), &pressures),
+            pressure_factor(&des_template(ADS_CO, 0, 1), &pressures, &test_species()),
             1.0
         );
         assert_eq!(
-            pressure_factor(&bimolecular_template(ADS_O, ADS_CO, 1), &pressures),
+            pressure_factor(&des_template(ADS_H2O, 0, 1), &pressures, &test_species()),
+            1.0
+        );
+        assert_eq!(
+            pressure_factor(
+                &bimolecular_template(ADS_O, ADS_CO, 1),
+                &pressures,
+                &test_species()
+            ),
             1.0
         );
     }
@@ -992,7 +1055,7 @@ mod tests {
     fn total_propensity_with_ones_pressure_matches_unpressured_formula() {
         let width = 4;
         let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
-        let counters = OccupancyCounters::new(&data, width, 3, &[]);
+        let counters = OccupancyCounters::new(&data, width, 3, &test_species(), &[]);
         let bucket = site_bucket(0, ADS_O, 3) as u8;
         let templates = vec![
             ads_template(ADS_O, bucket, 1000),
@@ -1011,7 +1074,7 @@ mod tests {
     fn total_propensity_scales_linearly_with_adsorption_pressure() {
         let width = 4;
         let data = vec![VACANT; 16];
-        let counters = OccupancyCounters::new(&data, width, 9, &[]);
+        let counters = OccupancyCounters::new(&data, width, 9, &test_species(), &[]);
         let bucket = site_bucket(0, ADS_CO, 9) as u8;
         // Only a CO adsorption template -- every VACANT site matches, so
         // this isolates the pressure multiplier's effect cleanly.
@@ -1053,7 +1116,7 @@ mod tests {
         let mut data = vec![VACANT; width * height];
         let o_site = 37usize;
         data[o_site] = ADS_O;
-        let counters = OccupancyCounters::new(&data, width, seed, &[]);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &[]);
 
         let bucket = site_bucket(o_site, ADS_O, seed) as u8;
         let templates = vec![des_template(ADS_O, bucket, u32::MAX)];
@@ -1084,7 +1147,7 @@ mod tests {
         let mut data = vec![ADS_CO; width * height];
         let vacant_site = 5usize;
         data[vacant_site] = VACANT;
-        let counters = OccupancyCounters::new(&data, width, seed, &[]);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &[]);
 
         let bucket = site_bucket(vacant_site, ADS_O, seed) as u8;
         let templates = vec![ads_template(ADS_O, bucket, u32::MAX)];
@@ -1128,7 +1191,7 @@ mod tests {
         };
         let templates = vec![template];
 
-        let counters = OccupancyCounters::new(&data, width, seed, &templates);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &templates);
         assert_eq!(counters.pairs.count(ADS_O, ADS_CO), 1);
 
         let mut rng = rng();
@@ -1164,7 +1227,7 @@ mod tests {
     fn select_event_returns_none_when_every_template_has_zero_live_count() {
         let width = 4;
         let data = vec![VACANT; 16];
-        let counters = OccupancyCounters::new(&data, width, 1, &[]);
+        let counters = OccupancyCounters::new(&data, width, 1, &test_species(), &[]);
         // Desorption templates for a species with nothing on the lattice.
         let templates = vec![
             des_template(ADS_O, 0, 1000),
@@ -1217,7 +1280,7 @@ mod tests {
 
         let templates = vec![dissociative_ads_template(ADS_H, u32::MAX)];
 
-        let counters = OccupancyCounters::new(&data, width, seed, &templates);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &templates);
         assert_eq!(counters.pairs.count(VACANT, VACANT), 1);
 
         let mut rng = rng();
@@ -1260,12 +1323,14 @@ mod tests {
         let templates = vec![dissociative_ads_template(ADS_H, 1000)];
 
         let mostly_vacant = vec![VACANT; width * height];
-        let counters_high = OccupancyCounters::new(&mostly_vacant, width, seed, &templates);
+        let counters_high =
+            OccupancyCounters::new(&mostly_vacant, width, seed, &test_species(), &templates);
 
         let mut mostly_occupied = vec![ADS_O; width * height];
         mostly_occupied[10] = VACANT;
         mostly_occupied[11] = VACANT; // exactly one adjacent vacant pair
-        let counters_low = OccupancyCounters::new(&mostly_occupied, width, seed, &templates);
+        let counters_low =
+            OccupancyCounters::new(&mostly_occupied, width, seed, &test_species(), &templates);
         assert_eq!(counters_low.pairs.count(VACANT, VACANT), 1);
         assert!(
             counters_high.pairs.count(VACANT, VACANT) > counters_low.pairs.count(VACANT, VACANT)
@@ -1292,12 +1357,15 @@ mod tests {
             values: [1.0, 7.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         };
         let template = dissociative_ads_template(ADS_H, 1);
-        assert_eq!(pressure_factor(&template, &pressures), 7.0);
+        assert_eq!(pressure_factor(&template, &pressures, &test_species()), 7.0);
 
         // A recombination-direction bimolecular template (occupied
         // reactant) must stay untouched by the same pressure vector.
         let recombination = bimolecular_template(ADS_H, ADS_H, 1);
-        assert_eq!(pressure_factor(&recombination, &pressures), 1.0);
+        assert_eq!(
+            pressure_factor(&recombination, &pressures, &test_species()),
+            1.0
+        );
     }
 
     fn heteroatomic_dissociative_ads_template(
@@ -1344,7 +1412,7 @@ mod tests {
         data[11] = VACANT;
 
         let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1000);
-        let counters = OccupancyCounters::new(&data, width, seed, &[forward]);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &[forward]);
         assert_eq!(counters.pairs.count(VACANT, VACANT), 1);
 
         assert_eq!(
@@ -1368,7 +1436,7 @@ mod tests {
         data[11] = ADS_OH;
 
         let reverse = heteroatomic_recombination_template(ADS_H, ADS_OH, 1000);
-        let counters = OccupancyCounters::new(&data, width, seed, &[reverse]);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &[reverse]);
         assert_eq!(counters.pairs.count(ADS_H, ADS_OH), 1);
         assert_eq!(counters.pairs.count(ADS_O, ADS_CO), 0);
         assert_eq!(counters.pairs.count(ADS_H, ADS_H), 0);
@@ -1391,7 +1459,7 @@ mod tests {
                                     // No templates named when building `counters` -- `bogus`'s
                                     // (CO, OH) pair was never registered, so it must fail safe to 0
                                     // even though the pair is a plausible-looking bimolecular record.
-        let counters = OccupancyCounters::new(&data, width, 1, &[]);
+        let counters = OccupancyCounters::new(&data, width, 1, &test_species(), &[]);
         let bogus = heteroatomic_recombination_template(ADS_CO, ADS_OH, 1000);
         assert_eq!(counters.total_propensity(&[bogus], &Pressures::ones()), 0.0);
     }
@@ -1409,7 +1477,7 @@ mod tests {
         }; // H2 pressure cranked up
         let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1);
         assert_eq!(
-            pressure_factor(&forward, &pressures),
+            pressure_factor(&forward, &pressures, &test_species()),
             1.0,
             "must not accidentally gate on H2 pressure just because site A produces H*"
         );
@@ -1418,12 +1486,15 @@ mod tests {
         // species) is unaffected by this guard -- still genuinely
         // pressure-coupled, matching Phase 3's existing behavior.
         let homoatomic = dissociative_ads_template(ADS_H, 1);
-        assert_eq!(pressure_factor(&homoatomic, &pressures), 99.0);
+        assert_eq!(
+            pressure_factor(&homoatomic, &pressures, &test_species()),
+            99.0
+        );
 
         // The reverse (associative desorption) direction is untouched
         // regardless -- no gas-phase reactant.
         let reverse = heteroatomic_recombination_template(ADS_H, ADS_OH, 1);
-        assert_eq!(pressure_factor(&reverse, &pressures), 1.0);
+        assert_eq!(pressure_factor(&reverse, &pressures, &test_species()), 1.0);
     }
 
     /// End-to-end: the reverse (associative desorption) direction must
@@ -1442,7 +1513,7 @@ mod tests {
 
         let templates = vec![heteroatomic_recombination_template(ADS_H, ADS_OH, u32::MAX)];
 
-        let counters = OccupancyCounters::new(&data, width, seed, &templates);
+        let counters = OccupancyCounters::new(&data, width, seed, &test_species(), &templates);
         assert_eq!(counters.pairs.count(ADS_H, ADS_OH), 1);
 
         let mut rng = rng();

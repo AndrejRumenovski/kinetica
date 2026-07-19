@@ -33,14 +33,26 @@ struct Config {
     /// before running, for exercising the pipeline without a real OC20
     /// rate-constant export on hand.
     generate_lut: Option<usize>,
-    /// Relative partial pressures for the O2/H2/CO/H2O feed gas, applied
-    /// only to the occupancy-gated engine's adsorption channels (see
-    /// `occupancy::Pressures`). Named after the gas-phase molecule fed in
-    /// (O2, H2, CO, H2O), not the surface species index it couples to.
+    /// Legacy per-gas pressure flags -- documented aliases for
+    /// `--pressure O <value>` / `--pressure H <value>` / `--pressure CO
+    /// <value>` / `--pressure H2O <value>` respectively (see `--pressure`'s
+    /// own doc comment below), kept so existing README command lines and
+    /// any pinned invocation keep working unchanged. Named after the
+    /// gas-phase molecule fed in (O2, H2, CO, H2O), not the surface
+    /// species name it resolves to -- `O2` dissociatively adsorbs as `O*`,
+    /// `H2` as `H*`.
     pressure_o2: f64,
     pressure_h2: f64,
     pressure_co: f64,
     pressure_h2o: f64,
+    /// Relative partial pressures for arbitrary species, applied only to
+    /// the occupancy-gated engine's adsorption channels (see
+    /// `occupancy::Pressures`). Each pair is `(species name, value)` as
+    /// typed on the command line via a repeatable `--pressure <name>
+    /// <value>` flag, resolved against the opened LUT's own self-described
+    /// `layout::SpeciesTable` (`ReactionLut::species`) in `run` -- not
+    /// here, since the LUT isn't open yet during argument parsing.
+    pressures: Vec<(String, f64)>,
 }
 
 impl Config {
@@ -60,6 +72,7 @@ impl Config {
         let mut pressure_h2 = 1.0f64;
         let mut pressure_co = 1.0f64;
         let mut pressure_h2o = 1.0f64;
+        let mut pressures = Vec::new();
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -79,6 +92,11 @@ impl Config {
                 "--pressure-h2" => pressure_h2 = parse_value(&mut args, "--pressure-h2")?,
                 "--pressure-co" => pressure_co = parse_value(&mut args, "--pressure-co")?,
                 "--pressure-h2o" => pressure_h2o = parse_value(&mut args, "--pressure-h2o")?,
+                "--pressure" => {
+                    let name = next_value(&mut args, "--pressure")?;
+                    let value = parse_value(&mut args, "--pressure")?;
+                    pressures.push((name, value));
+                }
                 "--help" | "-h" => return Err(usage()),
                 other => return Err(format!("unrecognized argument `{other}`\n\n{}", usage())),
             }
@@ -97,6 +115,7 @@ impl Config {
             pressure_h2,
             pressure_co,
             pressure_h2o,
+            pressures,
         })
     }
 }
@@ -128,14 +147,15 @@ fn usage() -> String {
        --patches <N>              Spatial domains / rayon tasks [default: available CPUs]\n    \
        --steps <N>                Gillespie steps per patch [default: 1000000]\n    \
        --generate-lut <N>         Synthesize N demo reactions into --lut-path first\n    \
-       --pressure-o2 <F>          Relative O2 partial pressure, gates O* adsorption\n                                    \
-                                    (occupancy-gated engine only) [default: 1.0]\n    \
-       --pressure-h2 <F>          Relative H2 partial pressure, gates H* adsorption\n                                    \
-                                    [default: 1.0]\n    \
-       --pressure-co <F>          Relative CO partial pressure, gates CO* adsorption\n                                    \
-                                    [default: 1.0]\n    \
-       --pressure-h2o <F>         Relative H2O partial pressure, gates H2O* adsorption\n                                    \
-                                    (does not affect water-splitting -- see README)\n                                    \
+       --pressure <NAME> <F>      Relative partial pressure for species NAME (as named\n                                    \
+                                    in the LUT's own species table, e.g. `O`/`H`/`CO`),\n                                    \
+                                    gates its adsorption (occupancy-gated engine only,\n                                    \
+                                    repeatable) [default: 1.0 for every species]\n    \
+       --pressure-o2 <F>          Legacy alias for `--pressure O <F>` [default: 1.0]\n    \
+       --pressure-h2 <F>          Legacy alias for `--pressure H <F>` [default: 1.0]\n    \
+       --pressure-co <F>          Legacy alias for `--pressure CO <F>` [default: 1.0]\n    \
+       --pressure-h2o <F>         Legacy alias for `--pressure H2O <F>`; note this\n                                    \
+                                    does not affect water-splitting -- see README\n                                    \
                                     [default: 1.0]\n    \
        -h, --help                 Print this message"
         .to_string()
@@ -157,6 +177,67 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Resolve `config`'s pressure flags -- both the four legacy per-gas
+/// aliases and any generic `--pressure <name> <value>` flags -- against
+/// `lut`'s own self-described `layout::SpeciesTable`, into the
+/// `occupancy::Pressures` array the engine actually indexes by species
+/// position. Deferred to here (rather than done during `Config::parse`)
+/// because species identity only becomes known once the LUT is open.
+///
+/// A `Static` LUT has no species table at all (see `SpeciesTable`'s doc
+/// comment), and pressure gating doesn't apply to that engine in the first
+/// place, so pressure flags are simply inert for one -- not validated,
+/// matching how they were already silently unused on the `Static` path
+/// before this flag existed.
+fn resolve_pressures(
+    lut: &ReactionLut,
+    config: &Config,
+) -> std::io::Result<kinetica::occupancy::Pressures> {
+    let mut pressures = kinetica::occupancy::Pressures::ones();
+    if lut.kind() != layout::LutKind::OccupancyGated {
+        return Ok(pressures);
+    }
+    let species = lut.species();
+
+    // The four legacy per-gas flags: silently no-op for any of them whose
+    // species name this LUT doesn't carry -- these are backward-compatible
+    // defaults for the original Pd(111) build, not a user-typed name, so a
+    // config with a different species set (missing "O"/"H2O"/etc.) simply
+    // has nothing for that alias to override.
+    for (alias_name, value) in [
+        ("O", config.pressure_o2),
+        ("H", config.pressure_h2),
+        ("CO", config.pressure_co),
+        ("H2O", config.pressure_h2o),
+    ] {
+        if let Some(idx) = species.index_of_name(alias_name) {
+            pressures.values[idx] = value;
+        }
+    }
+
+    // Explicit `--pressure <name> <value>` flags: unlike the legacy
+    // aliases above, an unrecognized name here is a user-typed mistake
+    // worth failing loudly on rather than silently ignoring.
+    for (name, value) in &config.pressures {
+        let idx = species.index_of_name(name).ok_or_else(|| {
+            let known: Vec<&str> = (0..species.len())
+                .map(|i| species.name(i).unwrap_or("?"))
+                .collect();
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "--pressure {name}: this LUT's species table has no species named \
+                     `{name}` (known species: {})",
+                    known.join(", ")
+                ),
+            )
+        })?;
+        pressures.values[idx] = *value;
+    }
+
+    Ok(pressures)
 }
 
 fn run(config: &Config) -> std::io::Result<()> {
@@ -202,32 +283,14 @@ fn run(config: &Config) -> std::io::Result<()> {
         config.steps_per_patch,
         config.trajectory_path.display()
     );
+    let pressures = resolve_pressures(&lut, config)?;
     if lut.kind() == layout::LutKind::OccupancyGated {
-        println!(
-            "kinetica: relative partial pressures: O2={} H2={} CO={} H2O={}",
-            config.pressure_o2, config.pressure_h2, config.pressure_co, config.pressure_h2o
-        );
+        let species = lut.species();
+        let report: Vec<String> = (0..species.len())
+            .map(|i| format!("{}={}", species.name(i).unwrap_or("?"), pressures.values[i]))
+            .collect();
+        println!("kinetica: relative partial pressures: {}", report.join(" "));
     }
-    // Index 3 (OH) has no independent gas-phase pressure knob -- OH only
-    // ever forms via the heteroatomic water-splitting reaction, which
-    // `occupancy::pressure_factor` always treats as pressure-neutral (see
-    // its doc comment), so this slot is never actually read. Kept at 1.0
-    // rather than omitted so the array stays indexed exactly like
-    // `layout::SPECIES_BITS`. Indices 5..MAX_SPECIES (beyond today's 5
-    // active species) are unused padding, same reasoning as
-    // `Pressures.values`'s own doc comment.
-    let pressures = kinetica::occupancy::Pressures {
-        values: [
-            config.pressure_o2,
-            config.pressure_h2,
-            config.pressure_co,
-            1.0,
-            config.pressure_h2o,
-            1.0,
-            1.0,
-            1.0,
-        ],
-    };
 
     let start = Instant::now();
     engine::run_simulation(

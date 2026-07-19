@@ -47,11 +47,17 @@ pub const ADS_H2O: u8 = 0x10;
 /// lattice file, and callers that care should treat it as the latter.
 pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H | ADS_OH | ADS_H2O;
 
-/// The adsorbates this lattice tracks, in the species-index order every
-/// real-data producer/consumer agrees on: `oc20_ingest`'s
-/// `EnergyRecord::species`, the `OC20E003`/`OC20BI03` binary formats, and
-/// `occupancy.rs`'s per-species counters all index into this same array.
-/// Defined once here rather than duplicated in each of those places.
+/// The original fixed 5-species Pd(111) adsorbate list this project shipped
+/// with before the config-driven generalization arc. Every real-data
+/// producer/consumer -- `oc20_ingest`, `main.rs`, `engine.rs`/
+/// `occupancy.rs`, `coverage_report.rs` -- now derives its species identity
+/// at runtime from a LUT's own self-described `SpeciesTable`
+/// (`ReactionLut::species`) instead of this compile-time list, so a build
+/// naming a different species set works without touching any of them. Kept
+/// as a real, still-used constant (test fixtures across the crate build a
+/// `SpeciesTable` that reproduces it exactly, and `--generate-lut`'s
+/// synthetic demo data still exercises this bit-layout convention) rather
+/// than removed outright.
 ///
 /// **Eight is the practical ceiling for this array, not an arbitrary
 /// round number.** `apply_transition` below packs a reaction's reactant
@@ -71,10 +77,9 @@ pub const OCCUPANCY_MASK: u8 = ADS_O | ADS_CO | ADS_H | ADS_OH | ADS_H2O;
 /// or per-reaction bytes roughly doubles.
 pub const SPECIES_BITS: [u8; 5] = [ADS_O, ADS_H, ADS_CO, ADS_OH, ADS_H2O];
 
-/// `SPECIES_BITS.len()`, named for readability at call sites that size a
-/// per-species array/counter (`occupancy::OccupancyCounters`,
-/// `oc20_ingest`'s per-species loops) rather than repeating the array
-/// itself just to measure it.
+/// `SPECIES_BITS.len()`, named for readability at the (now test-only, see
+/// `SPECIES_BITS`'s own doc comment) call sites still measuring it rather
+/// than repeating the array just to do so.
 pub const NUM_SPECIES: usize = SPECIES_BITS.len();
 
 /// The architectural ceiling on how many species this lattice can ever
@@ -455,6 +460,16 @@ impl SpeciesTable {
     /// the fixed `SPECIES_BITS` list.
     pub fn index_of(&self, bit: u8) -> Option<usize> {
         self.entries.iter().position(|&(b, _)| b == bit)
+    }
+
+    /// This table's species index for the species displayed as `name`, if
+    /// any -- the name-based counterpart to `index_of` (bit-based). Used
+    /// by `main.rs`'s `--pressure <name> <value>` flag to resolve a
+    /// user-typed species name against a LUT's own self-described
+    /// identity, without the caller needing to already know that species'
+    /// one-hot bit.
+    pub fn index_of_name(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|(_, n)| n == name)
     }
 
     /// The display name for the species at `index`, if this table names
@@ -894,6 +909,8 @@ mod tests {
         assert_eq!(decoded.name(2), Some("CO"));
         assert_eq!(decoded.index_of(ADS_CO), Some(2));
         assert_eq!(decoded.index_of(ADS_OH), None);
+        assert_eq!(decoded.index_of_name("CO"), Some(2));
+        assert_eq!(decoded.index_of_name("OH"), None);
 
         let _ = std::fs::remove_file(&path);
     }

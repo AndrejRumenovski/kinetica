@@ -199,7 +199,7 @@ fn run_patch_occupancy_gated(
     let reaction_count = lut.len() * ReactionLutBlock::LANES;
     let templates: Vec<_> = (0..reaction_count).map(|id| lut.rate_of(id)).collect();
 
-    let mut counters = OccupancyCounters::new(data, width, seed, &templates);
+    let mut counters = OccupancyCounters::new(data, width, seed, lut.species(), &templates);
     let mut rng = Rng::seeded(seed);
     let mut sim_time = 0.0f64;
 
@@ -522,6 +522,27 @@ fn run_trajectory_writer(rx: Receiver<TrajectoryRecord>, path: &Path) -> io::Res
 mod tests {
     use super::*;
 
+    /// The runtime species identity every occupancy-gated test LUT below
+    /// stamps into its header -- reproduces `layout::SPECIES_BITS`'s exact
+    /// bit/name/order (today's real Pd(111) build). `OccupancyCounters`
+    /// now derives its species-bit-to-index mapping entirely from a LUT's
+    /// own `ReactionLut::species()` rather than a compile-time list (see
+    /// `occupancy.rs`'s Phase 5 changes), so a hand-built `OccupancyGated`
+    /// test LUT with no species table stamped in (the old `layout::
+    /// write_lut`, which leaves `SpeciesTable::default()` -- empty) would
+    /// silently track zero species and never fire anything.
+    fn test_species_table() -> crate::layout::SpeciesTable {
+        use crate::layout::{SpeciesTable, ADS_CO, ADS_H, ADS_H2O, ADS_O, ADS_OH};
+        SpeciesTable::new(vec![
+            (ADS_O, "O".to_string()),
+            (ADS_H, "H".to_string()),
+            (ADS_CO, "CO".to_string()),
+            (ADS_OH, "OH".to_string()),
+            (ADS_H2O, "H2O".to_string()),
+        ])
+        .unwrap()
+    }
+
     #[test]
     fn same_patch_neighbor_returns_none_for_degenerate_1x1_patch() {
         let mut rng = Rng::seeded(1);
@@ -643,7 +664,13 @@ mod tests {
             }
         }
         let blocks = layout::pack_records_into_blocks(records);
-        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        layout::write_lut_with_species(
+            &lut_path,
+            LutKind::OccupancyGated,
+            &blocks,
+            &test_species_table(),
+        )
+        .unwrap();
         let lut = ReactionLut::open(&lut_path).unwrap();
         assert_eq!(lut.kind(), LutKind::OccupancyGated);
 
@@ -722,7 +749,13 @@ mod tests {
             });
         }
         let blocks = layout::pack_records_into_blocks(records);
-        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        layout::write_lut_with_species(
+            &lut_path,
+            LutKind::OccupancyGated,
+            &blocks,
+            &test_species_table(),
+        )
+        .unwrap();
         let lut = ReactionLut::open(&lut_path).unwrap();
 
         run_simulation(
@@ -800,7 +833,13 @@ mod tests {
             })
             .collect();
         let blocks = layout::pack_records_into_blocks(records);
-        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        layout::write_lut_with_species(
+            &lut_path,
+            LutKind::OccupancyGated,
+            &blocks,
+            &test_species_table(),
+        )
+        .unwrap();
         let lut = ReactionLut::open(&lut_path).unwrap();
 
         // Steps far beyond what's needed -- if the domain didn't correctly
@@ -871,7 +910,13 @@ mod tests {
         }
         let blocks = layout::pack_records_into_blocks(records);
         let lut_path = temp_path("pressure_lut");
-        layout::write_lut(&lut_path, LutKind::OccupancyGated, &blocks).unwrap();
+        layout::write_lut_with_species(
+            &lut_path,
+            LutKind::OccupancyGated,
+            &blocks,
+            &test_species_table(),
+        )
+        .unwrap();
         let lut = ReactionLut::open(&lut_path).unwrap();
 
         let run_with_pressure = |tag: &str, pressures: Pressures| -> usize {

@@ -25,7 +25,7 @@
 use std::io::{self, Read};
 use std::path::PathBuf;
 
-use kinetica::layout::{self, ReactionLut, NUM_SPECIES, SPECIES_BITS};
+use kinetica::layout::{self, ReactionLut, SpeciesTable};
 
 /// One `TrajectoryRecord` as `engine.rs` writes it: `sim_time_bits: u64`,
 /// `site_idx: u32`, `reaction_id: u32` -- 16 bytes, `repr(C)`, no padding
@@ -149,6 +149,7 @@ fn value<T: std::str::FromStr>(
 
 fn run(config: &Config) -> io::Result<()> {
     let lut = ReactionLut::open(&config.lut_path)?;
+    let species = lut.species();
 
     let mut bytes = Vec::new();
     std::fs::File::open(&config.trajectory_path)?.read_to_end(&mut bytes)?;
@@ -163,16 +164,11 @@ fn run(config: &Config) -> io::Result<()> {
     let site_count = config.lattice_width * config.lattice_height;
     let mut lattice = vec![layout::VACANT; site_count];
 
-    println!(
-        "event,sim_time,vacant,{}",
-        SPECIES_BITS
-            .iter()
-            .enumerate()
-            .map(|(i, _)| species_name(i))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    print_snapshot(0, 0.0, &lattice);
+    let header_species: Vec<&str> = (0..species.len())
+        .map(|i| species.name(i).unwrap_or("?"))
+        .collect();
+    println!("event,sim_time,vacant,{}", header_species.join(","));
+    print_snapshot(0, 0.0, &lattice, species);
 
     for (i, record) in records.iter().enumerate() {
         let site_idx = record.site_idx as usize;
@@ -184,29 +180,23 @@ fn run(config: &Config) -> io::Result<()> {
 
         let event_number = i + 1;
         if event_number.is_multiple_of(config.sample_every) || event_number == records.len() {
-            print_snapshot(event_number, record.sim_time, &lattice);
+            print_snapshot(event_number, record.sim_time, &lattice, species);
         }
     }
 
     Ok(())
 }
 
-fn species_name(index: usize) -> &'static str {
-    // Mirrors `oc20_ingest.rs`'s `SPECIES_NAMES` -- kept independent since
-    // this tool has no other reason to depend on that binary.
-    ["O", "H", "CO", "OH", "H2O"][index]
-}
-
-fn print_snapshot(event: usize, sim_time: f64, lattice: &[u8]) {
-    let mut counts = [0u64; NUM_SPECIES];
+fn print_snapshot(event: usize, sim_time: f64, lattice: &[u8], species: &SpeciesTable) {
+    let mut counts = vec![0u64; species.len()];
     let mut vacant = 0u64;
     for &state in lattice {
         if state == layout::VACANT {
             vacant += 1;
             continue;
         }
-        if let Some(species) = SPECIES_BITS.iter().position(|&b| b == state) {
-            counts[species] += 1;
+        if let Some(idx) = species.index_of(state) {
+            counts[idx] += 1;
         }
     }
     let counts_str: Vec<String> = counts.iter().map(|c| c.to_string()).collect();

@@ -141,17 +141,23 @@ tested, so the documented build and the tested build now agree.
 | `--patches`           | available CPUs      | Spatial domains / rayon tasks            |
 | `--steps`             | `1000000`           | Gillespie steps per patch                |
 | `--generate-lut <N>`  | —                   | Synthesize `N` demo reactions into `--lut-path` instead of using a real one |
-| `--pressure-o2 <F>`   | `1.0`                | Relative O2 partial pressure — gates O* adsorption |
-| `--pressure-h2 <F>`   | `1.0`                | Relative H2 partial pressure — gates H* adsorption |
-| `--pressure-co <F>`   | `1.0`                | Relative CO partial pressure — gates CO* adsorption |
-| `--pressure-h2o <F>`  | `1.0`                | Relative H2O partial pressure — gates H2O* adsorption (not water splitting) |
+| `--pressure <NAME> <F>` | `1.0`             | Relative partial pressure for species `NAME`, resolved against the LUT's own species table (e.g. `--pressure O 5.0`); repeatable |
+| `--pressure-o2 <F>`   | `1.0`                | Legacy alias for `--pressure O <F>` |
+| `--pressure-h2 <F>`   | `1.0`                | Legacy alias for `--pressure H <F>` |
+| `--pressure-co <F>`   | `1.0`                | Legacy alias for `--pressure CO <F>` |
+| `--pressure-h2o <F>`  | `1.0`                | Legacy alias for `--pressure H2O <F>` (does not affect water splitting) |
 
-The four `--pressure-*` flags are runtime simulator parameters, not baked
-into `reactions.lut` — changing the feed-gas composition never requires
-rebuilding the LUT. They only affect the occupancy-gated engine (real
-data), and only an adsorption channel's propensity (`VACANT -> species`);
-desorption and bimolecular reactions are untouched, since neither consumes
-a gas-phase molecule. See "Gas-phase pressure coupling" below.
+`--pressure` and the four legacy `--pressure-*` aliases are runtime
+simulator parameters, not baked into `reactions.lut` — changing the
+feed-gas composition never requires rebuilding the LUT. A LUT's own
+self-described species table (see "Config-driven ingestion" below)
+resolves the species name; an unrecognized name passed to `--pressure`
+itself is a hard error, while an unmatched legacy alias (e.g. a config
+without an `H2O` species) is silently a no-op. Pressure flags only affect
+the occupancy-gated engine (real data), and only an adsorption channel's
+propensity (`VACANT -> species`); desorption and bimolecular reactions are
+untouched, since neither consumes a gas-phase molecule. See "Gas-phase
+pressure coupling" below.
 
 ## Visualizing a run
 
