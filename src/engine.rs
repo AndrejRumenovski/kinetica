@@ -897,7 +897,7 @@ mod tests {
         let elevated_co = run_with_pressure(
             "elevated",
             Pressures {
-                values: [1.0, 1.0, 20.0, 1.0, 1.0],
+                values: [1.0, 1.0, 20.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             },
         );
 

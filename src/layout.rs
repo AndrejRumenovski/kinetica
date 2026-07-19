@@ -77,6 +77,16 @@ pub const SPECIES_BITS: [u8; 5] = [ADS_O, ADS_H, ADS_CO, ADS_OH, ADS_H2O];
 /// itself just to measure it.
 pub const NUM_SPECIES: usize = SPECIES_BITS.len();
 
+/// The architectural ceiling on how many species this lattice can ever
+/// track -- the one-hot-byte-in-a-`u16`-mask packing `SPECIES_BITS`'s doc
+/// comment describes caps any species list at 8 (`0x01..=0x80`), not just
+/// today's 5. Per-species arrays that need to stay valid across a future
+/// runtime-configurable species set (rather than only today's fixed 5)
+/// are sized to this constant instead of `NUM_SPECIES`, so widening the
+/// *active* species count later never requires resizing them again --
+/// only entries `NUM_SPECIES..MAX_SPECIES` go unused meanwhile.
+pub const MAX_SPECIES: usize = 8;
+
 /// Apply a packed `(reactant_mask << 8) | product_mask` transition to a
 /// site's current occupancy byte: clear the reactant's bits and OR in the
 /// product's. Shared by `engine.rs` (which also handles trajectory

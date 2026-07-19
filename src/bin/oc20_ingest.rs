@@ -70,7 +70,7 @@
 use std::io;
 use std::path::PathBuf;
 
-use kinetica::layout::{self, ReactionLutBlock, SPECIES_BITS};
+use kinetica::layout::{self, ReactionLutBlock, MAX_SPECIES, SPECIES_BITS};
 use kinetica::oc20e_format::{
     read_bimolecular_records, read_energy_records, BiEnergyRecord, EnergyRecord,
 };
@@ -304,8 +304,8 @@ fn rate_from_activation(activation_ev: f64, config: &Config) -> f64 {
 fn filter_with_fallback(
     records: &[EnergyRecord],
     config: &Config,
-) -> [Vec<EnergyRecord>; SPECIES_BITS.len()] {
-    let mut by_species: [Vec<EnergyRecord>; SPECIES_BITS.len()] = Default::default();
+) -> [Vec<EnergyRecord>; MAX_SPECIES] {
+    let mut by_species: [Vec<EnergyRecord>; MAX_SPECIES] = Default::default();
 
     let Some(metal) = config.metal else {
         for &rec in records {
@@ -321,7 +321,7 @@ fn filter_with_fallback(
         .collect();
     let metal_name = METALS[metal as usize];
 
-    for (species, slot) in by_species.iter_mut().enumerate() {
+    for species in 0..SPECIES_BITS.len() {
         let metal_only_species: Vec<EnergyRecord> = metal_only
             .iter()
             .copied()
@@ -329,7 +329,7 @@ fn filter_with_fallback(
             .collect();
 
         let Some(facet) = config.facet else {
-            *slot = metal_only_species;
+            by_species[species] = metal_only_species;
             continue;
         };
 
@@ -348,9 +348,9 @@ fn filter_with_fallback(
                 filtered.len(),
                 metal_only_species.len()
             );
-            *slot = metal_only_species;
+            by_species[species] = metal_only_species;
         } else {
-            *slot = filtered;
+            by_species[species] = filtered;
         }
     }
 
@@ -452,7 +452,7 @@ fn run(config: &Config) -> io::Result<()> {
     // therefore always show 0 CO records; that is expected, not a bug.
     let by_species = filter_with_fallback(&energy_records, config);
 
-    let mut bucketed_by_species: [Vec<BucketSummary>; SPECIES_BITS.len()] = Default::default();
+    let mut bucketed_by_species: [Vec<BucketSummary>; MAX_SPECIES] = Default::default();
     for species in 0..SPECIES_BITS.len() {
         let count = by_species[species].len();
         let real_ea_count = by_species[species]
@@ -510,7 +510,7 @@ fn run(config: &Config) -> io::Result<()> {
     // monomolecular desorption reaction below rather than supplementing
     // it; adsorption is untouched, since these records say nothing about
     // the adsorption direction.
-    let mut replaces_desorption = [false; SPECIES_BITS.len()];
+    let mut replaces_desorption = [false; MAX_SPECIES];
     for rec in &bimolecular_records {
         if !rec.is_dissociative && rec.species_a == rec.species_b {
             replaces_desorption[rec.species_a as usize] = true;

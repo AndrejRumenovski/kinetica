@@ -213,7 +213,9 @@ fn run(config: &Config) -> std::io::Result<()> {
     // `occupancy::pressure_factor` always treats as pressure-neutral (see
     // its doc comment), so this slot is never actually read. Kept at 1.0
     // rather than omitted so the array stays indexed exactly like
-    // `layout::SPECIES_BITS`.
+    // `layout::SPECIES_BITS`. Indices 5..MAX_SPECIES (beyond today's 5
+    // active species) are unused padding, same reasoning as
+    // `Pressures.values`'s own doc comment.
     let pressures = kinetica::occupancy::Pressures {
         values: [
             config.pressure_o2,
@@ -221,6 +223,9 @@ fn run(config: &Config) -> std::io::Result<()> {
             config.pressure_co,
             1.0,
             config.pressure_h2o,
+            1.0,
+            1.0,
+            1.0,
         ],
     };
 

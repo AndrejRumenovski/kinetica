@@ -53,7 +53,7 @@
 
 use crate::gillespie::Rng;
 use crate::layout::{
-    self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, NUM_SPECIES, SPECIES_BITS,
+    self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, MAX_SPECIES, SPECIES_BITS,
 };
 
 /// Quantile buckets `oc20_ingest`'s `bucket_by_quantile` splits each
@@ -151,15 +151,18 @@ fn species_index(species_bit: u8) -> Option<usize> {
 /// adsorption kinetics -- the same rate-constant table applied regardless
 /// of how much of each gas was actually being fed in.
 ///
-/// Sized `NUM_SPECIES`, but index 3 (OH) is always ignored: OH only ever
-/// forms via the heteroatomic dissociative-adsorption path (water
-/// splitting), which `pressure_factor` short-circuits to `1.0` *before*
-/// ever indexing into this array -- see its doc comment for why a species
-/// that only ever appears as one side of a two-species gas reaction can't
-/// correctly be gated by looking up its own slot. H2O (index 4) *is* a
-/// real, used slot: `star + H2O(g) -> H2Ostar` is an ordinary single-gas
-/// monomolecular adsorption, same shape as O2/H2/CO, so it gates exactly
-/// like they do.
+/// Sized `MAX_SPECIES` (the architectural ceiling, not today's active
+/// `NUM_SPECIES`) so a future runtime-configurable species set never
+/// needs this array resized -- only indices `NUM_SPECIES..MAX_SPECIES` go
+/// unused for today's fixed 5-species build. Index 3 (OH) is always
+/// ignored: OH only ever forms via the heteroatomic dissociative-
+/// adsorption path (water splitting), which `pressure_factor`
+/// short-circuits to `1.0` *before* ever indexing into this array -- see
+/// its doc comment for why a species that only ever appears as one side
+/// of a two-species gas reaction can't correctly be gated by looking up
+/// its own slot. H2O (index 4) *is* a real, used slot: `star + H2O(g) ->
+/// H2Ostar` is an ordinary single-gas monomolecular adsorption, same
+/// shape as O2/H2/CO, so it gates exactly like they do.
 ///
 /// Desorption and bimolecular *recombination* templates (CO-oxidation,
 /// H2-recombination) are untouched -- pressure only gates a reaction that
@@ -174,7 +177,8 @@ pub struct Pressures {
     /// Relative partial pressure for each species in `SPECIES_BITS`
     /// order; index 3 (OH) is permanently unused since OH* only ever
     /// forms via the pressure-neutral heteroatomic water-splitting path.
-    pub values: [f64; NUM_SPECIES],
+    /// Indices `NUM_SPECIES..MAX_SPECIES` are unused padding.
+    pub values: [f64; MAX_SPECIES],
 }
 
 impl Pressures {
@@ -182,7 +186,7 @@ impl Pressures {
     /// module had before gas-phase pressure coupling existed.
     pub const fn ones() -> Self {
         Pressures {
-            values: [1.0; NUM_SPECIES],
+            values: [1.0; MAX_SPECIES],
         }
     }
 }
@@ -260,13 +264,15 @@ pub struct OccupancyCounters {
     /// adsorption template for that species/bucket fires against. A single
     /// vacant site is a member of all `NUM_SPECIES` of these simultaneously
     /// (once per species, generally in a different bucket per species,
-    /// since any species could in principle adsorb there).
-    vacant_sets: [BucketedSet; NUM_SPECIES],
+    /// since any species could in principle adsorb there). Sized
+    /// `MAX_SPECIES` (see `Pressures.values`'s doc comment for why); slots
+    /// `NUM_SPECIES..MAX_SPECIES` are constructed but never populated.
+    vacant_sets: [BucketedSet; MAX_SPECIES],
     /// `occupied_sets[species]`: free-list of sites currently occupied *by
     /// that species*, bucketed the same way -- the live pool a desorption
     /// template fires against. A site is a member of at most one of these
     /// at a time (whichever species currently occupies it, if any).
-    occupied_sets: [BucketedSet; NUM_SPECIES],
+    occupied_sets: [BucketedSet; MAX_SPECIES],
     /// Live count of adjacent (O*, CO*) site pairs -- CO-oxidation's
     /// propensity. Not bucketed: `oc20_ingest` keeps bimolecular real
     /// barriers as individually-real, un-averaged records (there are only
@@ -643,7 +649,7 @@ fn neighbor_with_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, VACANT};
+    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, NUM_SPECIES, VACANT};
 
     fn rng() -> Rng {
         Rng::seeded(42)
@@ -878,7 +884,7 @@ mod tests {
     #[test]
     fn pressure_factor_only_scales_adsorption_templates() {
         let pressures = Pressures {
-            values: [2.0, 3.0, 5.0, 1.0, 11.0],
+            values: [2.0, 3.0, 5.0, 1.0, 11.0, 1.0, 1.0, 1.0],
         };
         // Adsorption: pressure_factor equals that species' own pressure.
         assert_eq!(pressure_factor(&ads_template(ADS_O, 0, 1), &pressures), 2.0);
@@ -944,7 +950,7 @@ mod tests {
         let doubled = counters.total_propensity(
             &templates,
             &Pressures {
-                values: [1.0, 1.0, 2.0, 1.0, 1.0],
+                values: [1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             },
         );
         assert!(
@@ -959,7 +965,7 @@ mod tests {
         let des_under_pressure = counters.total_propensity(
             &des_templates,
             &Pressures {
-                values: [1.0, 1.0, 2.0, 1.0, 1.0],
+                values: [1.0, 1.0, 2.0, 1.0, 1.0, 1.0, 1.0, 1.0],
             },
         );
         assert_eq!(des_baseline, des_under_pressure);
@@ -1204,7 +1210,7 @@ mod tests {
     #[test]
     fn pressure_couples_dissociative_adsorption_same_as_monomolecular() {
         let pressures = Pressures {
-            values: [1.0, 7.0, 1.0, 1.0, 1.0],
+            values: [1.0, 7.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         };
         let template = dissociative_ads_template(ADS_H, 1);
         assert_eq!(pressure_factor(&template, &pressures), 7.0);
@@ -1315,7 +1321,7 @@ mod tests {
     #[test]
     fn pressure_factor_is_neutral_for_heteroatomic_dissociative_adsorption() {
         let pressures = Pressures {
-            values: [1.0, 99.0, 1.0, 1.0, 1.0],
+            values: [1.0, 99.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
         }; // H2 pressure cranked up
         let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1);
         assert_eq!(
