@@ -107,6 +107,7 @@ tested, so the documented build and the tested build now agree.
 | `src/layout.rs`          | Bit-packed mmap'd lattice, cache-line-aligned `ReactionLutBlock` reaction table, LUT packing/writing, magic-header `LutKind`, self-described `SpeciesTable` in the LUT header |
 | `src/config.rs`          | Hand-rolled parser for a sectioned text config file (metal/facet/BEP/species/bimolecular) driving `oc20_ingest --config` |
 | `configs/pd111.conf`     | The config this repo's own `reactions.lut` is built from -- Pd(111), 5 real species (O, H, CO, OH, H2O) |
+| `configs/pd111_ohco_subset.conf` | A deliberately narrower 3-species (O, H, CO) config -- proves species-set generality against the same frozen real fixtures, see `tests/subset_config_regression.rs` |
 | `src/topology.rs`        | Neighbor topology (hexagonal, fcc(111) -- six neighbors per site) shared by the occupancy-gated engine and the bimolecular partner search |
 | `src/gillespie.rs`       | O(1) partial-propensity composition-rejection (SSA-CR) reaction sampler, fixed-point propensity arithmetic -- the `Static`/`--generate-lut` engine |
 | `src/occupancy.rs`       | Live per-patch occupancy counters + O(1) free-list site selection (bimolecular pair search still bounded-rejection) -- the `OccupancyGated`/real-data engine |
@@ -439,6 +440,24 @@ chemistry pipeline (new species, different BEP defaults, a different
 bucket count) will need to update this test's hardcoded expected reaction
 count/histogram — a deliberate cost, matching this project's "verify,
 don't assume" approach to real-data behavior changes elsewhere.
+
+**`tests/subset_config_regression.rs` is a second regression test against
+the same frozen fixtures, proving species-set generality rather than
+Pd(111)-specific correctness** — it drives the same
+`pd111_{energies,bimolecular}.bin` through
+[`configs/pd111_ohco_subset.conf`](configs/pd111_ohco_subset.conf) (O, H,
+CO only) instead of the full 5-species config, and asserts a genuinely
+smaller reaction count (22, down from 34), a 3-species self-described LUT
+header, and the same no-corrupted-site + exact-histogram checks. Writing
+this test for real (not just reasoning about the config schema in the
+abstract) caught a genuine bug: `oc20_ingest`'s printed reaction-count
+breakdown used to derive its "recombination bimolecular" figure by
+subtraction, which silently mislabeled the two real bimolecular records
+this subset config's species set doesn't cover (both name OH, which the
+subset never declares) as "recombination" instead of reflecting that they
+built zero reactions. Fixed by counting both categories directly in the
+same loop that populates the LUT, so the two counts can no longer drift
+apart — see `oc20_ingest.rs`'s own comment at that loop.
 
 ## Occupancy-gated kMC
 
@@ -783,6 +802,21 @@ mirrors `src/config.rs`'s own test module case-for-case — same example
 config text, same malformed-input error cases — so the two parsers are
 checked against one shared contract: `cd scripts && python3 -m unittest
 test_kinetica_config -v`.
+
+**Eight species is the ceiling, not a target.** The one-hot species byte
+`layout.rs` packs into a `u16` transition (see `SPECIES_BITS`'s own doc
+comment) caps any config's `[species]` section at 8 entries — a config
+can declare fewer, though, and
+[`configs/pd111_ohco_subset.conf`](configs/pd111_ohco_subset.conf) proves
+it: the same O, H, CO the real Pd(111) build tracks, with OH and H2O (and
+the water-splitting `[bimolecular]` entry that names OH) dropped
+entirely. `tests/subset_config_regression.rs` builds and runs it against
+the same frozen real fixtures `tests/real_data_regression.rs` uses (no
+new binary data committed) and asserts a genuinely smaller reaction set
+(22 real reactions, down from 34) and a 3-species self-described LUT
+header — the config-driven generalization arc's actual point: a
+different species set, wider *or* narrower, is a config-file edit now,
+not a source change.
 
 ### OC20
 

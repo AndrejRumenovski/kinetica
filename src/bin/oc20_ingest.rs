@@ -627,7 +627,19 @@ fn run(config: &Config) -> io::Result<()> {
     // bimolecular templates -- see `occupancy::OccupancyCounters::
     // live_count`): there are only a handful of these real barriers, not
     // enough to meaningfully quantile-split.
+    // Both counted directly in the loop below, not derived by subtracting
+    // one from `bimolecular_records.len()` -- a record whose species index
+    // this `--config` doesn't declare hits the `continue` a few lines down
+    // and contributes to neither count, so `bimolecular_records.len() -
+    // dissociative_bimolecular_count` over-counts "recombination" by
+    // exactly the number of skipped records (a real bug this project's
+    // Phase 7 generality config, `configs/pd111_ohco_subset.conf`, caught:
+    // the frozen Pd(111) fixture's 2 real bimolecular records both name OH,
+    // which that config doesn't declare, and the old subtraction-based
+    // count silently mislabeled both as "recombination" instead of
+    // reflecting that they built zero reactions).
     let mut dissociative_bimolecular_count = 0usize;
+    let mut recombination_bimolecular_count = 0usize;
     for rec in &bimolecular_records {
         // `oc20e_format::read_bimolecular_records` only bounds-checks
         // against the architectural `MAX_SPECIES` ceiling, not this run's
@@ -657,6 +669,7 @@ fn run(config: &Config) -> io::Result<()> {
         } else {
             // transition_a/b = species_0x00 (each site: occupied -> vacant).
             raw_rates.push((k_fwd, (bit_a as u16) << 8, (bit_b as u16) << 8, true, 0));
+            recombination_bimolecular_count += 1;
         }
     }
 
@@ -701,8 +714,6 @@ fn run(config: &Config) -> io::Result<()> {
         )
         .collect();
 
-    let recombination_bimolecular_count =
-        bimolecular_records.len() - dissociative_bimolecular_count;
     println!(
         "oc20_ingest: built {} reactions ({} monomolecular adsorption + {} desorption + \
          {} homoatomic dissociative-adsorption bimolecular + {} heteroatomic dissociative \
