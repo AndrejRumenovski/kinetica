@@ -52,9 +52,7 @@
 //! free-list above was built for).
 
 use crate::gillespie::Rng;
-use crate::layout::{
-    self, ReactionRecord, ADS_CO, ADS_H, ADS_O, ADS_OH, MAX_SPECIES, SPECIES_BITS,
-};
+use crate::layout::{self, ReactionRecord, MAX_SPECIES, SPECIES_BITS};
 
 /// Quantile buckets `oc20_ingest`'s `bucket_by_quantile` splits each
 /// species' real DFT samples into. Must agree with the ingest tool: the
@@ -246,12 +244,119 @@ pub fn site_bucket(site_idx: usize, species_bit: u8, seed: u64) -> usize {
     (z % BUCKETS_PER_SPECIES as u64) as usize
 }
 
-/// True iff the unordered pair `{a, b}` equals `{x, y}` -- used to count
-/// an adjacent-site pair regardless of which of the two sites is "first"
-/// in whatever order they happen to be visited.
-#[inline]
-fn pair_matches(a: u8, b: u8, x: u8, y: u8) -> bool {
-    (a == x && b == y) || (a == y && b == x)
+/// Live count of every DISTINCT bimolecular reactant pair a LUT's own
+/// templates actually name, replacing what used to be four individually
+/// hardcoded counters (`co_ox_pairs`/`h2_pairs`/`h_oh_pairs`/`vacant_pairs`)
+/// tied specifically to Pd(111)'s chemistry. Built once from `templates`
+/// at `OccupancyCounters::new`: each bimolecular template's reactant pair
+/// (e.g. `(ADS_O, ADS_CO)`, or `(VACANT, VACANT)` for any dissociative-
+/// adsorption template regardless of which two species it produces) is
+/// canonicalized (order-independent) and registered as a zero-initialized
+/// slot; templates that name the same pair (like water splitting's
+/// forward and reverse) share one slot. Kept in sync incrementally the
+/// same way the old fields were, via `add`/`remove` -- called once per
+/// touched neighbor from `OccupancyCounters::add_pair`/`remove_pair`.
+///
+/// Fixed-capacity, no heap allocation, no hashing: `CAPACITY` is the
+/// worst-case number of unordered pairs (with repetition) over
+/// `MAX_SPECIES + 1` symbols -- every one-hot species bit plus `VACANT`.
+/// In practice a real LUT names only a handful of distinct pairs (4 for
+/// today's Pd(111) data), so the linear scan over `keys[..len]` on the
+/// hot path is a handful of byte comparisons, not the full capacity.
+///
+/// A reactant pair with no matching key -- an adjacency this LUT's
+/// chemistry doesn't name, or (only reachable from corrupted/adversarial
+/// LUT bytes that aren't valid one-hot species values) one `register`
+/// had no room left to track -- contributes `0` to `count`, matching the
+/// old exhaustive-match's "fails safe, never selected" semantics for an
+/// unrecognized pair rather than panicking or silently miscounting
+/// against an unrelated pool.
+struct PairTable {
+    keys: [(u8, u8); Self::CAPACITY],
+    counts: [u32; Self::CAPACITY],
+    len: usize,
+}
+
+impl PairTable {
+    /// `MAX_SPECIES` one-hot species bits plus `VACANT` = `MAX_SPECIES + 1`
+    /// distinct byte values a reactant side can hold; unordered pairs with
+    /// repetition over that many symbols is `n * (n + 1) / 2`.
+    const SYMBOLS: usize = MAX_SPECIES + 1;
+    const CAPACITY: usize = Self::SYMBOLS * (Self::SYMBOLS + 1) / 2;
+
+    /// Order the pair so `(a, b)` and `(b, a)` always produce the same
+    /// key -- a real lattice scan visits an adjacent pair from an
+    /// arbitrary side, so `add`/`remove`/`count` must agree regardless of
+    /// argument order.
+    fn canonical(a: u8, b: u8) -> (u8, u8) {
+        if a <= b {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    fn empty() -> Self {
+        PairTable {
+            keys: [(0, 0); Self::CAPACITY],
+            counts: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    /// Build a table whose keys are exactly the distinct reactant pairs
+    /// named by `templates`'s bimolecular records.
+    fn from_templates(templates: &[ReactionRecord]) -> Self {
+        let mut table = Self::empty();
+        for t in templates {
+            if !t.is_bimolecular {
+                continue;
+            }
+            let a = (t.transition_a >> 8) as u8;
+            let b = (t.transition_b >> 8) as u8;
+            table.register(Self::canonical(a, b));
+        }
+        table
+    }
+
+    fn slot(&self, key: (u8, u8)) -> Option<usize> {
+        self.keys[..self.len].iter().position(|&k| k == key)
+    }
+
+    fn register(&mut self, key: (u8, u8)) {
+        if self.slot(key).is_some() {
+            return;
+        }
+        // Every one of `SYMBOLS` possible reactant bytes pairs with every
+        // other at most once, so a well-formed LUT can never name more
+        // than `CAPACITY` distinct pairs -- this bound only matters
+        // defensively against corrupted/adversarial reactant bytes that
+        // aren't valid one-hot species values (see the struct doc
+        // comment: a pair this table has no room left for just
+        // contributes 0, forever, rather than indexing out of bounds).
+        if self.len < Self::CAPACITY {
+            self.keys[self.len] = key;
+            self.len += 1;
+        }
+    }
+
+    fn add(&mut self, a: u8, b: u8) {
+        if let Some(i) = self.slot(Self::canonical(a, b)) {
+            self.counts[i] += 1;
+        }
+    }
+
+    fn remove(&mut self, a: u8, b: u8) {
+        if let Some(i) = self.slot(Self::canonical(a, b)) {
+            self.counts[i] = self.counts[i].saturating_sub(1);
+        }
+    }
+
+    fn count(&self, a: u8, b: u8) -> u32 {
+        self.slot(Self::canonical(a, b))
+            .map(|i| self.counts[i])
+            .unwrap_or(0)
+    }
 }
 
 /// Live, per-patch counts the occupancy-gated selector needs to weight
@@ -273,48 +378,29 @@ pub struct OccupancyCounters {
     /// template fires against. A site is a member of at most one of these
     /// at a time (whichever species currently occupies it, if any).
     occupied_sets: [BucketedSet; MAX_SPECIES],
-    /// Live count of adjacent (O*, CO*) site pairs -- CO-oxidation's
-    /// propensity. Not bucketed: `oc20_ingest` keeps bimolecular real
-    /// barriers as individually-real, un-averaged records (there are only
-    /// a handful of them), so there is one shared pool of matching pairs
-    /// for the CO-oxidation templates to draw from, not per-bucket ones.
-    co_ox_pairs: u32,
-    /// Live count of adjacent (H*, H*) site pairs -- H2-recombination's
-    /// propensity.
-    h2_pairs: u32,
-    /// Live count of adjacent (H*, OH*) site pairs -- the associative-
-    /// desorption (reverse) half of water splitting's propensity
-    /// (`H* + OH* -> H2O(g) + 2*`). Mirrors `co_ox_pairs`/`h2_pairs`.
-    h_oh_pairs: u32,
-    /// Live count of adjacent (VACANT, VACANT) site pairs -- the shared
-    /// pool every genuine two-site dissociative-adsorption template
-    /// (`2* + O2(g) -> 2 O*`, `2* + H2(g) -> 2 H*`, `2* + H2O(g) -> H* +
-    /// OH*`) draws its propensity from. Deliberately one shared counter,
-    /// not per-species/per-reaction: any adjacent vacant pair is a real
-    /// landing site for *any* of these, so their templates compete for
-    /// the same physical pool, same as monomolecular adsorption templates
-    /// already compete for `vacant_count`'s single-site pool -- only each
-    /// template's own `rate_q16` (and, via `pressure_factor`, its own
-    /// species' relative pressure where applicable) differentiates them.
-    vacant_pairs: u32,
+    /// Live count of every distinct bimolecular reactant pair this patch's
+    /// templates name -- see `PairTable`'s own doc comment. Replaces what
+    /// used to be four individually-named fields
+    /// (`co_ox_pairs`/`h2_pairs`/`h_oh_pairs`/`vacant_pairs`) hardcoded to
+    /// Pd(111)'s specific chemistry.
+    pairs: PairTable,
 }
 
 impl OccupancyCounters {
     /// One O(N) pass over `patch_data`'s initial state, seeding every
-    /// counter from scratch. Pair counting only looks at each site's
+    /// counter from scratch. `templates` seeds `pairs`' distinct-pair
+    /// slots (see `PairTable::from_templates`) before the scan below ever
+    /// calls `add_pair`. Pair counting only looks at each site's
     /// `topology::forward_neighbors` (not all up to six) specifically so a
     /// full scan counts every unordered adjacent pair exactly once --
     /// checking every neighbor from every site would double-count each
     /// pair, once from each side.
-    pub fn new(patch_data: &[u8], width: usize, seed: u64) -> Self {
+    pub fn new(patch_data: &[u8], width: usize, seed: u64, templates: &[ReactionRecord]) -> Self {
         let site_count = patch_data.len();
         let mut counters = OccupancyCounters {
             vacant_sets: std::array::from_fn(|_| BucketedSet::new(site_count)),
             occupied_sets: std::array::from_fn(|_| BucketedSet::new(site_count)),
-            co_ox_pairs: 0,
-            h2_pairs: 0,
-            h_oh_pairs: 0,
-            vacant_pairs: 0,
+            pairs: PairTable::from_templates(templates),
         };
         if width == 0 {
             return counters;
@@ -369,33 +455,11 @@ impl OccupancyCounters {
     }
 
     fn add_pair(&mut self, a: u8, b: u8) {
-        if pair_matches(a, b, ADS_O, ADS_CO) {
-            self.co_ox_pairs += 1;
-        }
-        if a == ADS_H && b == ADS_H {
-            self.h2_pairs += 1;
-        }
-        if pair_matches(a, b, ADS_H, ADS_OH) {
-            self.h_oh_pairs += 1;
-        }
-        if a == layout::VACANT && b == layout::VACANT {
-            self.vacant_pairs += 1;
-        }
+        self.pairs.add(a, b);
     }
 
     fn remove_pair(&mut self, a: u8, b: u8) {
-        if pair_matches(a, b, ADS_O, ADS_CO) {
-            self.co_ox_pairs = self.co_ox_pairs.saturating_sub(1);
-        }
-        if a == ADS_H && b == ADS_H {
-            self.h2_pairs = self.h2_pairs.saturating_sub(1);
-        }
-        if pair_matches(a, b, ADS_H, ADS_OH) {
-            self.h_oh_pairs = self.h_oh_pairs.saturating_sub(1);
-        }
-        if a == layout::VACANT && b == layout::VACANT {
-            self.vacant_pairs = self.vacant_pairs.saturating_sub(1);
-        }
+        self.pairs.remove(a, b);
     }
 
     /// Incrementally update every counter affected by one site's
@@ -442,31 +506,19 @@ impl OccupancyCounters {
     /// pattern -- the live weight its propensity is scaled by.
     fn live_count(&self, template: &ReactionRecord) -> u64 {
         if template.is_bimolecular {
+            // A single `PairTable` lookup replaces what used to be an
+            // exhaustive match over four hardcoded pool names: any
+            // dissociative adsorption (2* + gas -> 2 species*, homoatomic
+            // like O2/H2 or heteroatomic like water splitting) canonicalizes
+            // to the same `(VACANT, VACANT)` key regardless of which two
+            // species it produces, so those templates naturally share one
+            // slot, same as the old dedicated `vacant_pairs` counter -- and
+            // a pair this LUT's templates never named (see
+            // `PairTable::from_templates`) returns 0, the same fail-safe
+            // "never selected" behavior the old match's `else` arm gave.
             let reactant_a = (template.transition_a >> 8) as u8;
             let reactant_b = (template.transition_b >> 8) as u8;
-            // Exhaustive match on which live pair-count pool this
-            // template's reactant *pair* draws from, keyed off the
-            // reactant species on both sides (not just site A) -- an
-            // explicit match rather than an if/else chain so adding a new
-            // bimolecular reaction kind that doesn't fit any existing
-            // pool fails safe (0, never selected) instead of silently
-            // being miscounted against an unrelated pool.
-            if reactant_a == layout::VACANT && reactant_b == layout::VACANT {
-                // Any dissociative adsorption (2* + gas -> 2 species*,
-                // homoatomic like O2/H2 or heteroatomic like water
-                // splitting): both sites start VACANT -- draws from the
-                // shared adjacent-vacant-pair pool every such template
-                // competes for (see `vacant_pairs`'s doc comment).
-                self.vacant_pairs as u64
-            } else if pair_matches(reactant_a, reactant_b, ADS_O, ADS_CO) {
-                self.co_ox_pairs as u64
-            } else if reactant_a == ADS_H && reactant_b == ADS_H {
-                self.h2_pairs as u64
-            } else if pair_matches(reactant_a, reactant_b, ADS_H, ADS_OH) {
-                self.h_oh_pairs as u64
-            } else {
-                0
-            }
+            self.pairs.count(reactant_a, reactant_b) as u64
         } else {
             let reactant_mask = (template.transition_a >> 8) as u8;
             let product_mask = (template.transition_a & 0xFF) as u8;
@@ -612,12 +664,12 @@ impl OccupancyCounters {
                 return Some((candidate, partner));
             }
         }
-        // Deterministic fallback: `co_ox_pairs`/`h2_pairs`/`vacant_pairs`
-        // (whichever backs this template's `live_count`) being positive
-        // means a matching pair genuinely exists somewhere in the patch --
-        // guaranteed to succeed, same as `find_monomolecular_site`'s
-        // free-list lookup, just via a scan rather than an O(1) pick since
-        // pairs aren't bucketed (see the module-level doc comment).
+        // Deterministic fallback: this template's `PairTable` slot (see
+        // `live_count`) being positive means a matching pair genuinely
+        // exists somewhere in the patch -- guaranteed to succeed, same as
+        // `find_monomolecular_site`'s free-list lookup, just via a scan
+        // rather than an O(1) pick since pairs aren't bucketed (see the
+        // module-level doc comment).
         (0..n).find_map(|candidate| {
             if patch_data[candidate] != species_a_bit {
                 return None;
@@ -649,7 +701,7 @@ fn neighbor_with_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, NUM_SPECIES, VACANT};
+    use crate::layout::{ADS_CO, ADS_H, ADS_H2O, ADS_O, ADS_OH, NUM_SPECIES, VACANT};
 
     fn rng() -> Rng {
         Rng::seeded(42)
@@ -720,8 +772,13 @@ mod tests {
         assert!(mismatches > 100);
     }
 
-    fn brute_force_counters(patch_data: &[u8], width: usize, seed: u64) -> OccupancyCounters {
-        OccupancyCounters::new(patch_data, width, seed)
+    fn brute_force_counters(
+        patch_data: &[u8],
+        width: usize,
+        seed: u64,
+        templates: &[ReactionRecord],
+    ) -> OccupancyCounters {
+        OccupancyCounters::new(patch_data, width, seed, templates)
     }
 
     fn vacant_total(counters: &OccupancyCounters, species: usize) -> u32 {
@@ -740,7 +797,7 @@ mod tests {
     fn new_counts_vacant_and_occupied_sites_correctly() {
         let width = 4;
         let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
-        let counters = OccupancyCounters::new(&data, width, 99);
+        let counters = OccupancyCounters::new(&data, width, 99, &[]);
 
         let total_vacant: u32 = (0..3).map(|s| vacant_total(&counters, s)).sum();
         // Every vacant site contributes to all 3 species' vacant counts.
@@ -771,9 +828,13 @@ mod tests {
         // O  CO
         // H  H
         let data = vec![ADS_O, ADS_CO, ADS_H, ADS_H];
-        let counters = OccupancyCounters::new(&data, width, 5);
-        assert_eq!(counters.co_ox_pairs, 1); // (0,1) horizontal
-        assert_eq!(counters.h2_pairs, 1); // (2,3) horizontal
+        let templates = [
+            bimolecular_template(ADS_O, ADS_CO, 1),
+            bimolecular_template(ADS_H, ADS_H, 1),
+        ];
+        let counters = OccupancyCounters::new(&data, width, 5, &templates);
+        assert_eq!(counters.pairs.count(ADS_O, ADS_CO), 1); // (0,1) horizontal
+        assert_eq!(counters.pairs.count(ADS_H, ADS_H), 1); // (2,3) horizontal
     }
 
     #[test]
@@ -788,7 +849,11 @@ mod tests {
             *s = states[rng.next_u32_below(4) as usize];
         }
 
-        let mut counters = OccupancyCounters::new(&data, width, seed);
+        let templates = [
+            bimolecular_template(ADS_O, ADS_CO, 1),
+            bimolecular_template(ADS_H, ADS_H, 1),
+        ];
+        let mut counters = OccupancyCounters::new(&data, width, seed, &templates);
 
         for _ in 0..500 {
             let site = rng.next_u32_below((width * height) as u32) as usize;
@@ -798,7 +863,7 @@ mod tests {
             counters.on_occupancy_change(&data, site, width, height, old, new, seed);
         }
 
-        let brute = brute_force_counters(&data, width, seed);
+        let brute = brute_force_counters(&data, width, seed, &templates);
         // Compare exact set *membership*, not raw dense-array order --
         // swap-remove reorders a bucket's dense list, so two `BucketedSet`s
         // holding the same sites can differ in element order depending on
@@ -824,8 +889,14 @@ mod tests {
                 );
             }
         }
-        assert_eq!(counters.co_ox_pairs, brute.co_ox_pairs);
-        assert_eq!(counters.h2_pairs, brute.h2_pairs);
+        assert_eq!(
+            counters.pairs.count(ADS_O, ADS_CO),
+            brute.pairs.count(ADS_O, ADS_CO)
+        );
+        assert_eq!(
+            counters.pairs.count(ADS_H, ADS_H),
+            brute.pairs.count(ADS_H, ADS_H)
+        );
     }
 
     #[test]
@@ -921,7 +992,7 @@ mod tests {
     fn total_propensity_with_ones_pressure_matches_unpressured_formula() {
         let width = 4;
         let data = vec![VACANT, ADS_O, ADS_H, ADS_CO, VACANT, VACANT, ADS_O, ADS_O];
-        let counters = OccupancyCounters::new(&data, width, 3);
+        let counters = OccupancyCounters::new(&data, width, 3, &[]);
         let bucket = site_bucket(0, ADS_O, 3) as u8;
         let templates = vec![
             ads_template(ADS_O, bucket, 1000),
@@ -940,7 +1011,7 @@ mod tests {
     fn total_propensity_scales_linearly_with_adsorption_pressure() {
         let width = 4;
         let data = vec![VACANT; 16];
-        let counters = OccupancyCounters::new(&data, width, 9);
+        let counters = OccupancyCounters::new(&data, width, 9, &[]);
         let bucket = site_bucket(0, ADS_CO, 9) as u8;
         // Only a CO adsorption template -- every VACANT site matches, so
         // this isolates the pressure multiplier's effect cleanly.
@@ -982,7 +1053,7 @@ mod tests {
         let mut data = vec![VACANT; width * height];
         let o_site = 37usize;
         data[o_site] = ADS_O;
-        let counters = OccupancyCounters::new(&data, width, seed);
+        let counters = OccupancyCounters::new(&data, width, seed, &[]);
 
         let bucket = site_bucket(o_site, ADS_O, seed) as u8;
         let templates = vec![des_template(ADS_O, bucket, u32::MAX)];
@@ -1013,7 +1084,7 @@ mod tests {
         let mut data = vec![ADS_CO; width * height];
         let vacant_site = 5usize;
         data[vacant_site] = VACANT;
-        let counters = OccupancyCounters::new(&data, width, seed);
+        let counters = OccupancyCounters::new(&data, width, seed, &[]);
 
         let bucket = site_bucket(vacant_site, ADS_O, seed) as u8;
         let templates = vec![ads_template(ADS_O, bucket, u32::MAX)];
@@ -1047,8 +1118,6 @@ mod tests {
         data[10] = ADS_O;
         data[11] = ADS_CO;
         data[30] = ADS_O;
-        let counters = OccupancyCounters::new(&data, width, seed);
-        assert_eq!(counters.co_ox_pairs, 1);
 
         let template = ReactionRecord {
             rate_q16: u32::MAX,
@@ -1058,6 +1127,9 @@ mod tests {
             is_bimolecular: true,
         };
         let templates = vec![template];
+
+        let counters = OccupancyCounters::new(&data, width, seed, &templates);
+        assert_eq!(counters.pairs.count(ADS_O, ADS_CO), 1);
 
         let mut rng = rng();
         for _ in 0..200 {
@@ -1092,7 +1164,7 @@ mod tests {
     fn select_event_returns_none_when_every_template_has_zero_live_count() {
         let width = 4;
         let data = vec![VACANT; 16];
-        let counters = OccupancyCounters::new(&data, width, 1);
+        let counters = OccupancyCounters::new(&data, width, 1, &[]);
         // Desorption templates for a species with nothing on the lattice.
         let templates = vec![
             des_template(ADS_O, 0, 1000),
@@ -1142,10 +1214,11 @@ mod tests {
         data[10] = VACANT;
         data[11] = VACANT;
         data[30] = VACANT;
-        let counters = OccupancyCounters::new(&data, width, seed);
-        assert_eq!(counters.vacant_pairs, 1);
 
         let templates = vec![dissociative_ads_template(ADS_H, u32::MAX)];
+
+        let counters = OccupancyCounters::new(&data, width, seed, &templates);
+        assert_eq!(counters.pairs.count(VACANT, VACANT), 1);
 
         let mut rng = rng();
         for _ in 0..200 {
@@ -1184,17 +1257,20 @@ mod tests {
         let height = 6;
         let seed = 21u64;
 
+        let templates = vec![dissociative_ads_template(ADS_H, 1000)];
+
         let mostly_vacant = vec![VACANT; width * height];
-        let counters_high = OccupancyCounters::new(&mostly_vacant, width, seed);
+        let counters_high = OccupancyCounters::new(&mostly_vacant, width, seed, &templates);
 
         let mut mostly_occupied = vec![ADS_O; width * height];
         mostly_occupied[10] = VACANT;
         mostly_occupied[11] = VACANT; // exactly one adjacent vacant pair
-        let counters_low = OccupancyCounters::new(&mostly_occupied, width, seed);
-        assert_eq!(counters_low.vacant_pairs, 1);
-        assert!(counters_high.vacant_pairs > counters_low.vacant_pairs);
+        let counters_low = OccupancyCounters::new(&mostly_occupied, width, seed, &templates);
+        assert_eq!(counters_low.pairs.count(VACANT, VACANT), 1);
+        assert!(
+            counters_high.pairs.count(VACANT, VACANT) > counters_low.pairs.count(VACANT, VACANT)
+        );
 
-        let templates = vec![dissociative_ads_template(ADS_H, 1000)];
         let propensity_high = counters_high.total_propensity(&templates, &Pressures::ones());
         let propensity_low = counters_low.total_propensity(&templates, &Pressures::ones());
 
@@ -1203,8 +1279,11 @@ mod tests {
             "a lattice with more adjacent vacant pairs should have higher dissociative-adsorption \
              propensity: high={propensity_high}, low={propensity_low}"
         );
-        // Exact linear relationship: rate_q16 * vacant_pairs.
-        assert_eq!(propensity_low, 1000.0 * counters_low.vacant_pairs as f64);
+        // Exact linear relationship: rate_q16 * vacant-pair count.
+        assert_eq!(
+            propensity_low,
+            1000.0 * counters_low.pairs.count(VACANT, VACANT) as f64
+        );
     }
 
     #[test]
@@ -1253,7 +1332,7 @@ mod tests {
     /// *heteroatomic* dissociative-adsorption reaction -- the two sites
     /// produce/consume *different* species, unlike O2/H2's homoatomic
     /// case (Phase 3). The forward direction must still draw from the
-    /// same shared `vacant_pairs` pool (any adjacent vacant pair is a
+    /// same shared `(VACANT, VACANT)` slot (any adjacent vacant pair is a
     /// valid landing site, regardless of which two species end up there).
     #[test]
     fn live_count_heteroatomic_dissociative_adsorption_uses_vacant_pairs() {
@@ -1263,22 +1342,22 @@ mod tests {
         let mut data = vec![ADS_O; width * height];
         data[10] = VACANT;
         data[11] = VACANT;
-        let counters = OccupancyCounters::new(&data, width, seed);
-        assert_eq!(counters.vacant_pairs, 1);
 
         let forward = heteroatomic_dissociative_ads_template(ADS_H, ADS_OH, 1000);
+        let counters = OccupancyCounters::new(&data, width, seed, &[forward]);
+        assert_eq!(counters.pairs.count(VACANT, VACANT), 1);
+
         assert_eq!(
             counters.total_propensity(&[forward], &Pressures::ones()),
-            1000.0 * counters.vacant_pairs as f64
+            1000.0 * counters.pairs.count(VACANT, VACANT) as f64
         );
     }
 
     /// The reverse (associative desorption, `H* + OH* -> 2*`) must draw
-    /// from its own dedicated live pair-count (`h_oh_pairs`), not get
-    /// mixed up with `co_ox_pairs`/`h2_pairs`/`vacant_pairs` -- this is
-    /// exactly the kind of mistake the old if/else-chain `live_count`
-    /// (fixed this phase into an exhaustive match) could have made for a
-    /// pair type it didn't explicitly know about.
+    /// from its own dedicated `PairTable` slot, not get mixed up with the
+    /// (O*, CO*) or (H*, H*) slots -- exactly the kind of mistake a
+    /// canonicalization or lookup bug in `PairTable` could make for a
+    /// pair type it hadn't been told to track.
     #[test]
     fn live_count_h_oh_recombination_uses_its_own_pair_pool() {
         let width = 6;
@@ -1287,27 +1366,32 @@ mod tests {
         let mut data = vec![VACANT; width * height];
         data[10] = ADS_H;
         data[11] = ADS_OH;
-        let counters = OccupancyCounters::new(&data, width, seed);
-        assert_eq!(counters.h_oh_pairs, 1);
-        assert_eq!(counters.co_ox_pairs, 0);
-        assert_eq!(counters.h2_pairs, 0);
 
         let reverse = heteroatomic_recombination_template(ADS_H, ADS_OH, 1000);
+        let counters = OccupancyCounters::new(&data, width, seed, &[reverse]);
+        assert_eq!(counters.pairs.count(ADS_H, ADS_OH), 1);
+        assert_eq!(counters.pairs.count(ADS_O, ADS_CO), 0);
+        assert_eq!(counters.pairs.count(ADS_H, ADS_H), 0);
+
         assert_eq!(
             counters.total_propensity(&[reverse], &Pressures::ones()),
-            1000.0 * counters.h_oh_pairs as f64
+            1000.0 * counters.pairs.count(ADS_H, ADS_OH) as f64
         );
     }
 
-    /// A bimolecular reactant pair this build genuinely doesn't recognize
-    /// (neither vacant-pair, O/CO, H/H, nor H/OH) must contribute zero
-    /// live weight -- selectable-but-never-selected is the safe failure
-    /// mode, not silently miscounted against an unrelated pool.
+    /// A bimolecular reactant pair this build's templates genuinely never
+    /// named -- so `PairTable` never allocated it a slot -- must
+    /// contribute zero live weight -- selectable-but-never-selected is the
+    /// safe failure mode, not silently miscounted against an unrelated
+    /// pool.
     #[test]
     fn live_count_unknown_bimolecular_pair_is_zero() {
         let width = 4;
         let data = vec![ADS_O; 16]; // no H/OH/CO anywhere
-        let counters = OccupancyCounters::new(&data, width, 1);
+                                    // No templates named when building `counters` -- `bogus`'s
+                                    // (CO, OH) pair was never registered, so it must fail safe to 0
+                                    // even though the pair is a plausible-looking bimolecular record.
+        let counters = OccupancyCounters::new(&data, width, 1, &[]);
         let bogus = heteroatomic_recombination_template(ADS_CO, ADS_OH, 1000);
         assert_eq!(counters.total_propensity(&[bogus], &Pressures::ones()), 0.0);
     }
@@ -1355,10 +1439,12 @@ mod tests {
         data[10] = ADS_H;
         data[11] = ADS_OH;
         data[30] = ADS_H;
-        let counters = OccupancyCounters::new(&data, width, seed);
-        assert_eq!(counters.h_oh_pairs, 1);
 
         let templates = vec![heteroatomic_recombination_template(ADS_H, ADS_OH, u32::MAX)];
+
+        let counters = OccupancyCounters::new(&data, width, seed, &templates);
+        assert_eq!(counters.pairs.count(ADS_H, ADS_OH), 1);
+
         let mut rng = rng();
         for _ in 0..200 {
             if let Some((_, site_a, site_b)) = select(
@@ -1386,18 +1472,33 @@ mod tests {
     }
 
     proptest::proptest! {
-        /// `pair_matches`' entire reason to exist is treating `{a, b}` as
-        /// an *unordered* pair -- every call site (`add_pair`,
-        /// `remove_pair`, `live_count`) relies on `pair_matches(a, b, x,
-        /// y)` and `pair_matches(b, a, x, y)` agreeing, since a real
-        /// lattice scan visits each site pair from an arbitrary side. An
-        /// asymmetric implementation would silently undercount half of
+        /// `PairTable::canonical`'s entire reason to exist is treating
+        /// `{a, b}` as an *unordered* pair -- `add`/`remove`/`count` all
+        /// rely on `canonical(a, b) == canonical(b, a)`, since a real
+        /// lattice scan visits each adjacent pair from an arbitrary side.
+        /// An asymmetric implementation would silently undercount half of
         /// every matching pair's occurrences -- checked here for every
         /// representable species byte, not just the handful of ordered
         /// pairs the example tests above happen to construct.
         #[test]
-        fn pair_matches_is_symmetric_in_its_first_two_arguments(a: u8, b: u8, x: u8, y: u8) {
-            proptest::prop_assert_eq!(pair_matches(a, b, x, y), pair_matches(b, a, x, y));
+        fn pair_table_canonical_is_symmetric(a: u8, b: u8) {
+            proptest::prop_assert_eq!(PairTable::canonical(a, b), PairTable::canonical(b, a));
+        }
+
+        /// A pair `register`ed once must round-trip through `add`/
+        /// `remove` back to its starting count, queried in *either*
+        /// argument order -- the property an asymmetric canonicalization
+        /// or a lookup bug would break silently, the same class of
+        /// mistake the old four-hardcoded-field version could have made
+        /// for a pair type it didn't special-case.
+        #[test]
+        fn pair_table_add_then_remove_returns_to_the_starting_count(a: u8, b: u8) {
+            let mut table = PairTable::empty();
+            table.register(PairTable::canonical(a, b));
+            let before = table.count(a, b);
+            table.add(b, a);
+            table.remove(a, b);
+            proptest::prop_assert_eq!(table.count(b, a), before);
         }
     }
 }

@@ -199,7 +199,7 @@ fn run_patch_occupancy_gated(
     let reaction_count = lut.len() * ReactionLutBlock::LANES;
     let templates: Vec<_> = (0..reaction_count).map(|id| lut.rate_of(id)).collect();
 
-    let mut counters = OccupancyCounters::new(data, width, seed);
+    let mut counters = OccupancyCounters::new(data, width, seed, &templates);
     let mut rng = Rng::seeded(seed);
     let mut sim_time = 0.0f64;
 
