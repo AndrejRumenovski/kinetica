@@ -1048,8 +1048,8 @@ strict Pd(111) metal-facet chemistry, it isn't.
 
 ### Bimolecular reactions
 
-Each `ReactionLutBlock` lane carries a second `(reactant_mask << 4) |
-product_mask)` transition (`transition_b`) plus an `is_bimolecular` flag,
+Each `ReactionLutBlock` lane carries a second `(reactant_mask << 8) |
+product_mask` transition (`transition_b`) plus an `is_bimolecular` flag,
 alongside the original single-site `transition_a`. A monomolecular
 (adsorption/desorption) reaction only ever touches `transition_a`'s site,
 exactly as before. How the two sites get *chosen* differs by engine (see
@@ -1093,9 +1093,10 @@ data and BEP/Arrhenius model as before, just correctly gated on
 `occupancy::OccupancyCounters::vacant_pairs` (a live count of adjacent
 *vacant* pairs, shared by both species' templates the same way
 `vacant_count` is already shared across monomolecular adsorption
-templates). CO adsorbs molecularly (one site) and is unaffected —
-`oc20_ingest`'s `DISSOCIATIVE_SPECIES` names exactly the two species this
-applies to. Desorption is untouched for both: this only corrects the
+templates). CO adsorbs molecularly (one site) and is unaffected — the
+config `[species]` rows marked `role = dissociative` (O and H) name
+exactly the two species this applies to. Desorption is untouched for
+both: this only corrects the
 adsorption direction. Pressure-coupled the same as monomolecular
 adsorption (see "Gas-phase pressure coupling" above) — verified against
 the real Pd(111) `reactions.lut`: `--pressure-h2 15.0` raises H coverage
@@ -1169,7 +1170,8 @@ chasing a specific one, try again — currently three patterns are matched:
   channel alongside it. The existing monomolecular H adsorption/
   desorption pair already approximates H2 dissociative adsorption/
   associative desorption as a single-site event (using half the H2
-  dissociation energy per H atom — see `SPECIES_PATTERNS`); a real
+  dissociation energy per H atom — the `0.5` `stoich` in the config
+  `[species]` section); a real
   two-site measurement of the same physical recombination event isn't a
   *second* reaction, it's a more accurate model of the same one. Building
   both would just split one real process's propensity across two channels

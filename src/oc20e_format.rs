@@ -42,7 +42,8 @@ const RECORD_SIZE_BI: usize = 18;
 /// energy.
 #[derive(Clone, Copy)]
 pub struct EnergyRecord {
-    /// Index into `SPECIES_BITS`/`oc20_ingest`'s `SPECIES_NAMES`.
+    /// Index into `SPECIES_BITS` (equivalently, the order of the config
+    /// `[species]` list `oc20_ingest` loads).
     pub species: u8,
     /// Relaxed adsorption/reaction energy, eV.
     pub energy_ev: f64,

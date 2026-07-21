@@ -515,7 +515,8 @@ fn run(config: &Config) -> io::Result<()> {
     // 2 H* -> H2 + 2*) is a genuine two-site measurement of the same
     // physical process the monomolecular desorption reaction below
     // already approximates as a single-site event (using half the
-    // dissociative-adsorption energy per atom -- see SPECIES_PATTERNS in
+    // dissociative-adsorption energy per atom -- see the config `[species]`
+    // `stoich`, consumed by build_species_patterns in
     // extract_catalysis_hub.py). Building both would give that species
     // two independent rate channels for the same real-world event, which
     // isn't "more detail," just double-counted propensity split across
@@ -537,15 +538,15 @@ fn run(config: &Config) -> io::Result<()> {
     // came from a real barrier or BEP. The desorption half is skipped for
     // a species covered by `replaces_desorption` -- see above.
     //
-    // For O and H (`DISSOCIATIVE_SPECIES`), the adsorption half is built
-    // as a genuine two-site *dissociative* event (`2* + O2(g)/H2(g) ->
-    // 2 species*`, `is_bimolecular = true`, both sites VACANT -> species)
-    // instead of the pseudo-monomolecular approximation (one site,
-    // `VACANT -> species`) used previously -- the underlying energy is
-    // exactly the same per-atom DFT value this pipeline already extracts
-    // (see `SPECIES_PATTERNS`'s 0.5 stoichiometry), the fix is applying it
-    // to a correctly-gated *pair* of sites (drawing from
-    // `occupancy::OccupancyCounters::vacant_pairs`) rather than two
+    // For O and H (the `SpeciesRole::Dissociative` species), the
+    // adsorption half is built as a genuine two-site *dissociative* event
+    // (`2* + O2(g)/H2(g) -> 2 species*`, `is_bimolecular = true`, both
+    // sites VACANT -> species) instead of the pseudo-monomolecular
+    // approximation (one site, `VACANT -> species`) used previously -- the
+    // underlying energy is exactly the same per-atom DFT value this
+    // pipeline already extracts (the config `[species]` `stoich` of 0.5),
+    // the fix is applying it to a correctly-gated *pair* of sites (drawing
+    // from `occupancy::OccupancyCounters::vacant_pairs`) rather than two
     // independent single sites with no coverage-blocking relationship to
     // each other. CO adsorbs molecularly (one site) and keeps the
     // original monomolecular form unchanged. Desorption is untouched
@@ -1526,7 +1527,7 @@ mod tests {
             .collect();
         // O desorption (monomolecular) + O dissociative adsorption
         // (bimolecular, both species are dissociative -- see
-        // DISSOCIATIVE_SPECIES) + H dissociative adsorption (bimolecular)
+        // SpeciesRole::Dissociative) + H dissociative adsorption (bimolecular)
         // + 1 recombination bimolecular (H desorption is replaced, not
         // built).
         assert_eq!(real_records.len(), 4);
@@ -1605,7 +1606,7 @@ mod tests {
         // this test is about quantile-bucketing behavior in general, which
         // is orthogonal to O/H's separate dissociative-adsorption handling
         // (dissociative-adsorption records are deliberately un-bucketed,
-        // bin_id always 0 -- see DISSOCIATIVE_SPECIES).
+        // bin_id always 0 -- see SpeciesRole::Dissociative).
         let mut mono_bytes = Vec::new();
         mono_bytes.extend_from_slice(MAGIC);
         mono_bytes.extend_from_slice(&12u32.to_le_bytes());
@@ -1762,7 +1763,7 @@ mod tests {
         let out_path = temp_path("run_dissociative_bi_out.lut");
 
         // One CO record, energy_mev = 0, so `energy_records` isn't empty
-        // (CO isn't one of DISSOCIATIVE_SPECIES, so it doesn't interact
+        // (CO's role isn't Dissociative, so it doesn't interact
         // with the water-splitting record below).
         let mut mono_bytes = Vec::new();
         mono_bytes.extend_from_slice(MAGIC);
